@@ -1,0 +1,4 @@
+name = "nexusai"
+main = "worker.js"
+compatibility_date = "2026-09-06"
+compatibility_flags = ["nodejs_compat"]
