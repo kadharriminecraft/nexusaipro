@@ -1,25 +1,14 @@
 /**
- * Nexus AI Pro — sync + server-side generation worker
+ * Nexus AI Pro — sync + generation worker v2 (free-plan friendly)
  *
- * Endpoints:
- *   GET  /health             – no auth, checks worker is alive
- *   GET  /chats              – list chat metadata (auth)
- *   GET  /chat/:id           – full chat (auth)
- *   PUT  /chat               – save full chat (auth)
- *   DELETE /chat/:id         – delete chat (auth)
- *   POST /generate           – stream a completion through the worker; keeps
- *                              running + saves the result to KV even if the
- *                              client disconnects (auth)
- *   GET  /job/:id            – job status: running | done | error | cancelled
- *   POST /job/:id/cancel     – best-effort cancel
+ *   GET  /health | /chats | /chat/:id | /job/:id
+ *   PUT  /chat
+ *   DELETE /chat/:id
+ *   POST /generate   (body.poll === true → eco: returns JSON immediately, no stream)
+ *   POST /job/:id/cancel
  *
- * Secrets:  wrangler secret put SYNC_KEY            (pairing passphrase)
- *           wrangler secret put OPENROUTER_API_KEY  (optional server-side key)
- * Binding:  CHAT_KV (see wrangler.toml)
- *
- * Note: long generations are I/O bound (tiny CPU). The free Workers plan
- * (10ms CPU/request) is fine for typical chat replies; use the paid plan
- * ($5/mo, 30s CPU) if you generate very long files constantly.
+ * v2: chat listing uses KV metadata (1 write per save instead of 2),
+ *     eco poll mode, early API-key validation. API surface otherwise unchanged.
  */
 
 const CORS = {
@@ -35,7 +24,7 @@ const ALLOWED_PARAMS = new Set([
   "seed", "response_format", "reasoning",
 ]);
 
-const activeJobs = new Map(); // jobId -> AbortController (best effort, per-isolate)
+const activeJobs = new Map();
 let nsCache = { key: "", ns: "" };
 
 class HttpError extends Error {
@@ -43,28 +32,47 @@ class HttpError extends Error {
 }
 
 function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "Content-Type": "application/json", ...CORS },
-  });
+  return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json", ...CORS } });
 }
 
 async function namespace(request, env) {
   const key = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
-  if (!env.SYNC_KEY) throw new HttpError(500, "SYNC_KEY secret is not set on the worker. Run: wrangler secret put SYNC_KEY");
+  if (!env.SYNC_KEY) throw new HttpError(500, "SYNC_KEY secret is not set on the worker.");
   if (!key || key !== env.SYNC_KEY) throw new HttpError(401, "Invalid sync key.");
   if (nsCache.key !== key) {
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("nexus:" + key));
-    nsCache = {
-      key,
-      ns: [...new Uint8Array(digest)].slice(0, 12).map(b => b.toString(16).padStart(2, "0")).join(""),
-    };
+    nsCache = { key, ns: [...new Uint8Array(digest)].slice(0, 12).map(b => b.toString(16).padStart(2, "0")).join("") };
   }
   return nsCache.ns;
 }
 
-async function readIndex(kv, ns) { return (await kv.get(`index:${ns}`, "json")) || {}; }
-async function writeIndex(kv, ns, index) { await kv.put(`index:${ns}`, JSON.stringify(index)); }
+function chatMetaOf(chat) {
+  return { title: String(chat.title || "Chat").slice(0, 80), updatedAt: chat.updatedAt || Date.now() };
+}
+
+async function listChats(kv, ns) {
+  const prefix = `chat:${ns}:`;
+  const out = new Map();
+  let cursor;
+  do {
+    const page = await kv.list({ prefix, cursor });
+    for (const k of page.keys) {
+      const id = k.name.slice(prefix.length);
+      out.set(id, { id, title: (k.metadata && k.metadata.title) || "Chat", updatedAt: (k.metadata && k.metadata.updatedAt) || 0 });
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  // Compatibility with v1's separate index key (so old chats still list).
+  try {
+    const legacy = await kv.get(`index:${ns}`, "json");
+    if (legacy && typeof legacy === "object") {
+      for (const [id, meta] of Object.entries(legacy)) {
+        if (!out.has(id) && meta) out.set(id, { id, title: meta.title || "Chat", updatedAt: meta.updatedAt || 0 });
+      }
+    }
+  } catch {}
+  return [...out.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+}
 
 function upstreamError(text, status) {
   try {
@@ -99,21 +107,13 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     const url = new URL(request.url);
     try {
-      if (url.pathname === "/" ) {
-        return new Response("Nexus AI Pro sync worker is running. Paste this URL + your sync key into the app's Settings.",
-          { status: 200, headers: { "Content-Type": "text/plain", ...CORS } });
-      }
-      if (url.pathname === "/health") {
-        return json({ ok: true, hasServerKey: !!env.OPENROUTER_API_KEY, name: "nexus-sync" });
-      }
-      if (!env.CHAT_KV) throw new HttpError(500, "CHAT_KV binding missing — add a KV namespace in wrangler.toml.");
+      if (url.pathname === "/") return new Response("Nexus AI Pro sync worker v2 is running.", { headers: { "Content-Type": "text/plain", ...CORS } });
+      if (url.pathname === "/health") return json({ ok: true, version: 2, hasServerKey: !!env.OPENROUTER_API_KEY });
+      if (!env.CHAT_KV) throw new HttpError(500, "CHAT_KV binding missing — bind your KV namespace with variable name CHAT_KV.");
       const ns = await namespace(request, env);
       const route = request.method + " " + url.pathname;
 
-      if (route === "GET /chats") {
-        const index = await readIndex(env.CHAT_KV, ns);
-        return json(Object.values(index).sort((a, b) => b.updatedAt - a.updatedAt));
-      }
+      if (route === "GET /chats") return json(await listChats(env.CHAT_KV, ns));
 
       if (route === "PUT /chat") {
         const chat = await request.json();
@@ -125,13 +125,10 @@ export default {
           files: Array.isArray(chat.files) ? chat.files : [],
           createdAt: chat.createdAt || Date.now(),
           updatedAt: chat.updatedAt || Date.now(),
-          pendingJob: chat.pendingJob || null,
+          pendingJob: null,
         };
-        if (JSON.stringify(body).length > 24 * 1024 * 1024) throw new HttpError(413, "Chat too large for KV storage.");
-        await env.CHAT_KV.put(`chat:${ns}:${chat.id}`, JSON.stringify(body));
-        const index = await readIndex(env.CHAT_KV, ns);
-        index[chat.id] = { id: chat.id, title: body.title, updatedAt: body.updatedAt };
-        await writeIndex(env.CHAT_KV, ns, index);
+        if (JSON.stringify(body).length > 24 * 1024 * 1024) throw new HttpError(413, "Chat too large for KV.");
+        await env.CHAT_KV.put(`chat:${ns}:${chat.id}`, JSON.stringify(body), { metadata: chatMetaOf(body) });
         return json({ ok: true });
       }
 
@@ -143,9 +140,10 @@ export default {
       }
       if (chatMatch && request.method === "DELETE") {
         await env.CHAT_KV.delete(`chat:${ns}:${chatMatch[1]}`);
-        const index = await readIndex(env.CHAT_KV, ns);
-        delete index[chatMatch[1]];
-        await writeIndex(env.CHAT_KV, ns, index);
+        try {
+          const legacy = await env.CHAT_KV.get(`index:${ns}`, "json");
+          if (legacy && legacy[chatMatch[1]]) { delete legacy[chatMatch[1]]; await env.CHAT_KV.put(`index:${ns}`, JSON.stringify(legacy)); }
+        } catch {}
         return json({ ok: true });
       }
 
@@ -184,7 +182,10 @@ async function generate(request, env, ctx, ns) {
   if (!jobId || !chatId || !Array.isArray(requestMessages) || !params.model) {
     throw new HttpError(400, "generate requires jobId, chatId, requestMessages and params.model.");
   }
+  const key = apiKey || env.OPENROUTER_API_KEY;
+  if (!key) throw new HttpError(400, "No OpenRouter API key. Add one in the app, or set the OPENROUTER_API_KEY secret on the worker.");
 
+  const pollMode = body.poll === true; // eco mode
   const jobKey = `job:${ns}:${jobId}`;
   const chatKey = `chat:${ns}:${chatId}`;
   const startedAt = Date.now();
@@ -193,24 +194,21 @@ async function generate(request, env, ctx, ns) {
   const abort = new AbortController();
   activeJobs.set(jobKey, abort);
 
-  let client;
-  const relay = new ReadableStream({ start(c) { client = c; } });
+  let client = null;
+  const relay = pollMode ? null : new ReadableStream({ start(c) { client = c; } });
+  const send = (text) => { if (client) { try { client.enqueue(new TextEncoder().encode(text)); } catch {} } };
 
-  // Runs independently of the client connection. If the phone dies mid-stream,
-  // this keeps reading from OpenRouter and saves the finished reply to KV.
+  // Runs via waitUntil — keeps going and saves to KV even if the client vanished.
   const run = async () => {
     let raw = "";
     let errorMessage = null;
     let status = "done";
-    const send = (text) => { try { client.enqueue(new TextEncoder().encode(text)); } catch {} };
     try {
-      const key = apiKey || env.OPENROUTER_API_KEY;
-      if (!key) throw new HttpError(400, "No OpenRouter API key. Add one in the app, or set the OPENROUTER_API_KEY secret on the worker.");
       const genParams = {};
       for (const k of ALLOWED_PARAMS) if (params[k] !== undefined && params[k] !== null) genParams[k] = params[k];
       const upstream = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
-        headers: { "Authorization": `Bearer ${key}`, "Content-Type": "application/json" },
+        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
         body: JSON.stringify({ model: params.model, messages: requestMessages, stream: true, ...genParams }),
         signal: abort.signal,
       });
@@ -224,7 +222,7 @@ async function generate(request, env, ctx, ns) {
         if (done) break;
         const chunk = decoder.decode(value, { stream: true });
         raw += chunk;
-        send(chunk); // client may already be gone — errors swallowed on purpose
+        send(chunk);
       }
     } catch (err) {
       errorMessage = err.message || String(err);
@@ -232,7 +230,6 @@ async function generate(request, env, ctx, ns) {
       send(`data: ${JSON.stringify({ error: { message: errorMessage } })}\n\n`);
     }
 
-    // Save the finished (or partial, if cancelled/errored) message + chat.
     try {
       const parsed = extractStream(raw);
       const assistantMessage = {
@@ -247,28 +244,23 @@ async function generate(request, env, ctx, ns) {
         assistantMessage.error = errorMessage;
         if (assistantMessage.content) assistantMessage.interrupted = true;
       }
-      const messages = history.filter(m => m && m.id !== assistantMessageId).concat([assistantMessage]);
       const chat = {
         id: chatId,
         title: chatMeta.title || "Chat",
         files: chatMeta.files || [],
         createdAt: chatMeta.createdAt || startedAt,
         updatedAt: Date.now(),
-        messages,
+        messages: history.filter(m => m && m.id !== assistantMessageId).concat([assistantMessage]),
       };
-      await env.CHAT_KV.put(chatKey, JSON.stringify(chat));
-      const index = await readIndex(env.CHAT_KV, ns);
-      index[chatId] = { id: chatId, title: chat.title, updatedAt: chat.updatedAt };
-      await writeIndex(env.CHAT_KV, ns, index);
+      await env.CHAT_KV.put(chatKey, JSON.stringify(chat), { metadata: chatMetaOf(chat) });
     } catch {}
-    try {
-      await env.CHAT_KV.put(jobKey, JSON.stringify({ chatId, status, error: errorMessage, startedAt, updatedAt: Date.now() }));
-    } catch {}
+    try { await env.CHAT_KV.put(jobKey, JSON.stringify({ chatId, status, error: errorMessage, startedAt, updatedAt: Date.now() })); } catch {}
     activeJobs.delete(jobKey);
-    try { client.close(); } catch {}
+    if (client) { try { client.close(); } catch {} }
   };
 
   ctx.waitUntil(run());
+  if (pollMode) return json({ ok: true, jobId, chatId });
   return new Response(relay, {
     headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", ...CORS },
   });
