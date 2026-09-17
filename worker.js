@@ -35,10 +35,13 @@ function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json", ...CORS } });
 }
 
+const SYNC_KEY_FALLBACK = "your-passphrase-here"; // ← type your actual passphrase
+
 async function namespace(request, env) {
   const key = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
-  if (!env.SYNC_KEY) throw new HttpError(500, "SYNC_KEY secret is not set on the worker.");
-  if (!key || key !== env.SYNC_KEY) throw new HttpError(401, "Invalid sync key.");
+  const expected = env.SYNC_KEY || SYNC_KEY_FALLBACK;
+  if (!expected) throw new HttpError(500, "SYNC_KEY secret is not set on the worker.");
+  if (!key || key !== expected) throw new HttpError(401, "Invalid sync key."); throw new HttpError(401, "Invalid sync key.");
   if (nsCache.key !== key) {
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("nexus:" + key));
     nsCache = { key, ns: [...new Uint8Array(digest)].slice(0, 12).map(b => b.toString(16).padStart(2, "0")).join("") };
