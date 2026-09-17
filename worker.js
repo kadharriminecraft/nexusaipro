@@ -35,7 +35,7 @@ function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json", ...CORS } });
 }
 
-const SYNC_KEY_FALLBACK = "your-passphrase-here"; // ← type your actual passphrase
+const SYNC_KEY_FALLBACK = "Jesusisthebom"; // ← type your actual passphrase
 
 async function namespace(request, env) {
   const key = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
