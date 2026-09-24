@@ -1,163 +1,267 @@
-/* ============================================================
-   BASEPLATE MULTIPLAYER RELAY v2 — Durable Object world room
-   ------------------------------------------------------------
-   This is the code for the worker at:
-     nexusaipro.kadharri-minecraft.workers.dev
+/* =====================================================================
+   NEXUS BACKGROUND RELAY — Cloudflare Worker
+   =====================================================================
+   Keeps AI streams (chat completions, reasoning, tool calls, images)
+   running SERVER-SIDE so they survive: phone off, app killed, tab frozen,
+   connection drops. The client reconnects with a byte offset and receives
+   a seamless replay + live tail — zero tokens lost.
 
-   WHY v2?  The old version kept the player list in a plain
-   Worker variable. Cloudflare runs many copies of a plain
-   Worker in parallel (one per edge machine), so two players
-   could each get connected ("online") yet be sitting in two
-   DIFFERENT copies of the list — invisible to each other.
+   WIRE PROTOCOL (what NexusAiPro.html speaks):
+     POST {relay}/chat      → forwards to OpenRouter /chat/completions.
+                              Response: SSE stream + "X-Nexus-Job: <id>" header
+     POST {relay}/images    → forwards to OpenRouter /images (JSON).
+                              Response: JSON + "X-Nexus-Job: <id>" header
+     GET  {relay}/job/:id?offset=N
+                            → replay of buffered bytes from N, then the live
+                              tail; ends when the upstream ends. 404/410 when
+                              the job is gone (client falls back to auto-resume)
+     GET  {relay}/health    → {ok:true}
+     DELETE {relay}/job/:id → free the job early
 
-   THE FIX: a Durable Object ("BaseplateRoom"). A Durable Object
-   is ONE single global instance with a fixed name — every
-   player, from any device, anywhere in the world, is routed to
-   the exact same object. Everyone who opens the game file is
-   guaranteed to land in the same world room.
+   AUTH: the client's "Authorization: Bearer <OpenRouter key>" header is
+   forwarded upstream verbatim. The key is never stored or logged.
 
-   The game file connects automatically to  wss://<worker>/ws ,
-   so once this code is deployed, every player who opens the
-   game joins the same world.
+   SETUP (free tier is plenty, ~2 minutes):
+     1. Go to https://dash.cloudflare.com → Workers & Pages → Create Worker
+     2. Name it (e.g. nexus-relay) → Deploy
+     3. Edit code → paste this entire file → Deploy
+     4. Copy your worker URL (https://nexus-relay.<your-subdomain>.workers.dev)
+     5. In Nexus AI Pro: Settings → Connection → Background relay → paste URL
+        → Test relay
 
-   DEPLOY (3 minutes, no tools needed):
-     1. Go to  dash.cloudflare.com  →  Workers & Pages
-     2. Open the worker  "kadharri-minecraft"  →  "Edit code"
-     3. Select ALL of the old code, delete it, PASTE this file
-     4. In the editor's left panel (or top bar) open  SETTINGS,
-        find  BINDINGS  →  "Add binding"  →  pick
-        "Durable Object Namespace"  and enter:
-            Variable name:  ROOM
-            Class name:     BaseplateRoom
-        (the class name must match EXACTLY — capital B and R)
-     5. Click  "Save and Deploy"
-     6. Open  https://nexusaipro.kadharri-minecraft.workers.dev
-        in a browser — it must say:
-        "Baseplate multiplayer relay is live — 0 player(s) connected"
-        If it mentions a missing binding, step 4 didn't save.
+   LIMITS (be aware):
+     - Jobs live in worker memory (per isolate). Isolates persist for
+       minutes-to-hours; a phone-off gap of a few minutes is covered. For
+       multi-hour gaps, KV/Durable Objects would be needed.
+     - 32 MB buffer cap per job (a normal response is well under 1 MB).
+     - Cloudflare's free plan allows 100k requests/day — each chat message
+       is 1 POST + occasional reconnect GETs.
 
-   WHAT IT DOES:
-     Every player runs the whole world locally in their own copy
-     of the game file. The Durable Object room holds every open
-     WebSocket and relays what each player sends to everyone
-     else:
-       - player state (position / yaw / animation / tool) at 12 Hz
-       - player chat
-       - join / leave notifications (silent in-game)
-     The result: everybody renders everybody else in the same
-     world. Nothing is stored — it is a pure real-time relay.
+   OPTIONAL KV SNAPSHOT (images + completed bodies survive isolates):
+     - Create a KV namespace, bind it as NEXUS_KV, and completed jobs'
+       final buffers are stored with a 1-hour TTL. /job replay of a
+       completed job then works even after an isolate restart.
+   ===================================================================== */
 
-   LIMITS (fine for a group of friends):
-     - MAX 40 concurrent players, messages capped at 1 KB,
-       ~90 messages per second per player (way above what the
-       game sends: 12 states/sec + chat + a 25s keepalive ping).
-   ============================================================ */
+const UPSTREAM_BASE = "https://openrouter.ai/api/v1";
+const MAX_JOB_BYTES = 32 * 1024 * 1024; // 32MB buffer cap per job
+const JOB_TTL_MS = 15 * 60 * 1000;      // sweep jobs idle/finished > 15 min
+const KV_TTL = 3600;                    // seconds
+const FWD_HEADERS = ["authorization", "content-type", "http-referer", "x-title", "accept"];
 
-const MAX_CLIENTS = 40;
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title",
+  "Access-Control-Expose-Headers": "X-Nexus-Job",
+  "Access-Control-Max-Age": "86400",
+};
+
+/* job = {
+     id, kind: "chat"|"images",
+     chunks: Uint8Array[], total, contentType, status: BufferingHeader,
+     done, failed, subs: Set<controller>, createdAt, lastTouch,
+     kvKey (optional)
+   } */
+const jobs = new Map();
+
+const enc = new TextEncoder();
+function json(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json", ...CORS, ...headers } });
+}
+
+function sweepJobs() {
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    if ((job.done && now - job.lastTouch > 120000) || now - job.lastTouch > JOB_TTL_MS) {
+      for (const c of job.subs) { try { c.close(); } catch (_) {} }
+      jobs.delete(id);
+    }
+  }
+}
+
+function concatChunks(chunks) {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
+}
+// replay the buffered byte prefix starting at `offset`
+function bufferedFrom(job, offset) {
+  let total = 0;
+  for (const c of job.chunks) total += c.length;
+  if (offset >= total) return new Uint8Array(0);
+  const out = new Uint8Array(total - offset);
+  let pos = 0, written = 0;
+  for (const c of job.chunks) {
+    if (pos + c.length <= offset) { pos += c.length; continue; }
+    const skip = Math.max(0, offset - pos);
+    out.set(c.subarray(skip), written);
+    written += c.length - skip;
+    pos += c.length;
+  }
+  return out;
+}
+
+/* ---------- upstream pump: runs to completion regardless of the client ----------
+   Reads the upstream stream chunk by chunk, appends to the job buffer, and
+   fans out to every attached subscriber. Driven by ctx.waitUntil(), so it
+   keeps going even when the requesting client has vanished (phone off). */
+function startPump(job, upstream, ctx, env) {
+  const pump = (async () => {
+    const reader = upstream.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        job.lastTouch = Date.now();
+        if (job.total + value.length > MAX_JOB_BYTES) {
+          job.overflow = true; // stop buffering, keep fanning out live
+        } else {
+          job.chunks.push(value);
+          job.total += value.length;
+        }
+        for (const c of [...job.subs]) {
+          try { c.enqueue(value); } catch (_) { job.subs.delete(c); }
+        }
+      }
+      job.done = true;
+    } catch (err) {
+      job.failed = err?.message || "upstream error";
+      job.done = true;
+    } finally {
+      try { reader.releaseLock?.(); } catch (_) {}
+      for (const c of [...job.subs]) { try { c.close(); } catch (_) {} }
+      job.subs.clear();
+      // optional durable snapshot of the finished body
+      if (env?.NEXUS_KV && !job.overflow && job.total > 0 && job.total < 5 * 1024 * 1024) {
+        try {
+          const body = concatChunks(job.chunks);
+          await env.NEXUS_KV.put("job:" + job.id, body, { expirationTtl: KV_TTL });
+          await env.NEXUS_KV.put("meta:" + job.id, JSON.stringify({ done: true, contentType: job.contentType, bytes: job.total, kind: job.kind }), { expirationTtl: KV_TTL });
+          job.kvKey = "job:" + job.id;
+        } catch (_) {}
+      }
+    }
+  })();
+  ctx?.waitUntil?.(pump.catch(() => {}));
+  return pump;
+}
+
+function subscriberStream(job, startOffset) {
+  let ctl = null;
+  return new ReadableStream({
+    start(controller) {
+      ctl = controller;
+      // replay the already-buffered prefix first
+      const buffered = bufferedFrom(job, startOffset);
+      if (buffered.length) { try { controller.enqueue(buffered); } catch (_) {} }
+      if (job.done) { try { controller.close(); } catch (_) {} return; }
+      job.subs.add(controller);
+    },
+    cancel() {
+      // client left — just detach; the pump keeps the job alive
+      job.subs.delete(ctl);
+    },
+  });
+}
+
+function relayHeaders(job, extra = {}) {
+  return { "Content-Type": job.contentType || "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Nexus-Job": job.id, ...CORS, ...extra };
+}
+
+async function handleProxy(request, pathname, ctx, env) {
+  const upstreamUrl = UPSTREAM_BASE + pathname;
+  const headers = new Headers();
+  for (const h of FWD_HEADERS) { const v = request.headers.get(h); if (v) headers.set(h, v); }
+  const upstream = await fetch(upstreamUrl, {
+    method: "POST",
+    headers,
+    body: await request.arrayBuffer(),
+    // @ts-ignore runtime-specific
+    cf: { cacheTtl: 0 },
+  });
+
+  const id = crypto.randomUUID();
+  const job = {
+    id, kind: pathname === "/images" ? "images" : "chat",
+    chunks: [], total: 0,
+    contentType: upstream.headers.get("content-type") || "text/event-stream",
+    done: false, failed: null, overflow: false,
+    subs: new Set(), createdAt: Date.now(), lastTouch: Date.now(),
+  };
+  jobs.set(id, job);
+
+  if (!upstream.ok || !upstream.body) {
+    // pass the error straight through; no job to track
+    jobs.delete(id);
+    const hdrs = new Headers(upstream.headers);
+    for (const [k, v] of Object.entries(CORS)) hdrs.set(k, v);
+    return new Response(upstream.body, { status: upstream.status, headers: hdrs });
+  }
+
+  startPump(job, upstream.body, ctx, env);
+
+  // respond with a live subscriber starting at offset 0
+  const live = (() => {
+    let ctl = null;
+    return new ReadableStream({
+      start(controller) { ctl = controller; job.subs.add(controller); },
+      cancel() { job.subs.delete(ctl); },
+    });
+  })();
+  return new Response(live, { status: 200, headers: relayHeaders(job) });
+}
+
+async function handleJobGet(url, env) {
+  const id = url.pathname.split("/")[2];
+  const offset = Math.max(0, Number(url.searchParams.get("offset") || 0) || 0);
+  let job = jobs.get(id);
+  if (!job && env?.NEXUS_KV) {
+    // memory miss → maybe a completed job snapshotted to KV
+    try {
+      const meta = await env.NEXUS_KV.get("meta:" + id, "json");
+      if (meta?.done) {
+        const body = await env.NEXUS_KV.get("job:" + id, "arrayBuffer");
+        if (body) {
+          const bytes = new Uint8Array(body);
+          if (offset > bytes.length) return json({ error: "offset beyond snapshot" }, 416);
+          return new Response(bytes.subarray(offset), { status: 200, headers: { "Content-Type": meta.contentType || "text/event-stream", "X-Nexus-Job": id, ...CORS } });
+        }
+      }
+    } catch (_) {}
+  }
+  if (!job) return json({ error: "job not found (expired or relay restarted)" }, 404);
+  if (offset > 0 && job.overflow) return json({ error: "job buffer overflowed — cannot replay" }, 410);
+  return new Response(subscriberStream(job, offset), { status: 200, headers: relayHeaders(job, { "X-Nexus-Offset": String(job.total) }) });
+}
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
+    sweepJobs();
     const url = new URL(request.url);
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+    if (url.pathname === "/health") return json({ ok: true, relay: "nexus", jobs: jobs.size, time: Date.now() });
 
-    /* health check — open the worker URL in a browser to see this */
-    if (url.pathname === '/' || url.pathname === '/health') {
-      if (!env.ROOM)
-        return new Response(
-          'Baseplate relay is deployed, but the Durable Object binding is MISSING.\n' +
-          'Open the worker → Settings → Bindings → Add binding → Durable Object Namespace:\n' +
-          '    Variable name: ROOM\n    Class name: BaseplateRoom\n' +
-          'then Save and Deploy.\n',
-          { status: 500, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+    if (request.method === "POST" && (url.pathname === "/chat" || url.pathname === "/images")) {
       try {
-        const room = env.ROOM.get(env.ROOM.idFromName('baseplate-world'));
-        const n = await (await room.fetch('https://room/count')).text();
-        return new Response(
-          'Baseplate multiplayer relay is live — ' + n + ' player(s) connected\n',
-          { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } });
-      } catch (e) {
-        return new Response('Relay error: ' + (e && e.message ? e.message : e) + '\n',
-          { status: 500, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+        return await handleProxy(request, url.pathname, ctx, env);
+      } catch (err) {
+        return json({ error: { message: "relay upstream failed: " + (err?.message || String(err)), code: 502 } }, 502);
       }
     }
 
-    if (url.pathname !== '/ws')
-      return new Response('Not found\n', { status: 404 });
-
-    if ((request.headers.get('Upgrade') || '').toLowerCase() !== 'websocket')
-      return new Response('Expected WebSocket\n', { status: 426 });
-
-    if (!env.ROOM)
-      return new Response('ROOM binding missing — see the deploy steps\n', { status: 500 });
-
-    /* everyone lands in the SAME named room object — one shared world */
-    const room = env.ROOM.get(env.ROOM.idFromName('baseplate-world'));
-    return room.fetch(request);
-  }
+    if (request.method === "GET" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
+      return handleJobGet(url, env);
+    }
+    if (request.method === "DELETE" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
+      const id = url.pathname.split("/")[2];
+      const job = jobs.get(id);
+      if (job) { for (const c of job.subs) { try { c.close(); } catch (_) {} } jobs.delete(id); }
+      return json({ ok: true });
+    }
+    return json({ error: "not found", hint: "use /chat, /images, /job/:id?offset=N, /health" }, 404);
+  },
 };
-
-/* ============================================================
-   BaseplateRoom — the single shared world room.
-   All WebSockets from every device are forwarded here, so the
-   player list below is THE world, not a per-machine copy.
-   ============================================================ */
-export class BaseplateRoom {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-    this.clients = new Set();   // every open socket in the world
-  }
-
-  async fetch(request) {
-    const url = new URL(request.url);
-
-    /* the health check asks the room how many players it holds */
-    if (url.pathname === '/count')
-      return new Response(String(this.clients.size));
-
-    if ((request.headers.get('Upgrade') || '').toLowerCase() !== 'websocket')
-      return new Response('Expected WebSocket\n', { status: 426 });
-
-    if (this.clients.size >= MAX_CLIENTS)
-      return new Response('Relay is full\n', { status: 503 });
-
-    /* upgrade to WebSocket and join the room */
-    const [client, server] = Object.values(new WebSocketPair());
-    server.accept();
-    this.clients.add(server);
-
-    let id = null;                          // bound from the first state message
-    let msgs = 0, winStart = Date.now();
-
-    server.addEventListener('message', ev => {
-      if (typeof ev.data !== 'string' || ev.data.length > 1024) return;   // size cap
-      const now = Date.now();
-      if (now - winStart > 1000) { winStart = now; msgs = 0; }             // rate cap
-      if (++msgs > 90) return;
-
-      let m;
-      try { m = JSON.parse(ev.data); } catch (e) { return; }
-
-      if (m.t === 'p') { try { server.send('{"t":"q"}'); } catch (e) {} return; }  // keepalive ping
-
-      if (m.t === 's' || m.t === 'c') {     // player state / chat → pass through
-        if (typeof m.id === 'string' && m.id.length <= 64) id = m.id;     // remember who this socket is
-        for (const ws of this.clients) {
-          if (ws === server || ws.readyState !== 1) continue;
-          try { ws.send(ev.data); } catch (e) {}
-        }
-      }
-    });
-
-    const bye = () => {
-      this.clients.delete(server);
-      if (id) for (const ws of this.clients) {                  // tell the others they left
-        if (ws.readyState !== 1) continue;
-        try { ws.send(JSON.stringify({ t: 'bye', id })); } catch (e) {}
-      }
-    };
-    server.addEventListener('close', bye);
-    server.addEventListener('error', bye);
-
-    return new Response(null, { status: 101, webSocket: client });
-  }
-}
