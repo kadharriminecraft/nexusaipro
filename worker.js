@@ -143,7 +143,7 @@
        the full phone-off experience; /health reports both.
    ===================================================================== */
 
-const WORKER_VERSION = 5;
+const WORKER_VERSION = 6;
 
 /* test tunables — production reads defaults; the local harness may
    override via globalThis.__nexusTun to run E2E in seconds. */
@@ -166,6 +166,13 @@ const EVENT_BUDGET_MS = TUN("eventBudgetMs", 10 * 60 * 1000);
 const TAIL_POLL_FAST = TUN("tailPollFast", 500);
 const TAIL_POLL_SLOW = TUN("tailPollSlow", 2000);
 const MAX_ACTIVE_JOBS = 64;
+/* v6: parked jobs (agent tool-cuts waiting for the app to come back) live
+   longer than done/failed ones — 30 minutes instead of 10, so a long coding
+   run paused mid-tool-round is still recoverable when you return. */
+const PARK_TTL_MS = TUN("parkTtlMs", 30 * 60 * 1000);
+/* v6: how many due jobs one cron tick drives (concurrent chats generating
+   while the phone is off all make progress instead of queueing two-by-two) */
+const CRON_JOBS_PER_TICK = TUN("cronJobsPerTick", 4);
 
 const FWD_HEADERS = ["authorization", "content-type", "http-referer", "x-title", "accept"];
 
@@ -818,9 +825,22 @@ async function releaseJob(env, id, token, attempts) {
     });
   } catch (_) {}
 }
+/* v6: terminal transitions stamp TIMING into the job's meta — startedAt /
+   doneAt / durationMs survive in D1 so "how long did this request work for"
+   is answerable server-side too (visible via /health's jobs list). */
+async function stampMeta(env, id, token, extra) {
+  try {
+    const row = await getJobRow(env, id);
+    if (!row) return;
+    const meta = Object.assign({}, row.meta || {}, extra);
+    await lockWrite(env, id, token, { meta: JSON.stringify(meta) });
+  } catch (_) {}
+}
 async function finalizeDone(env, id, token, live) {
   const now = Date.now();
   try {
+    const startedAt = (await getJobRow(env, id))?.createdAt || now;
+    await stampMeta(env, id, token, { doneAt: now, durationMs: Math.max(0, now - startedAt), outcome: "done" });
     await lockWrite(env, id, token, { status: "done", finish: 1, heartbeat: 0, updated_at: now, lock_token: null });
     await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
   } catch (_) {}
@@ -829,6 +849,8 @@ async function finalizeDone(env, id, token, live) {
 async function parkJob(env, id, token) {
   const now = Date.now();
   try {
+    const startedAt = (await getJobRow(env, id))?.createdAt || now;
+    await stampMeta(env, id, token, { parkedAt: now, durationMs: Math.max(0, now - startedAt), outcome: "parked" });
     await lockWrite(env, id, token, { status: "parked", heartbeat: 0, updated_at: now, lock_token: null });
     await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
   } catch (_) {}
@@ -836,6 +858,8 @@ async function parkJob(env, id, token) {
 async function failJob(env, id, token, reason, o = {}) {
   const now = Date.now();
   try {
+    const startedAt = (await getJobRow(env, id))?.createdAt || now;
+    await stampMeta(env, id, token, { failedAt: now, durationMs: Math.max(0, now - startedAt), outcome: "failed", reason: String(reason || "").slice(0, 300) });
     await lockWrite(env, id, token, { status: "failed", heartbeat: 0, updated_at: now, lock_token: null });
     await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
   } catch (_) {}
@@ -1076,8 +1100,10 @@ async function handleJobGet(url, ctx, env) {
      is fully self-contained: byte-exact replay from the chunk log, live
      D1 polling (every pump flushes every ~2s), stale-pump kicks, and it
      closes only on done/failed/parked. It also registers as a WATCHER on
-     the job's live registry so liveness models see the attached client. */
-  return new Response(tailStream(env, ctx, id, offset), { status: 200, headers: relayHeaders(job.meta.contentType, id, { "X-Nexus-Offset": String(job.bytes) }) });
+     the job's live registry so liveness models see the attached client.
+     v6: X-Nexus-Age tells the app how long this job has been running
+     server-side ("the worker has been on this request for 47s"). */
+  return new Response(tailStream(env, ctx, id, offset), { status: 200, headers: relayHeaders(job.meta.contentType, id, { "X-Nexus-Offset": String(job.bytes), "X-Nexus-Age": String(Math.max(0, Date.now() - job.createdAt)) }) });
 }
 
 async function handleDelete(url, env) {
@@ -1093,9 +1119,11 @@ async function prune(env) {
   if (!hasDB(env)) return;
   const now = Date.now();
   try {
+    /* v6: PARKED jobs (agent tool-cuts, waiting for the app) get their own
+       longer TTL — a mid-agent run stays recoverable for 30 minutes. */
     const dead = await allSQL(env,
-      `SELECT id FROM jobs WHERE (status IN ('done','failed','parked','stopped') AND updated_at < ?) OR (created_at < ?)`,
-      [now - DONE_TTL_MS, now - JOB_TTL_MS - DONE_TTL_MS]);
+      `SELECT id FROM jobs WHERE ((status IN ('done','failed','stopped') AND updated_at < ?) OR (status = 'parked' AND updated_at < ?) OR (created_at < ?))`,
+      [now - DONE_TTL_MS, now - PARK_TTL_MS, now - JOB_TTL_MS - DONE_TTL_MS]);
     for (const r of dead) await deleteJobRows(env, r.id);
     await runSQL(env,
       `UPDATE jobs SET status = 'failed', heartbeat = 0, lock_token = NULL, updated_at = ? WHERE status IN ('queued','streaming') AND created_at < ?`,
@@ -1109,17 +1137,18 @@ async function prune(env) {
   } catch (_) {}
 }
 
-/* piggyback work: any incoming request can drive one due job in its own
+/* piggyback work: any incoming request can drive due jobs in its own
    fresh execution context — this is what makes progress resume the
-   instant the app reconnects, without waiting for the cron tick */
+   instant the app reconnects, without waiting for the cron tick.
+   v6: two jobs per request (concurrent chats revive together). */
 async function maybeWorkAny(env, ctx) {
   if (!hasDB(env)) return;
   try {
     const now = Date.now();
-    const r = await getSQL(env,
-      `SELECT id FROM jobs WHERE status IN ('queued','streaming') AND next_retry <= ? AND heartbeat < ? ORDER BY next_retry ASC LIMIT 1`,
+    const rows = await allSQL(env,
+      `SELECT id FROM jobs WHERE status IN ('queued','streaming') AND next_retry <= ? AND heartbeat < ? ORDER BY next_retry ASC LIMIT 2`,
       [now, now - STALE_LOCK_MS]);
-    if (r && r.id) {
+    for (const r of rows) {
       try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, r.id, { maxAttempts: 6, budgetMs: 90000 }).catch(() => {})); } catch (_) {}
     }
   } catch (_) {}
@@ -1142,6 +1171,22 @@ async function handleFetch(request, env, ctx) {
       try { cronAge = Date.now() - (await wstateGet(env, "cron_beat") || 0); } catch (_) {}
       try { const n = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','streaming')`); active = n ? Number(n.n) : 0; } catch (_) {}
       out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: true, mode: "job engine", cronOk: cronAge >= 0 && cronAge < 3 * 60 * 1000, cronAgeMs: cronAge, active, time: Date.now() };
+      /* v6: a live jobs digest — every active job's age, size, and attempt
+         count ("what is the worker working on and for how long"), plus the
+         last few finished ones with their SAVED durations. */
+      try {
+        const rows = await allSQL(env, `SELECT id, kind, status, created_at, updated_at, attempts, bytes, meta FROM jobs ORDER BY updated_at DESC LIMIT 8`);
+        const now = Date.now();
+        out.jobs = rows.map(r => {
+          let meta = {}; try { meta = r.meta ? JSON.parse(r.meta) : {}; } catch (_) {}
+          return {
+            id: String(r.id).slice(0, 8), kind: r.kind, status: r.status,
+            ageMs: Math.max(0, now - Number(r.created_at)),
+            bytes: Number(r.bytes), attempts: Number(r.attempts),
+            ...(meta.durationMs != null ? { durationMs: meta.durationMs } : {}),
+          };
+        });
+      } catch (_) {}
       if (!out.cronOk) out.setup = "add a Cron Trigger with schedule * * * * * (Settings → Triggers & Events) so jobs finish while your phone is off";
     } else {
       out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: false, mode: "passthrough (bind D1 as DB for the background job engine)", time: Date.now(), setup: "create a D1 database and bind it with variable name DB (Settings → Bindings)" };
@@ -1181,14 +1226,16 @@ export default {
     }
   },
 
-  /* cron tick: heartbeat + prune + up to two jobs of real work */
+  /* cron tick: heartbeat + prune + up to CRON_JOBS_PER_TICK jobs of real work.
+     v6: four jobs per tick — several chats generating with the phone off all
+     advance instead of finishing two-per-minute. */
   async scheduled(_event, env, ctx) {
     if (!hasDB(env)) return;
     try { await ensureSchema(env); } catch (_) { return; }
     try { await wstateSet(env, "cron_beat", Date.now()); } catch (_) {}
     try { await prune(env); } catch (_) {}
     const deadline = Date.now() + TICK_BUDGET_MS;
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < CRON_JOBS_PER_TICK; i++) {
       if (Date.now() > deadline - 15000) break;
       try {
         const now = Date.now();
@@ -1196,7 +1243,7 @@ export default {
           `SELECT id FROM jobs WHERE status IN ('queued','streaming') AND next_retry <= ? AND heartbeat < ? ORDER BY next_retry ASC LIMIT 1`,
           [now, now - STALE_LOCK_MS]);
         if (!r || !r.id) break;
-        await driveJob(env, ctx, r.id, { maxAttempts: 8, cron: true, budgetMs: Math.max(30000, deadline - Date.now() - 10000) });
+        await driveJob(env, ctx, r.id, { maxAttempts: 8, cron: true, budgetMs: Math.max(30000, Math.floor((deadline - Date.now()) / Math.max(1, CRON_JOBS_PER_TICK - i)) - 10000) });
       } catch (_) {}
     }
     try { await wstateSet(env, "last_work", Date.now()); } catch (_) {}
