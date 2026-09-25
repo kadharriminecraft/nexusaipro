@@ -4,5 +4,8 @@
   "private": false,
   "devDependencies": {
     "wrangler": "4.129.0"
+  },
+  "scripts": {
+    "test": "node test/run.mjs"
   }
 }

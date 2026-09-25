@@ -200,7 +200,13 @@
     }
     .dur-chip .ic { width: 11px; height: 11px; opacity: .8; }
     .message-actions .dur-chip { align-self: center; margin-right: 2px; }
+    /* v7: honest timing split — how long the job waited in line for a busy
+       provider vs how long the model actually worked. Only shown when there
+       WAS a wait, so a never-rate-limited run shows just the work time. */
+    .dur-chip.wait-chip { color: var(--warning); }
+    .message-actions .dur-chip + .dur-chip { margin-left: 0; }
     .history-time .chat-run { color: var(--accent); font-variant-numeric: tabular-nums; }
+    .history-time .chat-wait { color: var(--warning); font-variant-numeric: tabular-nums; }
 
     /* markdown */
     .markdown p { margin: 0 0 12px; }
@@ -642,6 +648,16 @@
     .history-star:hover { color: #f5c451; background: rgba(245, 196, 81, .12); }
     .history-star.on { color: #f5c451; }
     .history-star.on .ic path { fill: rgba(245, 196, 81, .9); }
+    /* v7: unread-done indicator — a green dot on a chat whose response
+       finished while you were looking at something else. It clears the
+       moment you open that chat. */
+    .history-unread {
+      width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; margin-right: 1px;
+      background: var(--success); box-shadow: 0 0 0 3px rgba(98, 197, 138, .16);
+      animation: unread-pop .35s ease-out;
+    }
+    .history-item.unread .history-title { font-weight: 600; }
+    @keyframes unread-pop { from { transform: scale(.2); opacity: 0; } to { transform: scale(1); opacity: 1; } }
     .spin { animation: spin 1s linear infinite; }
 
     /* workspace files */
@@ -1333,6 +1349,8 @@
       // (the un-suffixed legacy keys are migrated/swept at boot)
       vaultPtr: "nexus3.vaultr",
       draft: "nexus3.draft", migrated: "nexus3.migrated", reasonFlip: "nexus3.reasonDefaultOn",
+      // v7: rate-limit / wait-time telemetry (averages shown in Settings)
+      telemetry: "nexus3.telemetry",
     };
     const CONTINUE_INSTRUCTION = "Your previous answer was cut off by a connection drop. Continue exactly where you stopped. Do not repeat any text you already wrote, do not apologize, just continue the content seamlessly.";
     const STEP_LIMIT_INSTRUCTION = "You have reached the tool-use step limit for this task. Stop calling tools now and write your final answer: summarize what you built, the current state of the files, and anything left to do.";
@@ -1656,6 +1674,7 @@
       retryLevel: "aggressive", // auto-retry pace: relaxed | standard | aggressive | relentless — editable live on the retry card
       /* ---- bulletproof backgrounding ---- */
       relayUrl: "",            // optional Cloudflare-Worker stream relay: keeps the API running server-side while the phone is off / away
+      useWorker: true,         // v7: master switch — route through the background relay worker or talk to OpenRouter directly
       autoResume: true,        // automatically resume interrupted thinking/agent runs the moment you return (no tap needed)
       autoResumeMax: 12,       // resume attempts per interrupted run while you're away-and-back
       voice: { auto: true, voiceURI: "", pitch: 1, rate: 1, volume: 0.95, emotion: 1, pause: 170, focus: false, think: true, length: "balanced" },
@@ -1772,6 +1791,128 @@
       if (m.genMs) return m.genMs;
       if (m.genStart && (m.done || m.interrupted || m.stopped || m.error)) return Date.now() - m.genStart;
       return 0;
+    }
+
+    /* ============================== v7: honest run status ==============================
+       The worker tells us, in structured form, whether a job is really
+       generating, waiting in line for a rate-limited provider, or continuing
+       a truncated answer. The composer used to say "Thinking…" for all three
+       — this turns that into the truth, and carries the attempt count. */
+    const runStateFor = chat => (runFor(chat) || {}).liveStatus || null;
+    /* a chat counts as "being viewed" only when the tab is actually visible
+       on it — that's what decides whether a finished run is unread */
+    function isChatViewed(chat) {
+      return !!chat && state.currentId === chat.id && !document.hidden;
+    }
+    function statusForRun(run) {
+      const ls = run && run.liveStatus;
+      if (!ls) return { text: run && run.chat && run.chat.image ? "Painting your image…" : "Thinking…", kind: "", live: true };
+      if (ls.state === "waiting") {
+        const rl = ls.rateLimited || ls.code === 429;
+        const head = rl ? "Waiting in line — rate limited" : "Waiting in line — provider busy";
+        const retry = ls.waitMs ? ", retry in ~" + Math.max(1, Math.round(ls.waitMs / 1000)) + "s" : "";
+        const tries = ls.attempt ? " (attempt " + ls.attempt + (ls.max ? "/" + ls.max : "") + ")" : "";
+        return { text: head + tries + retry, kind: "warn", live: true };
+      }
+      if (ls.state === "continuing") {
+        return { text: "Continuing the answer…" + (ls.attempt > 1 ? " (attempt " + ls.attempt + (ls.max ? "/" + ls.max : "") + ")" : ""), kind: "warn", live: true };
+      }
+      // working
+      return { text: run && run.agent ? "Working · step " + ((run.steps || 0) + 1) + "…" : "Thinking…", kind: "", live: true };
+    }
+    /* v7: the live wait/work split for a run. workMs comes from the worker's
+       own accounting (server-side, survives the app being closed); waitedMs
+       stays 0 when the provider never rate limited us — the UI then hides the
+       wait figure entirely, exactly as asked. While a run is live the worker
+       has only banked work time at its checkpoints, so we fall back to
+       elapsed-minus-waited, which is the same quantity computed locally. */
+    function waitWorkFor(run) {
+      const ls = run && run.liveStatus;
+      const waitedMs = Math.max(0, (run && run.waitedMs) || (ls && ls.waitedMs) || 0);
+      let workMs = Math.max(0, (run && run.workMs) || (ls && ls.workMs) || 0);
+      // live estimate: from the moment the provider actually started responding
+      // (workStartAt, set when the request left the waiting loop) to now, minus
+      // any waiting still accruing after it.
+      if (!workMs && run && run.workStartAt) workMs = Math.max(0, Date.now() - run.workStartAt);
+      if (!workMs && run && run.genStart) workMs = Math.max(0, Date.now() - run.genStart - waitedMs);
+      return { waitedMs, workMs };
+    }
+    function waitWorkHtml(run, title) {
+      const { waitedMs, workMs } = waitWorkFor(run);
+      let out = "";
+      if (waitedMs > 0) {
+        out += '<span class="dur-chip wait-chip" title="Time spent waiting in line for a busy / rate-limited provider">' +
+          ic("clock") + "wait " + fmtElapsed(waitedMs) + "</span>";
+      }
+      if (workMs > 0) {
+        out += '<span class="dur-chip" title="' + escapeAttr(title || "How long the model actually worked") + '">' +
+          ic("clock") + "work " + fmtElapsed(workMs) + "</span>";
+      }
+      return out;
+    }
+    /* v7: the same split for a COMPLETED message, from its saved fields. When
+       the provider never rate limited the run, waitedMs is absent and only the
+       work figure shows — "wait" never appears for a clean run. */
+    function msgWaitWorkHtml(m, fallbackDur) {
+      const waitedMs = m.waitedMs || 0;
+      const workMs = m.workMs || fallbackDur || 0;
+      let out = "";
+      if (waitedMs > 0) {
+        out += '<span class="dur-chip wait-chip" title="Time spent waiting in line for a busy / rate-limited provider">' +
+          ic("clock") + "wait " + fmtElapsed(waitedMs) + "</span>";
+      }
+      if (workMs > 0) {
+        out += '<span class="dur-chip" title="How long the model actually worked">' +
+          ic("clock") + "work " + fmtElapsed(workMs) + "</span>";
+      }
+      return out;
+    }
+
+    /* ============================== v7: wait-time telemetry ==============================
+       A small rolling history of rate-limit waits so Settings can answer
+       "on average, how long does it take to get in, and how long does the
+       work take". Only runs that actually waited contribute to the wait
+       average. */
+    const TELEMETRY_CAP = 40;
+    function loadTelemetry() {
+      const t = readJson(K.telemetry, null);
+      return t && typeof t === "object" && Array.isArray(t.runs) ? t : { runs: [] };
+    }
+    function recordTelemetry(entry) {
+      if (!entry || (!entry.waitedMs && !entry.workMs)) return;
+      const t = loadTelemetry();
+      t.runs.unshift({ at: Date.now(), waitedMs: Math.round(entry.waitedMs || 0), workMs: Math.round(entry.workMs || 0) });
+      t.runs = t.runs.slice(0, TELEMETRY_CAP);
+      writeJson(K.telemetry, t);
+    }
+    function telemetrySummary() {
+      const runs = loadTelemetry().runs;
+      const waited = runs.filter(r => r.waitedMs > 0);
+      const avg = arr => arr.length ? Math.round(arr.reduce((s, v) => s + v, 0) / arr.length) : 0;
+      return {
+        runs: runs.length,
+        limited: waited.length,
+        avgWaitMs: avg(waited.map(r => r.waitedMs)),
+        maxWaitMs: waited.reduce((m, r) => Math.max(m, r.waitedMs), 0),
+        avgWorkMs: avg(runs.map(r => r.workMs).filter(v => v > 0)),
+      };
+    }
+
+    /* v7: unread-done bookkeeping. A chat whose run finished while you were
+       NOT looking at it gets a green dot; opening it clears the dot. The
+       timestamp survives reloads, so a response that lands while the app is
+       closed still shows up as unread when you reopen. */
+    function markChatUnread(chat) {
+      if (!chat || isChatViewed(chat)) return;
+      chat.unreadDoneAt = Date.now();
+      saveChats();
+      renderHistory();
+    }
+    function clearChatUnread(chat) {
+      if (chat && chat.unreadDoneAt) { delete chat.unreadDoneAt; saveChats(); }
+    }
+    function chatHasUnread(chat) {
+      return !!chat.unreadDoneAt && state.currentId !== chat.id;
     }
 
     /* ============================== storage ============================== */
@@ -2092,18 +2233,60 @@
           (phone off? still running) and replies with an X-Nexus-Job header
           the stream reader can reconnect to by byte offset. */
     function relayUrl() { return (state.settings.relayUrl || "").trim().replace(/\/+$/, ""); }
+    /* v7: the worker is used only when it's both configured AND switched on.
+       Every relay decision (routing, job re-attach, vault job records) funnels
+       through relayOn() so the Settings toggle genuinely turns it off. */
+    function relayOn() { return !!relayUrl() && state.settings.useWorker !== false; }
+    /* v7: a stable key for one logical generation (chat + message + start
+       time). The app sends it as X-Nexus-Client, so the worker can hand the
+       SAME job back even if the app closed before X-Nexus-Job arrived — the
+       exact "send a prompt and immediately close the app" case. */
+    function clientKeyFor(chat, msgIndex) {
+      if (!chat) return "";
+      const m = chat.messages[msgIndex];
+      const start = (m && m.genStart) || (runFor(chat) || {}).genStart || 0;
+      if (!start) return "";
+      return String(chat.id) + ":" + msgIndex + ":" + start;
+    }
+    function clientKeyForMsg(chat, msgIndex) { return clientKeyFor(chat, msgIndex); }
     function relayTarget(url) {
-      const r = relayUrl();
+      const r = relayOn() ? relayUrl() : "";
       if (!r) return url;
       if (url === CHAT_ENDPOINT) return r + "/chat";
       if (url === IMAGES_ENDPOINT) return r + "/images";
       return url;
     }
     const NET_RETRY_DELAYS = [500, 1000, 2000, 4000, 6000, 9000]; // ms, ±40% jitter
-    async function chatFetch(body, signal, onRetry, url = CHAT_ENDPOINT) {
-      const viaRelay = !!relayUrl();
+    /* v7: the direct (worker-off) path has no server to report status, so the
+       retry loop builds the SAME structured shape locally — same statusForRun
+       rendering, same wait/work split, same telemetry. `stats` is a per-run
+       accumulator: cumulative wait ms, attempt count, and the last status. */
+    async function chatFetch(body, signal, onRetry, url = CHAT_ENDPOINT, clientKey = "", stats = null) {
+      const viaRelay = relayOn();
       const target = relayTarget(url);
       let netAttempts = 0, rlAttempts = 0, serverAttempts = 0, toAttempts = 0;
+      const noteWait = (waitMs, rateLimited, reason, attempt, max) => {
+        if (!stats) return;
+        stats.waitedMs = (stats.waitedMs || 0) + waitMs;
+        stats.attempts = attempt;
+        stats.max = max;
+        const ls = {
+          state: "waiting", attempt, max, waitMs, reason, rateLimited,
+          waitedMs: Math.round(stats.waitedMs), workMs: 0,
+          since: stats.since || Date.now(),
+        };
+        stats.liveStatus = ls;
+        /* statusForRun/waitWorkFor read the RUN's liveStatus, so the local
+           accumulator must publish there too — otherwise a worker-off wait
+           still painted a bare "Thinking…". */
+        if (stats.run) {
+          stats.run.liveStatus = ls;
+          stats.run.waitedMs = Math.max(0, stats.waitedMs);
+          stats.run.attempts = attempt;
+          stats.run.maxAttempts = max;
+        }
+        stats.onUpdate?.();
+      };
       while (true) {
         const ctrl = new AbortController();
         let timedOut = false;
@@ -2112,14 +2295,18 @@
         const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, REQUEST_TIMEOUT);
         let resp;
         try {
+          const headers = {
+            "Authorization": "Bearer " + state.settings.apiKey,
+            "Content-Type": "application/json",
+            "HTTP-Referer": location.href,
+            "X-Title": "Nexus AI Pro",
+          };
+          /* v7: the client key lets the worker find THIS request's job again
+             even if we never receive X-Nexus-Job (app closed mid-send). */
+          if (viaRelay && clientKey) headers["X-Nexus-Client"] = clientKey;
           resp = await fetch(target, {
             method: "POST",
-            headers: {
-              "Authorization": "Bearer " + state.settings.apiKey,
-              "Content-Type": "application/json",
-              "HTTP-Referer": location.href,
-              "X-Title": "Nexus AI Pro",
-            },
+            headers,
             body: JSON.stringify(body),
             signal: ctrl.signal,
           });
@@ -2132,6 +2319,7 @@
             onRetry?.(navigator.onLine
               ? "Connection hiccup — retrying (" + netAttempts + "/" + NET_RETRY_DELAYS.length + ")…"
               : "Waiting for internet to come back…");
+            noteWait(delay, false, navigator.onLine ? "connection hiccup" : "offline", netAttempts, NET_RETRY_DELAYS.length);
             await sleep(delay, signal);
             continue;
           }
@@ -2152,18 +2340,21 @@
           rlAttempts++;
           const ra = Math.min(Math.max(Number(payload?.error?.metadata?.retry_after_seconds) || 2, 1), 10);
           onRetry?.("Provider busy — retrying in " + ra + "s…");
+          noteWait(ra * 1000, true, "provider rate limited", rlAttempts, 3);
           await sleep(ra * 1000, signal);
           continue;
         }
         if (resp.status === 408 && toAttempts < 2) {
           toAttempts++;
           onRetry?.("Provider timeout — retrying (" + toAttempts + "/2)…");
+          noteWait(toAttempts * 1000, false, "provider timeout", toAttempts, 2);
           await sleep(toAttempts * 1000, signal);
           continue;
         }
         if (resp.status >= 500 && serverAttempts < 3) {
           serverAttempts++;
           onRetry?.("Provider error — retrying (" + serverAttempts + "/3)…");
+          noteWait(serverAttempts * 1000, false, "provider error " + resp.status, serverAttempts, 3);
           await sleep(serverAttempts * 1000, signal);
           continue;
         }
@@ -2198,8 +2389,20 @@
       // Every line is checked for the two "the model actually finished"
       // markers: the SSE terminator [DONE] and a non-null finish_reason.
       const handleLine = line => {
-        if (!line || line.startsWith(":")) return;
-        if (!line.startsWith("data:")) return;
+        /* v7: the worker's machine-readable status comments drive the composer
+           status line. `: nexus-status {json}` says whether the job is really
+           generating ("working"), waiting in line for a busy provider
+           ("waiting"), or continuing a truncated answer ("continuing") — the
+           old UI painted "Thinking…" in all three cases, which is exactly why
+           a rate-limited run looked like a frozen thought. */
+        if (line && line.startsWith(":")) {
+          const body = line.slice(1).trim();
+          if (body.startsWith("nexus-status ")) {
+            try { handlers.onStatus?.(JSON.parse(body.slice("nexus-status ".length))); } catch (_) {}
+          }
+          return;
+        }
+        if (!line || !line.startsWith("data:")) return;
         const raw = line.slice(5).trim();
         if (!raw) return;
         if (raw === "[DONE]") { sawDone = true; return; }
@@ -2448,10 +2651,16 @@
         toolCalls: msg.tool_calls || null, usage: msg.usage || null,
         imagePending: !!msg.imagePending, agent: !!msg.agent, done: !!msg.done,
         genStart: msg.genStart || (run && run.genStart) || 0,
+        /* v7: remember the worker client key so a job that was created but
+           whose id never reached us (app closed mid-send) can still be found
+           and re-attached on the next boot. */
+        clientKey: relayOn() && run?.ctx?.clientKey ? run.ctx.clientKey : (relayOn() ? clientKeyFor(chat, msgIndex) : ""),
+        waitedMs: msg.waitedMs || (run && run.waitedMs) || 0,
+        workMs: msg.workMs || (run && run.workMs) || 0,
         job: run?.ctx?.jobResume ? {
           id: run.ctx.jobResume.jobId,
           offset: run.ctx.jobResume.offset || 0,
-          url: relayUrl(), kind: run.ctx.jobKind || "chat",
+          url: relayOn() ? relayUrl() : "", kind: run.ctx.jobKind || "chat",
         } : null,
         steps: (run && run.steps) || 0,
       };
@@ -2578,15 +2787,22 @@
           if (rec.genStart && !msg.genStart) msg.genStart = rec.genStart; // v4: the elapsed clock keeps its true start
           msg.resumeSteps = rec.steps || 0;
           const partial = (msg.content || msg.reasoning || "").trim();
-          if (partial || msg.tool_calls?.length || rec.imagePending) {
+          /* v7: a job exists (by id, or by client key when the id never reached
+             us) → recover even with NO content yet. That is the "send a prompt
+             and immediately close the app" case: nothing streamed locally, but
+             the worker is generating and we must re-attach on return. */
+          const hasJob = !!(rec.job?.id || rec.clientKey);
+          if (hasJob || partial || msg.tool_calls?.length || rec.imagePending) {
             msg.interrupted = true;
             saveChats();
             state.resume = { chatId: chat.id, msgIndex: rec.msgIndex };
             renderChat();
             renderHistory();
             // best path: the relay still holds the live job → re-attach and
-            // stream everything the model kept writing while you were away
-            if (rec.job?.id && rec.job.url && relayUrl()) {
+            // stream everything the model kept writing while you were away.
+            // v7: also try when we only have a client key (job created but its
+            // id never reached us because the app closed mid-send).
+            if ((rec.job?.id || rec.clientKey) && (rec.job?.url || relayUrl()) && relayOn()) {
               if (chat.id === state.currentId) setStatus("Reconnecting to the background job…", "", true);
               resumeRelayJob(rec, chat).then(res => {
                 if (res && res.continueAgent) generate({ chat, steps: res.steps || 0 });
@@ -2615,30 +2831,48 @@
        to normal auto-resume when the job is gone (relay restart, expiry). */
     async function resumeRelayJob(rec, chat) {
       if (runFor(chat)) return { resumed: false };
-      const job = rec.job;
+      const job = rec.job || {};
+      const clientKey = rec.clientKey || "";
+      /* v7: a job whose id we never saw (app closed before the response
+         headers landed) is still findable by the client key we sent. */
+      const byClient = !job.id && !!clientKey && relayOn();
+      if (!job.id && !byClient) return { resumed: false };
       const msgIndex = rec.msgIndex;
       const msg = chat.messages[msgIndex];
       if (!msg || msg.role !== "assistant") return { resumed: false };
-      const jobUrl = off => String(job.url).replace(/\/+$/, "") + "/job/" + encodeURIComponent(job.id) + "?offset=" + off;
+      const base = String(job.url || relayUrl()).replace(/\/+$/, "");
+      const jobUrl = off => byClient
+        ? base + "/job/by-client?client=" + encodeURIComponent(clientKey) + "&offset=" + off
+        : base + "/job/" + encodeURIComponent(job.id) + "?offset=" + off;
       let resp;
       try {
         resp = await fetch(jobUrl(job.offset || 0), { headers: { "Authorization": "Bearer " + state.settings.apiKey } });
       } catch (_) { return { resumed: false }; }
       if (!resp.ok) return { resumed: false }; // job expired / relay restarted
+      /* v7: adopt whatever job id the worker hands back so later reconnects
+         (and the vault record) can use the precise /job/:id path again. */
+      const adoptedId = resp.headers?.get ? resp.headers.get("X-Nexus-Job") : null;
+      const ct = resp.headers && resp.headers.get ? (resp.headers.get("content-type") || "") : "";
+      const jobKind = job.kind || (ct.indexOf("json") >= 0 ? "images" : "chat");
+      const resumeCtx = { id: adoptedId || job.id, url: base, kind: jobKind };
       /* v4: register a RUN for this chat (parallel streams stay independent) */
       const ctrl = new AbortController();
       const run = {
-        chat, ctx: { controller: ctrl, chatId: chat.id, jobKind: job.kind },
+        chat, ctx: { controller: ctrl, chatId: chat.id, jobKind: resumeCtx.kind },
         steps: rec.steps || 0, autoContinues: 0, streamingIndex: -1,
         genStart: msg.genStart || rec.genStart || Date.now(),
       };
+      if (rec.waitedMs) run.waitedMs = rec.waitedMs;
+      if (rec.workMs) run.workMs = rec.workMs;
+      if (resumeCtx.id) run.ctx.jobResume = { jobId: resumeCtx.id, offset: 0, reconnectUrl: off => base + "/job/" + encodeURIComponent(resumeCtx.id) + "?offset=" + off };
+      if (rec.clientKey) run.ctx.clientKey = rec.clientKey;
       state.runs.set(chat.id, run);
       if (!msg.genStart) msg.genStart = run.genStart;
       hideBanner();
       setGeneratingUi(true);
       acquireWakeLock();
       try {
-        if (job.kind === "images") {
+        if (resumeCtx.kind === "images") {
           runStatus(chat, "Resuming your image…", "", true);
           const text = await resp.text();
           let data = null;
@@ -2655,16 +2889,27 @@
           msg.done = true;
           msg.genMs = Date.now() - (msg.genStart || Date.now());
           saveChats();
+          markChatUnread(chat);
           toast("Image finished while you were away — here it is", "");
           return { resumed: true };
         }
         runStatus(chat, "Streaming what the AI kept writing while you were away…", "", true);
         beginStreamUi(chat, msgIndex, msg.content || "");
         persistInflight(chat, msgIndex);
-        const resume = { jobId: job.id, offset: job.offset || 0, reconnectUrl: jobUrl };
+        const resume = run.ctx.jobResume || { jobId: job.id, offset: job.offset || 0, reconnectUrl: jobUrl };
         run.ctx.jobResume = resume;
         run.ctx.jobKind = "chat";
         let streamedText = msg.content || "", streamedReasoning = msg.reasoning || "";
+        const onStatus = ls => {
+          if (!ls || typeof ls !== "object") return;
+          run.liveStatus = ls;
+          if (typeof ls.waitedMs === "number") run.waitedMs = Math.max(0, ls.waitedMs);
+          if (typeof ls.workMs === "number") run.workMs = Math.max(0, ls.workMs);
+          if (typeof ls.attempt === "number") run.attempts = ls.attempt;
+          if (typeof ls.max === "number") run.maxAttempts = ls.max;
+          const st = statusForRun(run);
+          runStatus(chat, st.text, st.kind, true);
+        };
         const rs = await readStream(resp.body, ctrl.signal, {
           onText: t => { streamedText += t; msg.content = streamedText; pushStreamUpdate(chat, msgIndex); },
           onReasoning: r => { streamedReasoning += r; msg.reasoning = streamedReasoning; pushStreamUpdate(chat, msgIndex, true); },
@@ -2672,6 +2917,7 @@
           onStall: () => ctrl.abort(),
           onToolProgress: prog => paintToolDraft(prog, chat, msgIndex),
           onRetry: t => runStatus(chat, t, "warn", true),
+          onStatus,
         }, resume);
         clearToolDraft(chat);
         finalizeStreamUi(chat);
@@ -2699,10 +2945,15 @@
         msg.done = true;
         delete msg.interrupted;
         msg.genMs = Date.now() - (msg.genStart || Date.now());
+        const ww = waitWorkFor(run);
+        if (ww.waitedMs > 0) msg.waitedMs = ww.waitedMs;
+        if (ww.workMs > 0) msg.workMs = ww.workMs;
+        recordTelemetry({ waitedMs: ww.waitedMs, workMs: ww.workMs || msg.genMs });
         chat.messages = chat.messages.filter(m => !m.meta);
         clearInflight(chat);
         saveChats();
         flushChats(); // v4: terminal state → disk immediately (vault already erased)
+        markChatUnread(chat);
         toast("Response finished while you were away — nothing was lost", "");
         return { resumed: true };
       } catch (err) {
@@ -2855,7 +3106,11 @@
       const agent = !!(chat.agent && caps.tools && !noTools);
       const toolsActive = !!(caps.tools && !noTools && activeTools(agent).length);
       const ctrl = new AbortController();
-      run.ctx = { controller: ctrl, chatId: chat.id };
+      run.ctx = { controller: ctrl, chatId: chat.id, jobKind: "chat" };
+      run.liveStatus = null;
+      run.waitedMs = 0;
+      run.workMs = 0;
+      run.attempts = 0;
       acquireWakeLock();
 
       let msgIndex, baseContent = "", baseReasoning = "";
@@ -2883,6 +3138,11 @@
       }
       const msg = chat.messages[msgIndex];
       msg.agent = agent || undefined;
+      /* v7: a client key can only be built once the placeholder exists (it
+         carries genStart) — that same key is sent to the worker and saved in
+         the vault, so a job created during a mid-send app kill is findable. */
+      const clientKey = clientKeyFor(chat, msgIndex);
+      run.ctx.clientKey = clientKey;
       persistInflight(chat, msgIndex);
       beginStreamUi(chat, msgIndex, baseContent);
       updateModelChip();
@@ -2899,18 +3159,45 @@
         pushStreamUpdate(chat, msgIndex, true);
       };
 
+      /* v7: when the worker is off, this accumulator is what produces the
+         wait/work split locally — same shape the worker sends, so the composer
+         status and the message chips behave identically either way. */
+      const directStats = {
+        waitedMs: 0, attempts: 1, max: 1, since: run.genStart, run,
+        onUpdate: () => {
+          const st = statusForRun(run);
+          runStatus(chat, st.text, st.kind, true);
+          renderHistory();
+        },
+      };
       try {
-        const resp = await chatFetch(body, ctrl.signal, t => runStatus(chat, t, "warn", true));
+        const resp = await chatFetch(body, ctrl.signal, t => runStatus(chat, t, "warn", true), CHAT_ENDPOINT, clientKey, directStats);
+        // the wait is over: bank it and start the work clock
+        run.waitedMs = Math.max(run.waitedMs || 0, directStats.waitedMs);
+        run.attempts = directStats.attempts;
+        run.workStartAt = Date.now();
+        run.liveStatus = { state: "working", attempt: directStats.attempts, max: directStats.max, waitedMs: Math.round(directStats.waitedMs), workMs: 0, since: run.genStart };
         // relay mode: capture the job handle so the stream can re-attach after
         // drops, and so the vault can re-attach after a full page kill
         const jobId = resp.__nexusJob || (resp.headers?.get ? resp.headers.get("X-Nexus-Job") : null);
         let resume = null;
-        if (jobId && relayUrl()) {
+        if (jobId && relayOn()) {
           resume = { jobId, offset: 0, reconnectUrl: off => relayUrl() + "/job/" + encodeURIComponent(jobId) + "?offset=" + off };
           run.ctx.jobResume = resume;
           run.ctx.jobKind = "chat";
         }
         runStatus(chat, agent ? "Working · step " + (run.steps + 1) + "…" : "Thinking…", "", true);
+        const onStatus = ls => {
+          if (!ls || typeof ls !== "object") return;
+          run.liveStatus = ls;
+          if (typeof ls.waitedMs === "number") run.waitedMs = Math.max(0, ls.waitedMs);
+          if (typeof ls.workMs === "number") run.workMs = Math.max(0, ls.workMs);
+          if (typeof ls.attempt === "number") run.attempts = ls.attempt;
+          if (typeof ls.max === "number") run.maxAttempts = ls.max;
+          const st = statusForRun(run);
+          runStatus(chat, st.text, st.kind, true);
+          renderHistory(); // the history row's live clock gains the wait chip
+        };
         const rs = await readStream(resp.body, ctrl.signal, {
           onText: applyText,
           onReasoning: applyReasoning,
@@ -2918,6 +3205,7 @@
           onStall: () => ctrl.abort(),
           onToolProgress: prog => paintToolDraft(prog, chat, msgIndex),
           onRetry: t => runStatus(chat, t, "warn", true),
+          onStatus,
         }, resume);
         const toolCalls = rs.toolCalls;
         clearToolDraft(chat);
@@ -2977,10 +3265,18 @@
         msg.done = true;
         delete msg.interrupted;
         msg.genMs = Date.now() - (msg.genStart || Date.now()); // v4: how long this request worked for — SAVED
+        /* v7: persist the honest wait/work split on the message and the rolling
+           telemetry, then light the unread dot when you weren't watching. */
+        const ww = waitWorkFor(run);
+        if (ww.waitedMs > 0) msg.waitedMs = ww.waitedMs;
+        if (ww.workMs > 0) msg.workMs = ww.workMs;
+        if (run.attempts > 1) msg.attempts = run.attempts;
+        recordTelemetry({ waitedMs: ww.waitedMs, workMs: ww.workMs || msg.genMs });
         chat.messages = chat.messages.filter(m => !m.meta);
         clearInflight(chat);
         saveChats();
         flushChats(); // v4: the terminal state must hit IndexedDB NOW — a done message whose vault record is already erased cannot survive a debounced save racing a page kill
+        markChatUnread(chat);
         return { status: "done", index: msgIndex };
       } catch (err) {
         finalizeStreamUi(chat);
@@ -3053,10 +3349,21 @@
       chat.messages.push({ role: "assistant", content: "", reasoning: "", imagePending: true, createdAt: Date.now(), genStart: run.genStart });
       const msgIndex = chat.messages.length - 1;
       const msg = chat.messages[msgIndex];
+      const clientKey = clientKeyFor(chat, msgIndex);
+      run.ctx.clientKey = clientKey;
       beginStreamUi(chat, msgIndex, "");
       runStatus(chat, "Painting your image…", "", true);
       updateModelChip();
       persistInflight(chat, msgIndex);
+      /* v7: same local wait/work accumulator as the chat path (worker-off). */
+      const directStats = {
+        waitedMs: 0, attempts: 1, max: 1, since: run.genStart, run,
+        onUpdate: () => {
+          const st = statusForRun(run);
+          runStatus(chat, st.text, st.kind, true);
+          renderHistory();
+        },
+      };
       const lastUser = [...chat.messages].reverse().find(m => m.role === "user");
       const prompt = typeof lastUser?.content === "string" ? lastUser.content
         : (Array.isArray(lastUser?.content) ? (lastUser.content.find(p => p?.type === "text")?.text || "") : "");
@@ -3069,11 +3376,14 @@
         } else if (refs.length) {
           toast(imgModel?.name || "This image model" + " only takes text — attached photos weren't sent", "warn");
         }
-        const resp = await chatFetch(body, ctrl.signal, t => runStatus(chat, t, "warn", true), IMAGES_ENDPOINT);
+        const resp = await chatFetch(body, ctrl.signal, t => runStatus(chat, t, "warn", true), IMAGES_ENDPOINT, clientKey, directStats);
+        run.waitedMs = Math.max(run.waitedMs || 0, directStats.waitedMs);
+        run.attempts = directStats.attempts;
+        run.workStartAt = Date.now();
         // relay mode: the job handle lets a returning page (or a connection
         // dip) pull the buffered image JSON instead of re-requesting it
         const jobId = resp.__nexusJob || (resp.headers?.get ? resp.headers.get("X-Nexus-Job") : null);
-        if (jobId && relayUrl()) {
+        if (jobId && relayOn()) {
           run.ctx.jobResume = { jobId, offset: 0, reconnectUrl: off => relayUrl() + "/job/" + encodeURIComponent(jobId) + "?offset=" + off };
           run.ctx.jobKind = "images";
           persistInflight(chat, msgIndex);
@@ -3089,9 +3399,14 @@
         msg.content = "";
         msg.done = true;
         msg.genMs = Date.now() - (msg.genStart || Date.now());
+        const ww = waitWorkFor(run);
+        if (ww.waitedMs > 0) msg.waitedMs = ww.waitedMs;
+        if (ww.workMs > 0) msg.workMs = ww.workMs;
+        recordTelemetry({ waitedMs: ww.waitedMs, workMs: ww.workMs || msg.genMs });
         clearInflight(chat);
         saveChats();
         flushChats(); // v4: terminal state → disk immediately
+        markChatUnread(chat);
         return { status: "done", index: msgIndex };
       } catch (err) {
         finalizeStreamUi(chat);
@@ -3967,7 +4282,10 @@
         ? '<span class="msg-flag">' + ic("alert") + (m.interrupted ? "Interrupted — response cut off" : "Stopped") + "</span>"
         : "";
       const showContinue = isLast && !streaming && (m.interrupted || m.stopped) && (m.content || m.reasoning || m.tool_calls);
-      const durChip = !streaming && dur ? '<span class="dur-chip" title="How long this request worked for">' + ic("clock") + fmtElapsed(dur) + "</span>" : "";
+      /* v7: honest split — "wait Xs" only when the provider actually made us
+         wait; "work Xs" is the real generation time (a clean run shows work
+         alone, exactly as asked). */
+      const durChip = !streaming && dur ? msgWaitWorkHtml(m, dur) : "";
       const actions = isLast && !streaming
         ? '<div class="message-actions">' + durChip +
           '<button data-action="copy-msg" data-index="' + index + '" aria-label="Copy response">' + ic("copy") + "</button>" +
@@ -4130,7 +4448,9 @@
         : "";
       const isLastMsg = lastIndex === chat.messages.length - 1;
       const showContinue = isLastMsg && !streaming && (last.m.interrupted || last.m.stopped) && (last.m.content || last.m.reasoning || last.m.tool_calls);
-      const durChip = !streaming && runDur ? '<span class="dur-chip" title="How long this agent run worked for">' + ic("clock") + fmtElapsed(runDur) + "</span>" : "";
+      /* v7: honest split for the unified agent row — the final round's saved
+         wait/work totals cover the whole run. */
+      const durChip = !streaming && runDur ? msgWaitWorkHtml(last.m, runDur) : "";
       const actions = isLastMsg && !streaming && !endCard
         ? '<div class="message-actions">' + durChip +
           '<button data-action="copy-msg" data-index="' + lastIndex + '" aria-label="Copy response">' + ic("copy") + "</button>" +
@@ -4942,11 +5262,21 @@
       listEl.innerHTML = chats.map(chat => {
         const run = runFor(chat); // v4: any chat can be generating — its row shows a live clock
         const files = chat.ws ? Object.keys(chat.ws.files).length : 0;
-        return '<div class="history-item ' + (chat.id === state.currentId ? "active" : "") + '" data-action="switch-chat" data-chat-id="' + escapeAttr(chat.id) + '">' +
-          (run ? '<span class="spin" style="color:var(--accent)">' + ic("refresh") + "</span>" : ic("msg")) +
+        /* v7: unread-done green dot (a run finished while you were elsewhere)
+           and the live wait-in-line chip while a run is rate limited. */
+        const unread = chatHasUnread(chat);
+        const ww = run ? waitWorkFor(run) : null;
+        const waitChip = ww && ww.waitedMs > 0
+          ? ' · <span class="chat-wait" title="Waiting in line for a busy provider">wait ' + fmtElapsed(ww.waitedMs) + "</span>"
+          : "";
+        const lead = run
+          ? '<span class="spin" style="color:var(--accent)">' + ic("refresh") + "</span>"
+          : (unread ? '<span class="history-unread" title="Response finished — not viewed yet" aria-label="Unread response"></span>' : ic("msg"));
+        return '<div class="history-item ' + (chat.id === state.currentId ? "active" : "") + (unread ? " unread" : "") + '" data-action="switch-chat" data-chat-id="' + escapeAttr(chat.id) + '">' +
+          lead +
           '<div class="history-copy"><div class="history-title">' + (chat.agent ? "⚡ " : "") + escapeHtml(chat.title || "New chat") + "</div>" +
           '<div class="history-time">' + chat.messages.length + " msg" + (files ? " · " + files + " files" : "") + " · " + formatDate(chat.updatedAt) +
-          (run ? ' · <span class="chat-run" data-chat-elapsed="" data-chat-start="' + run.genStart + '">' + fmtElapsed(Date.now() - run.genStart) + "</span>" : "") + "</div></div>" +
+          (run ? ' · <span class="chat-run" data-chat-elapsed="" data-chat-start="' + run.genStart + '">' + fmtElapsed(Date.now() - run.genStart) + "</span>" : "") + waitChip + "</div></div>" +
           '<button class="history-star' + (chat.starred ? " on" : "") + '" data-action="star-chat" data-chat-id="' + escapeAttr(chat.id) + '" aria-label="' + (chat.starred ? "Unstar chat (starred chats survive wipes)" : "Star chat (starred chats survive wipes)") + '">' + ic("star") + "</button>" +
           '<button class="history-del" data-action="delete-chat" data-chat-id="' + escapeAttr(chat.id) + '" aria-label="Delete chat">' + ic("trash") + "</button></div>";
       }).join("");
@@ -4990,6 +5320,34 @@
     /* ============================== settings ============================== */
     function draft() { return state.settingsDraft || state.settings; }
     function setDraft(key, value) { draft()[key] = value; }
+    /* v7: the wait-time / work-time averages the user asked for — "on average,
+       how long does it take to get in, and how long does it take to do the
+       work". Built from the rolling telemetry; the wait figure only counts
+       runs that were actually rate limited, and is hidden entirely when none
+       ever were. */
+    function workerStatsSection() {
+      const t = telemetrySummary();
+      if (!t.runs) {
+        return '<div class="settings-section"><label class="section-label">Worker timing</label><div class="setting-card">' +
+          '<div class="setting-row"><div class="setting-name">Rate-limit & work timing</div>' +
+          '<p class="setting-help">No runs recorded yet. Once you send a few requests, this shows your average time waiting in line for a busy provider versus the time the model actually spent working.</p></div>' +
+          '<div class="setting-row" style="margin-top:6px"><div class="setting-name">Model busy attempts</div>' +
+          '<p class="setting-help">Shows how often the worker had to wait and retry. Disabled (or unused) when nothing is ever rate limited.</p></div></div></div>';
+      }
+      const waited = t.limited > 0
+        ? '<span class="setting-value" style="color:var(--warning)">' + fmtElapsed(t.avgWaitMs) + " avg · " + fmtElapsed(t.maxWaitMs) + " worst</span>"
+        : '<span class="setting-value" style="color:var(--success)">never waited</span>';
+      const waitHelp = t.limited > 0
+        ? '<p class="setting-help">Across ' + t.limited + " of " + t.runs + " recent run" + (t.runs === 1 ? "" : "s") + " the provider was busy (rate limited) and the worker had to wait and re-request. This is the average time before the model actually started answering.</p>"
+        : '<p class="setting-help">None of your last ' + t.runs + " run" + (t.runs === 1 ? "" : "s") + " were rate limited, so there's no wait time to average — every request got straight through.</p>";
+      return '<div class="settings-section"><label class="section-label">Worker timing</label><div class="setting-card">' +
+        '<div class="setting-row"><div class="setting-heading"><span class="setting-name">Average wait time (rate limited)</span>' + waited + "</div>" + waitHelp + "</div>" +
+        '<div class="setting-row" style="margin-top:10px"><div class="setting-heading"><span class="setting-name">Average work time</span><span class="setting-value">' + (t.avgWorkMs ? fmtElapsed(t.avgWorkMs) : "—") + "</span></div>" +
+        '<p class="setting-help">How long the model actually spent generating, averaged over your last ' + t.runs + " run" + (t.runs === 1 ? "" : "s") + ". Each finished reply also shows its own wait / work split under it.</p></div>" +
+        '<div class="setting-row" style="margin-top:10px"><div class="setting-heading"><span class="setting-name">Runs recorded</span><span class="setting-value">' + t.runs + " of " + TELEMETRY_CAP + "</span></div>" +
+        '<div style="display:flex;gap:8px;margin-top:10px"><button class="secondary-btn" data-action="clear-telemetry">' + ic("trash") + " Reset timing history</button></div></div>" +
+        "</div></div>";
+    }
 
     function tempHint(v) {
       if (v <= 0.3) return "Focused and deterministic — best for code, math, and factual answers.";
@@ -5117,14 +5475,18 @@
         '<div class="setting-card" style="margin-top:10px">' +
           '<div class="setting-row"><div class="setting-heading"><span class="setting-name">Auto-resume on return</span><button class="toggle ' + (d.autoResume ? "on" : "") + '" data-action="toggle-autoresume" aria-label="Toggle auto-resume"></button></div>' +
           '<p class="setting-help">When you come back after leaving mid-response — thinking, agent file work, images — the interrupted run continues by itself. Handles connection dips too: retries with growing backoff (up to ' + (d.autoResumeMax || 8) + ' attempts) and waits for internet when it\u2019s down.</p></div>' +
-          '<div class="setting-row"><div class="setting-heading"><span class="setting-name">Background relay (optional)</span><span class="setting-value">' + (d.relayUrl ? "Configured" : "Off") + '</span></div>' +
+          '<div class="setting-row"><div class="setting-heading"><span class="setting-name">Background relay (optional)</span><span class="setting-value">' + (!d.relayUrl ? "Off" : (d.useWorker !== false ? "On" : "Paused")) + '</span></div>' +
           '<p class="setting-help">URL of your Nexus relay worker (free Cloudflare Worker, ~2 min setup — see nexus-relay-worker.js). With it, streams keep running <b>server-side even with the phone fully off</b>: reopening the app replays everything the model wrote meanwhile, with zero tokens lost. Without it, the app auto-resumes instead (re-asks the model to continue).</p>' +
+          '<div class="setting-row" style="margin-top:10px"><div class="setting-heading"><span class="setting-name">Use the worker</span><button class="toggle ' + (d.useWorker !== false ? "on" : "") + '" data-action="toggle-worker" aria-label="Toggle the background worker"></button></div>' +
+          '<p class="setting-help">Master switch. On, requests run through the worker above so nothing is lost when you close the app. Off, the app talks straight to OpenRouter and relies on auto-resume — handy for testing or if the worker is ever misbehaving.</p></div>' +
           '<div class="key-input" style="margin-top:10px">' +
             '<input class="field" id="relay-url" type="url" autocomplete="off" spellcheck="false" placeholder="https://nexus-relay.your-name.workers.dev" value="' + escapeAttr(d.relayUrl || "") + '">' +
           '</div>' +
           '<div style="display:flex;gap:8px;margin-top:10px"><button class="secondary-btn" data-action="test-relay">' + ic("check") + ' Test relay</button></div>' +
           '<div class="key-status" id="relay-status"><span class="dot"></span><span>Not tested yet</span></div>' +
         "</div></div></div>" +
+
+        workerStatsSection() +
 
         '<div class="settings-section"><label class="section-label">Assistant profile</label>' +
           '<div class="setting-card"><div class="setting-row"><div class="profile-chips" id="profile-chips"></div>' +
@@ -6368,10 +6730,11 @@
       toast("Chat deleted");
     }
     function switchChat(id) {
-      if (state.currentId === id) { closeSidePanel(); return; }
+      if (state.currentId === id) { clearChatUnread(currentChat()); closeSidePanel(); renderHistory(); return; }
       state.currentId = id;
       saveChats();
       closeSidePanel();
+      clearChatUnread(currentChat()); // v7: opening a chat clears its unread-done dot
       renderChat();
       renderHistory(); // v4: refresh the active highlight + any live per-chat clocks
       renderAgentChip();
@@ -6820,6 +7183,8 @@
       },
       "test-key": () => testApiKey(),
       "toggle-autoresume": () => { setDraft("autoResume", !draft().autoResume); renderSettings(); },
+      "toggle-worker": () => { setDraft("useWorker", draft().useWorker === false); renderSettings(); },
+      "clear-telemetry": () => { writeJson(K.telemetry, { runs: [] }); renderSettings(); toast("Timing history cleared"); },
       "test-relay": () => testRelay(),
       "set-profile": el => applyProfile(el.dataset.profile),
       "slider-step": el => nudgeSlider(el.dataset.slider, Number(el.dataset.dir)),
@@ -7013,6 +7378,9 @@
       } else {
         if (anyRun()) acquireWakeLock();
         else if (state.wasHidden) kickAutoResume(); // back to an interrupted run → continue it automatically
+        /* v7: you're looking at the current chat again — its unread-done dot clears */
+        clearChatUnread(currentChat());
+        renderHistory();
         updateStatusLine();
         $("offline-bar").hidden = navigator.onLine;
       }

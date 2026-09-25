@@ -141,9 +141,30 @@
        context and work continues).
      - D1 must be bound as "DB" and the cron must be "* * * * *" for
        the full phone-off experience; /health reports both.
+
+   v7 — HONEST STATUS EVENTS (what the app's UI reads):
+     Before v7 the pump's only live signal was a human-readable SSE comment
+     (": nexus upstream 429 — re-requesting…"). The app skipped comments
+     entirely, so a job that was actually WAITING IN LINE for a busy
+     provider still painted "Thinking…" — the app looked like it was
+     thinking when it was really rate-limited and re-requesting.
+
+     v7 keeps those comments (they're still real, byte-accounted buffer
+     bytes and the stall watchdog needs them) but adds a MACHINE-READABLE
+     twin right after each one:
+        ": nexus-status {\"state\":\"waiting\",\"attempt\":3,\"max\":24,
+                            \"waitMs\":8000,\"since\":<epoch>,\"reason\":\"upstream 429\"}"
+     The app parses `nexus-status` and drives its UI from it:
+       - state "waiting"   → "Waiting in line — rate limited (attempt 3/24,
+                             retry in ~8s)" instead of a fake "Thinking…"
+       - state "working"   → "Thinking…" (the model is actually generating)
+       - state "continuing"→ "Continuing the answer…" (truncated stream)
+     It also carries cumulative wait/work split (waitedMs/workMs) so the
+     app can show "wait 12s · work 47s" — and when a job is never rate
+     limited, waitedMs stays 0 and the app hides the wait figure.
    ===================================================================== */
 
-const WORKER_VERSION = 6;
+const WORKER_VERSION = 7;
 
 /* test tunables — production reads defaults; the local harness may
    override via globalThis.__nexusTun to run E2E in seconds. */
@@ -183,8 +204,8 @@ const CONTINUE_INSTRUCTION = "Your previous answer was cut off by a connection d
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title",
-  "Access-Control-Expose-Headers": "X-Nexus-Job",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title, X-Nexus-Client",
+  "Access-Control-Expose-Headers": "X-Nexus-Job, X-Nexus-Offset, X-Nexus-Age, X-Nexus-Waited, X-Nexus-Work, X-Nexus-Attempts, X-Nexus-Status",
   "Access-Control-Max-Age": "86400",
 };
 
@@ -227,9 +248,12 @@ const SCHEMA_SQL = [
      attempts INTEGER NOT NULL DEFAULT 0,
      finish INTEGER NOT NULL DEFAULT 0,
      bytes INTEGER NOT NULL DEFAULT 0,
+     waited_ms INTEGER NOT NULL DEFAULT 0,
+     work_ms INTEGER NOT NULL DEFAULT 0,
      content_text TEXT NOT NULL DEFAULT '',
      req TEXT,
      meta TEXT,
+     client TEXT,
      lock_token TEXT
    )`,
   `CREATE TABLE IF NOT EXISTS chunks (
@@ -256,6 +280,17 @@ let schemaDone = false;
 async function ensureSchema(env) {
   if (!hasDB(env) || schemaDone) return;
   for (const s of SCHEMA_SQL) await runSQL(env, s, []);
+  /* v7 migration: databases created before v7 lack waited_ms. ALTER is a
+     no-op error once the column exists, so it is safe to run every boot. */
+  try { await runSQL(env, `ALTER TABLE jobs ADD COLUMN waited_ms INTEGER NOT NULL DEFAULT 0`, []); } catch (_) {}
+  /* v7: work_ms is the generation half of the split — cumulative seconds the
+     model was actually producing, so /health and a reconnect can show it. */
+  try { await runSQL(env, `ALTER TABLE jobs ADD COLUMN work_ms INTEGER NOT NULL DEFAULT 0`, []); } catch (_) {}
+  /* v7: `client` is the app's own stable key for a request
+     (chatId:messageIndex:genStart). It lets the app find the job again even
+     when it never received the X-Nexus-Job header — i.e. the user sent a
+     prompt and closed the app before the response headers arrived. */
+  try { await runSQL(env, `ALTER TABLE jobs ADD COLUMN client TEXT`, []); } catch (_) {}
   schemaDone = true;
 }
 
@@ -294,6 +329,8 @@ function rowToJob(row) {
     heartbeat: Number(row.heartbeat), nextRetry: Number(row.next_retry),
     attempts: Number(row.attempts), finish: !!Number(row.finish),
     bytes: Number(row.bytes), contentText: row.content_text || "",
+    waitedMs: Number(row.waited_ms) || 0,
+    workMs: Number(row.work_ms) || 0,
     req, meta,
   };
 }
@@ -532,7 +569,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
     parser.feed(all);
     parser.flushPending();
   }
-  if (parser.finishSeen || job.finish) { await finalizeDone(env, jobId, token, live); return; }
+  if (parser.finishSeen || job.finish) { await persistTiming(); await finalizeDone(env, jobId, token, live); return; }
 
   let totalBytes = Math.max(parser.totalBytes(), 0);
   let attempts = job.attempts;      // total across all drivers (persisted)
@@ -563,6 +600,26 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
     }
   }
 
+  /* v7 — wait/work accounting. `waitedMs` is how long this job spent
+     waiting in line for a busy provider (429/5xx/network); `workMs` is how
+     long the model was actually generating. Both are cumulative and survive
+     isolate recycling because waited_ms is flushed to D1 alongside bytes. */
+  let jobWaitedMs = job.waitedMs || 0;
+  const jobCreatedAt = job.createdAt || Date.now();
+  let workStartAt = 0; // when the current generation attempt started
+  let jobWorkMs = job.workMs || 0; // accumulated generation time
+
+  /* Bank the in-flight attempt's generation time and write the honest
+     wait/work split to D1 while we still hold the lock. Terminal
+     transitions (finalizeDone/parkJob/failJob) clear lock_token, so any
+     lockWrite after them is a no-op — this must run first. */
+  const bankWork = () => { if (workStartAt) { jobWorkMs += Math.max(0, Date.now() - workStartAt); workStartAt = 0; } };
+  const persistTiming = async () => {
+    bankWork();
+    try { await lockWrite(env, jobId, token, { waited_ms: Math.round(jobWaitedMs), work_ms: Math.round(jobWorkMs), updated_at: Date.now() }); } catch (_) {}
+    try { await stampMeta(env, jobId, token, { waitedMs: Math.round(jobWaitedMs), workMs: Math.round(jobWorkMs), attempts }); } catch (_) {}
+  };
+
   const flush = async () => {
     if (!pendingFlush) return true;
     const text = pendingFlush;
@@ -574,6 +631,8 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
       const w = await lockWrite(env, jobId, token, {
         bytes: totalBytes, content_text: parser.contentText,
         finish: parser.finishSeen ? 1 : 0,
+        waited_ms: Math.round(jobWaitedMs),
+        work_ms: Math.round(jobWorkMs + (workStartAt ? Math.max(0, Date.now() - workStartAt) : 0)),
         heartbeat: Date.now(), updated_at: Date.now(),
       });
       if (w !== 1) return false; // lock lost — another driver took over
@@ -606,6 +665,30 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
   };
   const emitNote = (text, immediate) => emitRaw(": nexus " + text + "\n\n", immediate);
 
+  /* v7 — the machine-readable twin of emitNote. `: nexus-status {json}` is
+     skipped by SSE parsers like any comment, but the app specifically looks
+     for it and drives the composer status from it. It is emitted DIRECTLY
+     (not through emitNote) so the line is exactly `: nexus-status {json}` —
+     the app matches on that literal prefix. Fields:
+       state    waiting | working | continuing
+       attempt  how many upstream attempts have been made (1-based display)
+       max      the attempt budget
+       waitMs   how long the CURRENT re-request pause is (waiting only)
+       reason   short human phrase ("upstream 429")
+       waitedMs cumulative time spent waiting in line across the whole job
+       workMs   cumulative time actually generating
+     Job-level waitedMs is persisted to D1 so a reconnect (or the cron in a
+     fresh isolate) keeps the honest total. */
+  const statusPayload = (state, extra) => JSON.stringify(Object.assign({
+    state,
+    attempt: Math.max(1, attempts),
+    max: MAX_ATTEMPTS,
+    waitedMs: Math.round(jobWaitedMs),
+    workMs: Math.round(jobWorkMs + (workStartAt ? Math.max(0, Date.now() - workStartAt) : 0)),
+    since: jobCreatedAt,
+  }, extra || {}));
+  const emitStatus = (state, extra) => emitRaw(": nexus-status " + statusPayload(state, extra) + "\n\n", true);
+
   /* heartbeat while a slow first token takes its time — keeps other
      drivers from falsely claiming an alive-but-quiet pump.
      v5: the beat rate is tied to the staleness threshold (STALE_LOCK/3,
@@ -626,9 +709,9 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
 
       /* park: tool-call cuts are never continued server-side (app protocol).
          images never continue either — they re-issue from zero or park. */
-      if (parser.sawToolCalls && !parser.finishSeen) { await parkJob(env, jobId, token); liveClose(live); return; }
-      if (job.kind !== "chat" && totalBytes > 0 && !parser.finishSeen) { await parkJob(env, jobId, token); liveClose(live); return; }
-      if (attempts >= MAX_ATTEMPTS) { await failJob(env, jobId, token, "retry budget used up"); liveClose(live); return; }
+      if (parser.sawToolCalls && !parser.finishSeen) { await persistTiming(); await parkJob(env, jobId, token); liveClose(live); return; }
+      if (job.kind !== "chat" && totalBytes > 0 && !parser.finishSeen) { await persistTiming(); await parkJob(env, jobId, token); liveClose(live); return; }
+      if (attempts >= MAX_ATTEMPTS) { await persistTiming(); await failJob(env, jobId, token, "retry budget used up"); liveClose(live); return; }
 
       /* ---- build the upstream request ---- */
       /* v5: continuation vs plain re-issue is decided by REAL DATA, not
@@ -662,6 +745,13 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
       const wd = setInterval(() => { if (Date.now() - lastBeat > UPSTREAM_STALL_MS) { try { ac.abort(); } catch (_) {} } }, 5000);
 
       let upstream = null, upstreamErr = null;
+      /* v7: the wait is over the moment this attempt starts talking to the
+         provider — real generation time starts here (and the UI stops saying
+         "waiting in line"). The status is emitted for EVERY attempt (not just
+         re-requests) so a watching or reconnecting client always has a real
+         status box to show instead of a bare "thinking". */
+      workStartAt = Date.now();
+      if (job.kind === "chat") { try { await emitStatus(parser.contentText ? "continuing" : "working"); } catch (_) {} }
       if (firstUpstream) { upstream = firstUpstream; firstUpstream = null; }
       else {
         try {
@@ -725,16 +815,21 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
         signal.removeEventListener("abort", onOuterAbort);
         /* v5: lock lost → the new owner streams on; stop silently */
         if (!(await flush())) { try { reader.cancel(); } catch (_) {} return; }
-        if (parser.finishSeen) { await finalizeDone(env, jobId, token, live); return; }
-        if (naturalEnd && job.kind !== "chat") { await finalizeDone(env, jobId, token, live); return; } // images: full body = done
+        if (parser.finishSeen) { await persistTiming(); await finalizeDone(env, jobId, token, live); return; }
+        if (naturalEnd && job.kind !== "chat") { await persistTiming(); await finalizeDone(env, jobId, token, live); return; } // images: full body = done
         if (signal.aborted) return;
         /* truncated → persist the attempt count and try again inline
            (the lock is NOT released: fresh heartbeats prove we're alive,
            so no other driver can steal the job mid-run) */
         attempts++; inlineAttempts++;
         try { await lockWrite(env, jobId, token, { attempts, updated_at: Date.now() }); } catch (_) {}
+        /* v7: bank the generation time this attempt produced before the pause */
+        if (workStartAt) { jobWorkMs += Math.max(0, Date.now() - workStartAt); workStartAt = 0; }
         if (job.kind === "chat") {
-          try { await emitNote("answer was truncated — seamlessly continuing (attempt " + (attempts + 1) + "/" + MAX_ATTEMPTS + ")", true); } catch (_) {}
+          try {
+            await emitNote("answer was truncated — seamlessly continuing (attempt " + (attempts + 1) + "/" + MAX_ATTEMPTS + ")", true);
+            await emitStatus("continuing", { reason: "truncated" });
+          } catch (_) {}
         }
         if (inlineAttempts >= maxInline) { gaveUp = true; break; }
         await sleep(backoffFor(attempts));
@@ -772,10 +867,10 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
         } else {
           try { await emitRaw("data: " + JSON.stringify({ error: { message: clean, code: status } }) + "\n\n", true); } catch (_) {}
         }
-        await failJob(env, jobId, token, "upstream " + status + ": " + clean, { live });
+        await persistTiming(); await failJob(env, jobId, token, "upstream " + status + ": " + clean, { live });
         return;
       }
-      if (fatal) { await parkJob(env, jobId, token); liveClose(live); return; }
+      if (fatal) { await persistTiming(); await parkJob(env, jobId, token); liveClose(live); return; }
       /* retryable: 429 / 408 / 5xx / network — re-request until it gets in.
          v5: OpenRouter 429s carry retry_after — honor it (capped) so the
          re-request cadence is exactly as fast as the provider asks for. */
@@ -789,16 +884,30 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
         if (h > 0) raSec = h;
       }
       if (status === 429 && raSec > 0) waitMs = Math.min(Math.max(raSec * 1000, 500), 30000);
+      /* v7: this is the moment the app must NOT say "Thinking…". The job is
+         rate limited / the provider is down — it is WAITING IN LINE. Bank the
+         generation time, count the wait, and emit the structured status so the
+         UI can show "Waiting in line — rate limited (attempt N/24, retry in
+         ~Xs)" plus the cumulative wait figure. */
+      if (workStartAt) { jobWorkMs += Math.max(0, Date.now() - workStartAt); workStartAt = 0; }
+      jobWaitedMs += waitMs;
       if (job.kind === "chat") {
         const why = upstream ? ("upstream " + status) : "upstream unreachable";
-        try { await emitNote(why + " — re-requesting until it gets in (attempt " + (attempts + 1) + "/" + MAX_ATTEMPTS + ") in ~" + Math.max(1, Math.round(waitMs / 1000)) + "s", true); } catch (_) {}
+        try {
+          await emitNote(why + " — re-requesting until it gets in (attempt " + (attempts + 1) + "/" + MAX_ATTEMPTS + ") in ~" + Math.max(1, Math.round(waitMs / 1000)) + "s", true);
+          await emitStatus("waiting", { reason: why, waitMs, code: status || 0, rateLimited: status === 429 });
+        } catch (_) {}
       }
       if (inlineAttempts >= maxInline) { gaveUp = true; break; }
       await sleep(waitMs);
     }
   } finally {
     clearInterval(heart);
+    /* v7: bank any in-flight generation time and write the honest wait/work
+       split so /health and a later reconnect (or a different isolate) can
+       report it. A no-op if a terminal transition already cleared the lock. */
     try { await flush(); } catch (_) {}
+    await persistTiming();
     if (gaveUp) {
       /* release for the next driver (cron / piggyback / app reconnect).
          v5: emit an HONEST error event as real buffer bytes — the watching
@@ -1006,6 +1115,11 @@ async function handleProxy(request, pathname, ctx, env) {
   try { parsed = JSON.parse(new TextDecoder().decode(rawBody)); } catch (_) {}
   const fwd = {};
   for (const h of FWD_HEADERS) { const v = request.headers.get(h); if (v) fwd[h] = v; }
+  /* v7: the app's stable per-request key, so a job can be found again even if
+     the client never saw the response headers (app closed mid-send). Kept
+     short and never returned to other clients. */
+  const clientKey = String(request.headers.get("x-nexus-client") || "").slice(0, 200);
+  const now = Date.now();
 
   /* no D1 (or an unparseable body) → plain passthrough (graceful degrade) */
   if (!hasDB(env) || !parsed) {
@@ -1037,6 +1151,25 @@ async function handleProxy(request, pathname, ctx, env) {
     }
   }
 
+  /* v7: if this exact client request already has a live job (the app is
+     re-sending after a drop, or re-attaching by client key rather than by
+     job id), reuse it — no duplicate generation, no double spend. */
+  if (clientKey) {
+    const existing = await getSQL(env,
+      `SELECT id FROM jobs WHERE client = ? AND status IN ('queued','streaming','parked','done') AND updated_at > ? ORDER BY updated_at DESC LIMIT 1`,
+      [clientKey, now - JOB_TTL_MS]);
+    if (existing && existing.id) {
+      const job = await getJobRow(env, existing.id);
+      if (job) {
+        const hdrs = relayHeaders(job.meta.contentType, existing.id, { "X-Nexus-Offset": String(job.bytes), "X-Nexus-Work": String(job.workMs || 0), "X-Nexus-Waited": String(job.waitedMs || 0), "X-Nexus-Attempts": String(job.attempts || 0), "X-Nexus-Status": job.status });
+        if (job.status === "queued" || job.status === "streaming") {
+          try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, existing.id).catch(() => {})); } catch (_) {}
+        }
+        return new Response(tailStream(env, ctx, existing.id, 0), { status: 200, headers: hdrs });
+      }
+    }
+  }
+
   /* attempt 0 — fatal 4xx passes straight through (v2 behavior: the app
      maps auth/path errors itself); retryable failures become a durable
      queued job the pump keeps re-requesting "until it gets in". */
@@ -1058,14 +1191,13 @@ async function handleProxy(request, pathname, ctx, env) {
   /* create the durable job */
   const id = crypto.randomUUID();
   const kind = pathname === "/images" ? "images" : "chat";
-  const now = Date.now();
   const contentType = (upstream && upstream.headers.get("content-type")) || (kind === "images" ? "application/json" : "text/event-stream");
   const metaFwd = Object.assign({}, fwd);
   delete metaFwd.authorization;
   const meta = { fwd: metaFwd, contentType };
   await runSQL(env,
-    `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, 0, '', ?, ?, NULL)`,
-    [id, kind, now, now, JSON.stringify(parsed), JSON.stringify(meta)]);
+    `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, client, lock_token) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, 0, '', ?, ?, ?, NULL)`,
+    [id, kind, now, now, JSON.stringify(parsed), JSON.stringify(meta), clientKey || null]);
   if (fwd.authorization) {
     try { await runSQL(env, `INSERT INTO secrets (job, auth) VALUES (?, ?)`, [id, fwd.authorization]); } catch (_) {}
   }
@@ -1103,7 +1235,30 @@ async function handleJobGet(url, ctx, env) {
      the job's live registry so liveness models see the attached client.
      v6: X-Nexus-Age tells the app how long this job has been running
      server-side ("the worker has been on this request for 47s"). */
-  return new Response(tailStream(env, ctx, id, offset), { status: 200, headers: relayHeaders(job.meta.contentType, id, { "X-Nexus-Offset": String(job.bytes), "X-Nexus-Age": String(Math.max(0, Date.now() - job.createdAt)) }) });
+  return new Response(tailStream(env, ctx, id, offset), { status: 200, headers: relayHeaders(job.meta.contentType, id, { "X-Nexus-Offset": String(job.bytes), "X-Nexus-Age": String(Math.max(0, Date.now() - job.createdAt)), "X-Nexus-Waited": String(job.waitedMs || 0), "X-Nexus-Work": String(job.workMs || 0), "X-Nexus-Attempts": String(job.attempts || 0), "X-Nexus-Status": job.status }) });
+}
+
+/* v7: find a chat job by the app's client key — used when the app closed
+   before it ever saw X-Nexus-Job. Returns the newest matching job. */
+async function handleJobByClient(url, ctx, env, clientKey) {
+  if (!hasDB(env)) return json({ error: "job not found (relay in passthrough mode)" }, 404);
+  const ck = String(clientKey || "").slice(0, 200);
+  if (!ck) return json({ error: "missing client key" }, 400);
+  /* v7: honor ?offset=N exactly like /job/:id. Without this, a client that
+     already consumed bytes before it lost the job id would replay them on
+     re-attach and duplicate text in the final answer. */
+  const offset = Math.max(0, Number(url.searchParams.get("offset") || 0) || 0);
+  const row = await getSQL(env,
+    `SELECT id FROM jobs WHERE client = ? AND status IN ('queued','streaming','parked','done','failed') AND updated_at > ? ORDER BY updated_at DESC LIMIT 1`,
+    [ck, Date.now() - JOB_TTL_MS]);
+  if (!row || !row.id) return json({ error: "job not found (no matching client request)" }, 404);
+  const job = await getJobRow(env, row.id);
+  if (!job) return json({ error: "job not found" }, 404);
+  if (job.status === "stopped") return json({ error: "job ended (" + job.status + ")" }, 410);
+  if (job.status === "queued" || job.status === "streaming") {
+    try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, row.id).catch(() => {})); } catch (_) {}
+  }
+  return new Response(tailStream(env, ctx, row.id, offset), { status: 200, headers: relayHeaders(job.meta.contentType, row.id, { "X-Nexus-Offset": String(job.bytes), "X-Nexus-Age": String(Math.max(0, Date.now() - job.createdAt)), "X-Nexus-Waited": String(job.waitedMs || 0), "X-Nexus-Work": String(job.workMs || 0), "X-Nexus-Attempts": String(job.attempts || 0), "X-Nexus-Status": job.status }) });
 }
 
 async function handleDelete(url, env) {
@@ -1183,6 +1338,8 @@ async function handleFetch(request, env, ctx) {
             id: String(r.id).slice(0, 8), kind: r.kind, status: r.status,
             ageMs: Math.max(0, now - Number(r.created_at)),
             bytes: Number(r.bytes), attempts: Number(r.attempts),
+            waitedMs: Number(r.waited_ms) || 0,
+            workMs: Number(r.work_ms) || (meta.workMs || 0),
             ...(meta.durationMs != null ? { durationMs: meta.durationMs } : {}),
           };
         });
@@ -1202,6 +1359,10 @@ async function handleFetch(request, env, ctx) {
     } catch (err) {
       return json({ error: { message: "relay upstream failed: " + (err && err.message || String(err)), code: 502 } }, 502);
     }
+  }
+  if (request.method === "GET" && url.pathname === "/job/by-client") {
+    piggyback();
+    return handleJobByClient(url, ctx, env, url.searchParams.get("client"));
   }
   if (request.method === "GET" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
     piggyback();
