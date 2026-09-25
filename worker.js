@@ -29,6 +29,14 @@
      5. In Nexus AI Pro: Settings → Connection → Background relay → paste URL
         → Test relay
 
+   v2 FIX (IMPORTANT — re-deploy if your relay says "Model not found"):
+     v1 forwarded POST /chat to openrouter.ai/api/v1/chat (a path that does
+     not exist). OpenRouter answered 404 and the app showed it as "Model not
+     found". v2 maps /chat → /api/v1/chat/completions correctly. Visit
+     {relay}/health — it must say "v":2. If it doesn't, you are still
+     running v1. Optional: bind env NEXUS_UPSTREAM_BASE to relay through a
+     different OpenAI-compatible provider.
+
    LIMITS (be aware):
      - Jobs live in worker memory (per isolate). Isolates persist for
        minutes-to-hours; a phone-off gap of a few minutes is covered. For
@@ -43,7 +51,7 @@
        completed job then works even after an isolate restart.
    ===================================================================== */
 
-const UPSTREAM_BASE = "https://openrouter.ai/api/v1";
+const WORKER_VERSION = 2;
 const MAX_JOB_BYTES = 32 * 1024 * 1024; // 32MB buffer cap per job
 const JOB_TTL_MS = 15 * 60 * 1000;      // sweep jobs idle/finished > 15 min
 const KV_TTL = 3600;                    // seconds
@@ -172,8 +180,20 @@ function relayHeaders(job, extra = {}) {
   return { "Content-Type": job.contentType || "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Nexus-Job": job.id, ...CORS, ...extra };
 }
 
+/* v2 fix: the relay route is NOT the upstream path. /chat is the relay's
+   name for OpenRouter's /chat/completions endpoint — v1 concatenated the
+   relay route onto the upstream base and got a 404. */
+function upstreamBase(env) {
+  return ((env && env.NEXUS_UPSTREAM_BASE) || "https://openrouter.ai/api/v1").replace(/\/+$/, "");
+}
+function upstreamPath(pathname) {
+  if (pathname === "/chat") return "/chat/completions";
+  if (pathname === "/images") return "/images";
+  return pathname;
+}
+
 async function handleProxy(request, pathname, ctx, env) {
-  const upstreamUrl = UPSTREAM_BASE + pathname;
+  const upstreamUrl = upstreamBase(env) + upstreamPath(pathname);
   const headers = new Headers();
   for (const h of FWD_HEADERS) { const v = request.headers.get(h); if (v) headers.set(h, v); }
   const upstream = await fetch(upstreamUrl, {
@@ -243,7 +263,7 @@ export default {
     sweepJobs();
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-    if (url.pathname === "/health") return json({ ok: true, relay: "nexus", jobs: jobs.size, time: Date.now() });
+    if (url.pathname === "/health") return json({ ok: true, relay: "nexus", v: WORKER_VERSION, jobs: jobs.size, time: Date.now() });
 
     if (request.method === "POST" && (url.pathname === "/chat" || url.pathname === "/images")) {
       try {
