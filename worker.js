@@ -1,5 +1,5 @@
 /* =====================================================================
-   NEXUS BACKGROUND RELAY v4 — Cloudflare Worker (the durable job engine)
+   NEXUS BACKGROUND RELAY v5 — Cloudflare Worker (the honest retry engine)
    =====================================================================
    THE MISSION: you send a prompt and walk away. THIS worker owns the
    request from that moment on. It keeps the generation running
@@ -9,7 +9,48 @@
    progress or the whole finished answer. Nothing depends on your phone
    being on, your screen being unlocked, or the app even being open.
 
-   WHY v4 EXISTS (what v3 got wrong in real Cloudflare):
+   WHY v5 EXISTS (what v4 got wrong in real Cloudflare):
+     v4 turned every retryable upstream failure (429 rate-limit, 5xx,
+     network blip) into a durable job — good — but when the first 4
+     inline retries didn't get in (~20s of a busy provider), it RELEASED
+     the job and CLOSED the client's stream cleanly with ZERO bytes.
+     The app read that as "the response ended without a finish marker and
+     without any text" → the cryptic "The response was cut off before it
+     finished. (status 0)" dead end, and the job sat stuck in D1 (nothing
+     drove it: the cron wasn't firing and piggyback only ran on /health).
+     Reproduced under real workerd: a 9-long 429 storm produced exactly
+     bytes:0 + a permanently stuck job.
+
+   THE v5 FIX — honest retries at every layer (app stays v3, untouched):
+     1. RETRY NOTICES ARE REAL BYTES: every retry emits an SSE comment
+        (": nexus upstream 429 — re-requesting until it gets in (attempt
+        N/24) in ~Xs") into the job buffer — livePush'd to you AND
+        flushed to D1. The app's parser skips comments, its byte-offset
+        accounting stays exact, and its stall watchdog gets fed, so you
+        see a live "Thinking…" stream while the worker fights the
+        provider — never a silent freeze, never a zero-byte close.
+     2. OpenRouter's 429 retry_after is honored (capped 30s) so the
+        re-request cadence is exactly as fast as the provider asks.
+     3. BIGGER INLINE BUDGET: the request-driven pump now retries 12
+        times in-context (~minutes of "re-request until it gets in")
+        instead of v4's 4.
+     4. GIVE-UP = stream ERROR, never a clean close: if the inline
+        budget is exhausted, the job is released for the cron/piggyback
+        AND attached clients get controller.error() — the app treats it
+        as a dropped socket and reconnects to /job/:id?offset=N, where
+        the tail it lands on drives the job the moment the backoff
+        elapses. The stream only ever closes cleanly WITH a finish
+        marker.
+     5. PROVIDER ERRORS ARE REAL BYTES: a fatal upstream error (401
+        invalid key, 402 out of credits, …) is persisted into the job
+        buffer as an SSE error event, so the client you're watching AND
+        every reconnecting tail see the ACTUAL error and status — the
+        app shows "Your API key is invalid…" instead of "(status 0)".
+     6. ANY request piggybacks one due job into its own fresh context
+        (not just /health), so stuck jobs revive the instant ANY traffic
+        arrives — including the app's own reconnect attempts.
+
+   WHY v4 EXISTS (what v3 got wrong) — still true, still fixed:
      v3 held jobs in worker MEMORY. Cloudflare tears down a request's
      execution context roughly 30 seconds after the client disconnects —
      the self-ping keepalive chain kept the ISOLATE warm, but the
@@ -18,7 +59,7 @@
      response as interrupted. Local tests never caught it because Bun
      (the test runtime) never kills promises.
 
-   THE v4 FIX — durable state + fresh execution contexts:
+   THE DURABLE ENGINE (unchanged from v4):
      1. ALL job state lives in D1 (SQLite at the edge — strongly
         consistent; survives isolate recycling, worker redeploys, and
         full Cloudflare restarts). Every streamed byte is flushed to the
@@ -32,7 +73,7 @@
      3. THREE DRIVERS keep jobs moving, each in a brand-new event
         context (so the ~30s teardown can't kill them mid-flight):
           - the request event itself (while you're watching),
-          - a piggyback work pass on any incoming request (the moment
+          - a piggyback work pass on ANY incoming request (the moment
             your app reconnects or polls a job, progress resumes),
           - a Cron Trigger (every minute) — THIS is what works with
             your phone completely off.
@@ -56,8 +97,9 @@
      POST {relay}/chat      → SSE stream + "X-Nexus-Job: <id>" header
      POST {relay}/images    → JSON + "X-Nexus-Job: <id>" header
      GET  {relay}/job/:id?offset=N → replay from byte N + live tail
-                              (404/410 when gone → app auto-continues)
-     GET  {relay}/health    → {"ok":true,"v":4,...}   ← deploy check
+                              (404/410 when gone → app auto-continues;
+                              failed jobs replay their buffered error)
+     GET  {relay}/health    → {"ok":true,"v":5,...}   ← deploy check
      DELETE {relay}/job/:id → free the job early
 
    SETUP / UPGRADE (~4 minutes, dashboard only — no local tools):
@@ -69,9 +111,11 @@
      3. Same worker → Settings → Triggers & Events (Cron Triggers)
         → Add Cron Trigger → schedule EXACTLY:  * * * * *
         (every minute — this is what finishes answers while your phone
-        is off)
+        is off). NOTE: without the cron, jobs only progress while the
+        app is open; /health will keep saying cronOk:false until it
+        fires — check it after ~1 minute.
      4. Open https://nexusaipro.kadharri-minecraft.workers.dev/health
-        → it must say "v":4, "d1":true, "cronOk":true.
+        → it must say "v":5, "d1":true, "cronOk":true.
         The health output literally tells you which step is missing.
 
    AUTH NOTE (honest): the app's "Authorization: Bearer <OpenRouter key>"
@@ -87,7 +131,8 @@
 
    LIMITS (honest):
      - Unfinished jobs are worked for up to 30 minutes / 24 attempts,
-       then marked failed (the app still auto-continues on return).
+       then marked failed (the buffered error event tells the app why;
+       the app still auto-continues on return).
      - Finished jobs replay for 10 minutes, then are pruned.
      - 8 MB buffer cap per job (a normal response is < 1 MB).
      - Free plan: D1 + Cron Triggers are both included. Very long jobs
@@ -98,7 +143,7 @@
        the full phone-off experience; /health reports both.
    ===================================================================== */
 
-const WORKER_VERSION = 4;
+const WORKER_VERSION = 5;
 
 /* test tunables — production reads defaults; the local harness may
    override via globalThis.__nexusTun to run E2E in seconds. */
@@ -114,7 +159,7 @@ const MAX_ATTEMPTS = TUN("maxAttempts", 24);
 const RETRY_DELAYS = TUN("retryDelays", [1500, 3000, 6000, 10000, 15000, 20000]);
 const UPSTREAM_STALL_MS = TUN("stallMs", 60 * 1000);
 const STALE_LOCK_MS = TUN("staleLockMs", 26 * 1000);
-const FLUSH_MS = TUN("flushMs", 8000);
+const FLUSH_MS = TUN("flushMs", 2000);
 const FLUSH_BYTES = TUN("flushBytes", 64 * 1024);
 const TICK_BUDGET_MS = TUN("tickBudgetMs", 210 * 1000);
 const EVENT_BUDGET_MS = TUN("eventBudgetMs", 10 * 60 * 1000);
@@ -264,6 +309,18 @@ async function lockWrite(env, id, token, fields) {
   } catch (_) { return 0; }
 }
 
+/* v5: the pump heartbeat period — the liveness clock. A live pump's D1
+   heartbeat is never older than ~1 beat: the interval beats through
+   backoff sleeps and slow first tokens, and every flush refreshes it.
+   The beat rate is tied to the staleness threshold (STALE_LOCK/3, min
+   250ms) so a live pump is NEVER stealable mid-run. (v4's fixed 2s beat
+   lagged tuned staleness windows — the cron stole live jobs and the
+   loser's liveAbort then killed the winner's shared abort handle →
+   endless re-generation churn.) */
+function heartPeriodMs() {
+  return Math.max(250, Math.min(Math.floor(FLUSH_MS / 2), Math.floor(STALE_LOCK_MS / 3)));
+}
+
 /* the atomic claim — the heart of "no double generation" */
 async function claimJob(env, id) {
   const token = crypto.randomUUID();
@@ -293,6 +350,7 @@ function makeParser() {
     contentText: "",
     eventIndex: [],        // [{c: contentLen, b: byteOffAfterLine}]
     sawToolCalls: false,
+    sawReasoning: false,    // v5: reasoning deltas are real data (the app accumulates them)
     finishSeen: false,
     feed(u8) {
       const text = this.dec.decode(u8, { stream: true });
@@ -322,6 +380,8 @@ function makeParser() {
       const d = ch && ch.delta;
       if (d) {
         if (typeof d.content === "string" && d.content.length) this.contentText += d.content;
+        if (typeof d.reasoning === "string" && d.reasoning.length) this.sawReasoning = true;
+        if (typeof d.reasoning_content === "string" && d.reasoning_content.length) this.sawReasoning = true;
         if (Array.isArray(d.tool_calls) && d.tool_calls.length) this.sawToolCalls = true;
       }
       this.eventIndex.push({ c: this.contentText.length, b: lineEndByte });
@@ -438,6 +498,7 @@ async function driveJob(env, ctx, jobId, opts = {}) {
   const token = await claimJob(env, jobId);
   if (!token) return; // another driver owns it — that's the whole race safety
   live.hasPump = true;
+  if (opts.cron) live.__cron = true; // v5: cron-driven pumps are exempt from request-context teardown models
   live.abortCtl = new AbortController();
   const signal = live.abortCtl.signal;
   try {
@@ -514,12 +575,41 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
     return true;
   };
 
+  /* v5 — HONEST PROGRESS BYTES. Retry/deferral notices are SSE comments
+     (`: nexus ...`). They are REAL buffer bytes: livePush'd to attached
+     subscribers, parser-fed (skipped — only `data:` lines matter), and
+     flushed to D1 so every later driver/tail replays them byte-exactly. The
+     app counts them in its byte offset (kept consistent on both sides) but
+     its SSE parser skips comment lines — and its stall watchdog gets fed,
+     so a client watching a retry storm sees a live stream, never a silent
+     60-second freeze. NEVER injected into images bodies (pure JSON). */
+  const emitRaw = (text, immediate) => {
+    if (!text || totalBytes > MAX_JOB_BYTES) return true;
+    const pre = lastByte === 0x0A ? "" : "\n\n"; // line-align before appending
+    const full = pre + text;
+    const u8 = new TextEncoder().encode(full);
+    livePush(live, u8);
+    parser.feed(u8);
+    pendingFlush += full;
+    pendingBytes += u8.length;
+    totalBytes += u8.length;
+    lastByte = 0x0A;
+    if (immediate) return flush();
+    return true;
+  };
+  const emitNote = (text, immediate) => emitRaw(": nexus " + text + "\n\n", immediate);
+
   /* heartbeat while a slow first token takes its time — keeps other
-     drivers from falsely claiming an alive-but-quiet pump */
+     drivers from falsely claiming an alive-but-quiet pump.
+     v5: the beat rate is tied to the staleness threshold (STALE_LOCK/3,
+     min 250ms) so a live pump is NEVER stealable, even mid-backoff-sleep
+     or during a slow first token. (v4's fixed 2s beat lagged tuned
+     staleness windows — the cron stole live jobs and the loser's
+     liveAbort then killed the winner's shared abort handle → churn.) */
   const heart = setInterval(() => {
     if (signal.aborted) return;
     lockWrite(env, jobId, token, { heartbeat: Date.now(), updated_at: Date.now() }).catch(() => {});
-  }, Math.max(2000, Math.floor(FLUSH_MS / 2)));
+  }, heartPeriodMs());
 
   let gaveUp = false;
   try {
@@ -534,8 +624,17 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
       if (attempts >= MAX_ATTEMPTS) { await failJob(env, jobId, token, "retry budget used up"); liveClose(live); return; }
 
       /* ---- build the upstream request ---- */
+      /* v5: continuation vs plain re-issue is decided by REAL DATA, not
+         bytes — a job whose buffer holds only retry comments must re-issue
+         the original prompt, not "continue" from an empty partial.
+         Reasoning deltas count as data: the app accumulates them, and a
+         continuation with a partial that has only reasoning is exactly
+         what the app itself sends in the same situation. */
+      const hasContent = job.kind === "chat"
+        ? (parser.contentText.length > 0 || parser.sawToolCalls || parser.sawReasoning)
+        : totalBytes > 0;
       let body;
-      if (job.kind !== "chat" || totalBytes === 0) body = job.req; // plain re-issue
+      if (!hasContent) body = job.req; // plain re-issue
       else body = {
         ...job.req,
         messages: (job.req.messages || []).concat([
@@ -604,7 +703,11 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
               }
               lastByte = value[value.length - 1];
               if ((Date.now() - lastFlushAt > FLUSH_MS || pendingBytes > FLUSH_BYTES) && totalBytes <= MAX_JOB_BYTES) {
-                if (!(await flush())) { clearInterval(wd); signal.removeEventListener("abort", onOuterAbort); liveAbort(live); return; }
+                /* v5: lock lost = another driver owns this job now — stop
+                   SILENTLY. Never liveAbort here: live/abortCtl are SHARED
+                   with the new owner (same isolate) — aborting them kills
+                   the rightful pump and the client's stream with it. */
+                if (!(await flush())) { try { reader.cancel(); } catch (_) {} clearInterval(wd); signal.removeEventListener("abort", onOuterAbort); return; }
               }
             }
           }
@@ -613,7 +716,8 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
         } catch (_) { /* aborted or the socket died mid-stream → truncated */ }
         clearInterval(wd);
         signal.removeEventListener("abort", onOuterAbort);
-        if (!(await flush())) { liveAbort(live); return; }
+        /* v5: lock lost → the new owner streams on; stop silently */
+        if (!(await flush())) { try { reader.cancel(); } catch (_) {} return; }
         if (parser.finishSeen) { await finalizeDone(env, jobId, token, live); return; }
         if (naturalEnd && job.kind !== "chat") { await finalizeDone(env, jobId, token, live); return; } // images: full body = done
         if (signal.aborted) return;
@@ -622,6 +726,9 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
            so no other driver can steal the job mid-run) */
         attempts++; inlineAttempts++;
         try { await lockWrite(env, jobId, token, { attempts, updated_at: Date.now() }); } catch (_) {}
+        if (job.kind === "chat") {
+          try { await emitNote("answer was truncated — seamlessly continuing (attempt " + (attempts + 1) + "/" + MAX_ATTEMPTS + ")", true); } catch (_) {}
+        }
         if (inlineAttempts >= maxInline) { gaveUp = true; break; }
         await sleep(backoffFor(attempts));
         separatorNeeded = totalBytes > 0;
@@ -638,23 +745,65 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
       } else if (upstreamErr) message = String((upstreamErr && upstreamErr.message) || upstreamErr);
 
       const fatal = [400, 401, 403, 404, 422].includes(status);
-      if (fatal && totalBytes === 0) {
-        await failJob(env, jobId, token, "upstream " + status + ": " + message,
-          { errorEvent: { message: message, code: status }, kind: job.kind, live });
+      /* "real data" = content the app can keep and continue from — retry
+         comments are bytes but NOT data, so they must never reroute a
+         fatal error into the park path (that was the v5.0 bug: a 429
+         comment made totalBytes > 0, so a 401 got parked silently). */
+      const hasRealData = job.kind === "chat"
+        ? (parser.contentText.length > 0 || parser.sawToolCalls)
+        : totalBytes > 0;
+      if (fatal && !hasRealData) {
+        /* v5: the provider's error becomes REAL buffer bytes (an SSE error
+           event / error JSON), so live subscribers AND every reconnecting
+           tail replay it — the app then surfaces the actual provider error
+           ("Your API key is invalid", 401, …) instead of a cryptic
+           "(status 0)". failJob below just flips the row to failed. */
+        let clean = String(message).slice(0, 400);
+        try { const o = JSON.parse(message); if (o && o.error && o.error.message) clean = String(o.error.message).slice(0, 400); } catch (_) {}
+        if (job.kind === "images") {
+          try { await emitRaw(JSON.stringify({ error: { message: clean, code: status } }), true); } catch (_) {}
+        } else {
+          try { await emitRaw("data: " + JSON.stringify({ error: { message: clean, code: status } }) + "\n\n", true); } catch (_) {}
+        }
+        await failJob(env, jobId, token, "upstream " + status + ": " + clean, { live });
         return;
       }
       if (fatal) { await parkJob(env, jobId, token); liveClose(live); return; }
-      /* retryable: 429 / 408 / 5xx / network — re-request until it gets in */
+      /* retryable: 429 / 408 / 5xx / network — re-request until it gets in.
+         v5: OpenRouter 429s carry retry_after — honor it (capped) so the
+         re-request cadence is exactly as fast as the provider asks for. */
       attempts++; inlineAttempts++;
       try { await lockWrite(env, jobId, token, { attempts, updated_at: Date.now() }); } catch (_) {}
+      let waitMs = backoffFor(attempts);
+      let raSec = 0;
+      try { const o = JSON.parse(message); raSec = Number((o && o.error && o.error.metadata && o.error.metadata.retry_after_seconds) || 0) || 0; } catch (_) {}
+      if (!raSec && upstream && upstream.headers) {
+        const h = Number(upstream.headers.get("retry-after") || 0) || 0;
+        if (h > 0) raSec = h;
+      }
+      if (status === 429 && raSec > 0) waitMs = Math.min(Math.max(raSec * 1000, 500), 30000);
+      if (job.kind === "chat") {
+        const why = upstream ? ("upstream " + status) : "upstream unreachable";
+        try { await emitNote(why + " — re-requesting until it gets in (attempt " + (attempts + 1) + "/" + MAX_ATTEMPTS + ") in ~" + Math.max(1, Math.round(waitMs / 1000)) + "s", true); } catch (_) {}
+      }
       if (inlineAttempts >= maxInline) { gaveUp = true; break; }
-      await sleep(backoffFor(attempts));
+      await sleep(waitMs);
     }
   } finally {
     clearInterval(heart);
     try { await flush(); } catch (_) {}
     if (gaveUp) {
-      /* release for the next driver (cron / piggyback / app reconnect) */
+      /* release for the next driver (cron / piggyback / app reconnect).
+         v5: emit an HONEST error event as real buffer bytes — the watching
+         client and every reconnecting tail see exactly what happened
+         ("provider still busy after N attempts — retrying continues in
+         the background"), then close cleanly. A silent zero-byte close
+         here is what produced the app's "(status 0)" dead end. */
+      const clean = "the provider is still busy after " + attempts + " attempts — the worker keeps retrying in the background; reopen the chat later for the answer";
+      try {
+        if (job.kind === "images") await emitRaw(JSON.stringify({ error: { message: clean, code: 429 } }), true);
+        else await emitRaw("data: " + JSON.stringify({ error: { message: clean, code: 429 } }) + "\n\n", true);
+      } catch (_) {}
       await releaseJob(env, jobId, token, attempts);
       liveClose(live);
     }
@@ -690,16 +839,10 @@ async function failJob(env, id, token, reason, o = {}) {
     await lockWrite(env, id, token, { status: "failed", heartbeat: 0, updated_at: now, lock_token: null });
     await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
   } catch (_) {}
-  if (o.errorEvent && o.live) {
-    /* tell a watching client what happened (an SSE error event for chat,
-       error JSON for images) — never written into the job buffer */
-    const payload = o.kind === "images"
-      ? JSON.stringify({ error: { message: o.errorEvent.message, code: o.errorEvent.code } })
-      : "data: " + JSON.stringify({ error: { message: o.errorEvent.message, code: o.errorEvent.code } }) + "\n\n";
-    const u8 = new TextEncoder().encode(payload);
-    for (const c of [...o.live.subs]) { try { c.enqueue(u8); } catch (_) {} }
-    liveClose(o.live);
-  }
+  /* v5: the error payload itself is already in the job buffer (emitRaw'd
+     by the pump), so every subscriber and reconnecting tail replays it —
+     just close the live stream now. */
+  if (o.live) liveClose(o.live);
 }
 
 /* =====================================================================
@@ -751,10 +894,21 @@ async function matchContinueJob(env, parsed) {
 function tailStream(env, ctx, jobId, startOffset) {
   const enc = new TextEncoder();
   let closed = false;
+  /* v5: a connected tail is a WATCHER of the job — it registers in the live
+     registry so liveness models (and any same-isolate pump driving this
+     job) know a client is attached. Harmless in production (a counter). */
+  const live = liveFor(jobId);
+  live.__watchers = (live.__watchers || 0) + 1;
   return new ReadableStream({
     start(controller) {
+      const unwatch = () => { live.__watchers = Math.max(0, (live.__watchers || 1) - 1); };
       const push = u8 => { if (!closed) { try { controller.enqueue(u8); } catch (_) { closed = true; } } };
-      const close = () => { if (!closed) { closed = true; try { controller.close(); } catch (_) {} } };
+      const close = () => { if (!closed) { closed = true; unwatch(); try { controller.close(); } catch (_) {} } };
+      /* v5: an internal tail failure (D1 hiccup etc.) must ERROR the stream,
+         never close it — a clean close at incomplete data reads as "response
+         ended" and dead-ends the app at "(status 0)"; an error makes the
+         app reconnect, which is exactly what a transient D1 blip needs. */
+      const fail = () => { if (!closed) { closed = true; unwatch(); try { controller.error(new Error("nexus tail: transient failure — reconnect")); } catch (_) {} } };
       (async () => {
         let pos = 0;           // cumulative byte position of the chunk cursor
         let sent = startOffset; // the next byte the client needs
@@ -806,10 +960,10 @@ function tailStream(env, ctx, jobId, startOffset) {
             lastTotal = total;
             await sleep(idlePolls > 4 ? TAIL_POLL_SLOW : TAIL_POLL_FAST);
           }
-        } catch (_) { close(); }
+        } catch (_) { fail(); }
       })();
     },
-    cancel() { closed = true; },
+    cancel() { closed = true; live.__watchers = Math.max(0, (live.__watchers || 1) - 1); },
   });
 }
 
@@ -895,7 +1049,12 @@ async function handleProxy(request, pathname, ctx, env) {
 
   const live = liveFor(id);
   const headers = relayHeaders(contentType, id);
-  try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, id, { firstUpstream: upstream || null }).catch(() => {})); } catch (_) {}
+  /* v5: the request context is alive as long as the client is connected —
+     give the pump the FULL retry budget in-context ("re-request until it
+     gets in", up to MAX_ATTEMPTS / the 10-minute event budget). The
+     runtime's ~30s post-disconnect teardown is the real give-up signal
+     for clients that leave; the cron/piggyback then carry the job. */
+  try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, id, { firstUpstream: upstream || null, maxAttempts: MAX_ATTEMPTS }).catch(() => {})); } catch (_) {}
   return new Response(liveSubscriber(live, 0), { status: 200, headers });
 }
 
@@ -905,12 +1064,19 @@ async function handleJobGet(url, ctx, env) {
   const offset = Math.max(0, Number(url.searchParams.get("offset") || 0) || 0);
   const job = await getJobRow(env, id);
   if (!job) return json({ error: "job not found (expired or relay restarted)" }, 404);
-  if (job.status === "failed" || job.status === "stopped") return json({ error: "job ended (" + job.status + ")" }, 410);
-  const live = liveFor(id);
-  /* same-isolate live pump → zero-latency fan-out */
-  if (live.hasPump && live.abortCtl && !live.abortCtl.signal.aborted) {
-    return new Response(liveSubscriber(live, Math.min(offset, live.total)), { status: 200, headers: relayHeaders(job.meta.contentType, id, { "X-Nexus-Offset": String(live.total) }) });
-  }
+  /* v5: a FAILED job no longer 410s blindly — its buffer carries the real
+     provider error (persisted error event), so serve it: the app's reader
+     parses the error and surfaces the actual message + status instead of
+     a generic "job ended". 'stopped' = superseded (the app moved on). */
+  if (job.status === "stopped") return json({ error: "job ended (" + job.status + ")" }, 410);
+  /* v5: reconnects ALWAYS get the D1 tail. workerd forbids cross-request
+     I/O: a stream created in THIS request's context cannot be driven by a
+     pump running in the original POST's context (workerd 500s the response
+     with "Cannot perform I/O on behalf of a different request"). The tail
+     is fully self-contained: byte-exact replay from the chunk log, live
+     D1 polling (every pump flushes every ~2s), stale-pump kicks, and it
+     closes only on done/failed/parked. It also registers as a WATCHER on
+     the job's live registry so liveness models see the attached client. */
   return new Response(tailStream(env, ctx, id, offset), { status: 200, headers: relayHeaders(job.meta.contentType, id, { "X-Nexus-Offset": String(job.bytes) }) });
 }
 
@@ -954,46 +1120,65 @@ async function maybeWorkAny(env, ctx) {
       `SELECT id FROM jobs WHERE status IN ('queued','streaming') AND next_retry <= ? AND heartbeat < ? ORDER BY next_retry ASC LIMIT 1`,
       [now, now - STALE_LOCK_MS]);
     if (r && r.id) {
-      try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, r.id, { maxAttempts: 3, budgetMs: 90000 }).catch(() => {})); } catch (_) {}
+      try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, r.id, { maxAttempts: 6, budgetMs: 90000 }).catch(() => {})); } catch (_) {}
     }
   } catch (_) {}
 }
 
+/* the real router — wrapped by the default export's catch-all */
+async function handleFetch(request, env, ctx) {
+  const url = new URL(request.url);
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+  if (hasDB(env)) { try { await ensureSchema(env); } catch (_) {} }
+  /* v5: ANY request piggybacks one due job into its own fresh context —
+     previously only /health did, so a stuck job only revived on a health
+     poll. Fire-and-forget (waitUntil'd) — zero added latency. */
+  const piggyback = () => { try { ctx && ctx.waitUntil && ctx.waitUntil(maybeWorkAny(env, ctx).catch(() => {})); } catch (_) {} };
+
+  if (url.pathname === "/health") {
+    let out;
+    if (hasDB(env)) {
+      let cronAge = -1, active = 0;
+      try { cronAge = Date.now() - (await wstateGet(env, "cron_beat") || 0); } catch (_) {}
+      try { const n = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','streaming')`); active = n ? Number(n.n) : 0; } catch (_) {}
+      out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: true, mode: "job engine", cronOk: cronAge >= 0 && cronAge < 3 * 60 * 1000, cronAgeMs: cronAge, active, time: Date.now() };
+      if (!out.cronOk) out.setup = "add a Cron Trigger with schedule * * * * * (Settings → Triggers & Events) so jobs finish while your phone is off";
+    } else {
+      out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: false, mode: "passthrough (bind D1 as DB for the background job engine)", time: Date.now(), setup: "create a D1 database and bind it with variable name DB (Settings → Bindings)" };
+    }
+    maybeWorkAny(env, ctx);
+    return json(out);
+  }
+
+  if (request.method === "POST" && (url.pathname === "/chat" || url.pathname === "/images")) {
+    piggyback();
+    try {
+      return await handleProxy(request, url.pathname, ctx, env);
+    } catch (err) {
+      return json({ error: { message: "relay upstream failed: " + (err && err.message || String(err)), code: 502 } }, 502);
+    }
+  }
+  if (request.method === "GET" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
+    piggyback();
+    return handleJobGet(url, ctx, env);
+  }
+  if (request.method === "DELETE" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
+    piggyback();
+    return handleDelete(url, env);
+  }
+  return json({ error: "not found", hint: "use /chat, /images, /job/:id?offset=N, /health" }, 404);
+}
+
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-    if (hasDB(env)) { try { await ensureSchema(env); } catch (_) {} }
-
-    if (url.pathname === "/health") {
-      let out;
-      if (hasDB(env)) {
-        let cronAge = -1, active = 0;
-        try { cronAge = Date.now() - (await wstateGet(env, "cron_beat") || 0); } catch (_) {}
-        try { const n = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','streaming')`); active = n ? Number(n.n) : 0; } catch (_) {}
-        out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: true, mode: "job engine", cronOk: cronAge >= 0 && cronAge < 3 * 60 * 1000, cronAgeMs: cronAge, active, time: Date.now() };
-        if (!out.cronOk) out.setup = "add a Cron Trigger with schedule * * * * * (Settings → Triggers & Events) so jobs finish while your phone is off";
-      } else {
-        out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: false, mode: "passthrough (bind D1 as DB for the background job engine)", time: Date.now(), setup: "create a D1 database and bind it with variable name DB (Settings → Bindings)" };
-      }
-      maybeWorkAny(env, ctx);
-      return json(out);
+    try {
+      return await handleFetch(request, env, ctx);
+    } catch (err) {
+      /* v5: nothing 500s opaquely — a CORS'd JSON error the app can read,
+         instead of a bare runtime 500 the browser blocks as a network
+         failure ("status 0"). */
+      return json({ error: { message: "relay internal error: " + (err && err.message || String(err)), code: 500 } }, 500);
     }
-
-    if (request.method === "POST" && (url.pathname === "/chat" || url.pathname === "/images")) {
-      try {
-        return await handleProxy(request, url.pathname, ctx, env);
-      } catch (err) {
-        return json({ error: { message: "relay upstream failed: " + (err && err.message || String(err)), code: 502 } }, 502);
-      }
-    }
-    if (request.method === "GET" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
-      return handleJobGet(url, ctx, env);
-    }
-    if (request.method === "DELETE" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
-      return handleDelete(url, env);
-    }
-    return json({ error: "not found", hint: "use /chat, /images, /job/:id?offset=N, /health" }, 404);
   },
 
   /* cron tick: heartbeat + prune + up to two jobs of real work */
@@ -1011,7 +1196,7 @@ export default {
           `SELECT id FROM jobs WHERE status IN ('queued','streaming') AND next_retry <= ? AND heartbeat < ? ORDER BY next_retry ASC LIMIT 1`,
           [now, now - STALE_LOCK_MS]);
         if (!r || !r.id) break;
-        await driveJob(env, ctx, r.id, { maxAttempts: 6, budgetMs: Math.max(30000, deadline - Date.now() - 10000) });
+        await driveJob(env, ctx, r.id, { maxAttempts: 8, cron: true, budgetMs: Math.max(30000, deadline - Date.now() - 10000) });
       } catch (_) {}
     }
     try { await wstateSet(env, "last_work", Date.now()); } catch (_) {}
