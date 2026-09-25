@@ -2,3 +2,7 @@ name = "nexusai"
 main = "worker.js"
 compatibility_date = "2026-09-06"
 compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_id = "fb7e137e-d197-4147-a80d-bbb7f71de0a2"
