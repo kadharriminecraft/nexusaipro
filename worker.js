@@ -1,7 +1,22 @@
 /* =====================================================================
-   NEXUS BACKGROUND RELAY v8 — Cloudflare Worker (the honest queue engine)
+   NEXUS BACKGROUND RELAY v9 — Cloudflare Worker (the honest queue engine)
    =====================================================================
-   WHAT v8 ADDS (on top of the v5-v7 durable engine):
+   WHAT v9 ADDS (on top of the v8 durable engine):
+     1. 24-HOUR DONE RETENTION — finished jobs kept their full buffer for
+        only 10 minutes in v8, so "send a prompt, close the app, come back
+        in an hour" fell back to a re-ask: the original thinking was cut
+        off and sometimes nothing showed at all. Done jobs now live 24h
+        (parked 6h) — the app replays the EXACT finished response.
+     2. CLIENT-KEY JOB LOOKUP — the app stamps every request with a
+        deterministic X-Nexus-Client key (chatId|msgIndex) BEFORE the
+        fetch fires. If the page dies before the job id header arrives,
+        the next launch calls GET /job/by-key/:key to find the running or
+        finished job and re-attach — no re-ask, no double spend. The key
+        is auth-checked against the job's stored secret.
+     3. SCHEMA MIGRATION — existing D1 tables gain the client_key column
+        via guarded ALTER (safe on old and fresh databases alike).
+
+   WHAT v8 ADDED (kept):
      1. STRUCTURED NOTICES — every retry/continue/park now emits
         `: nexus-notice {"kind":"wait","attempt":N,"max":24,"etaMs":X,
         "waitedMs":Y,"reason":"rate limited"} — human text` as REAL buffer
@@ -170,7 +185,7 @@
        the full phone-off experience; /health reports both.
    ===================================================================== */
 
-const WORKER_VERSION = 8;
+const WORKER_VERSION = 9;
 
 /* test tunables — production reads defaults; the local harness may
    override via globalThis.__nexusTun to run E2E in seconds. */
@@ -181,7 +196,12 @@ function TUN(key, def) {
 
 const MAX_JOB_BYTES = TUN("maxJobBytes", 8 * 1024 * 1024);
 const JOB_TTL_MS = TUN("jobTtlMs", 30 * 60 * 1000);
-const DONE_TTL_MS = TUN("doneTtlMs", 10 * 60 * 1000);
+/* v9: DONE jobs live for 24 HOURS, not 10 minutes — "send a prompt, close
+   the app, come back later" must replay the FULL finished response from the
+   durable buffer, not fall back to a re-ask that loses the original answer.
+   v8's 10-minute reap was exactly why coming back late showed a cut-off
+   thinking block or nothing at all. */
+const DONE_TTL_MS = TUN("doneTtlMs", 24 * 60 * 60 * 1000);
 const MAX_ATTEMPTS = TUN("maxAttempts", 24);
 const RETRY_DELAYS = TUN("retryDelays", [1500, 3000, 6000, 10000, 15000, 20000]);
 const UPSTREAM_STALL_MS = TUN("stallMs", 60 * 1000);
@@ -193,10 +213,10 @@ const EVENT_BUDGET_MS = TUN("eventBudgetMs", 10 * 60 * 1000);
 const TAIL_POLL_FAST = TUN("tailPollFast", 500);
 const TAIL_POLL_SLOW = TUN("tailPollSlow", 2000);
 const MAX_ACTIVE_JOBS = 64;
-/* v6: parked jobs (agent tool-cuts waiting for the app to come back) live
-   longer than done/failed ones — 30 minutes instead of 10, so a long coding
-   run paused mid-tool-round is still recoverable when you return. */
-const PARK_TTL_MS = TUN("parkTtlMs", 30 * 60 * 1000);
+/* v9: parked jobs (agent tool-cuts waiting for the app to come back) live
+   6 hours instead of 30 minutes — a long coding run paused mid-tool-round
+   is still recoverable when you return well after the old window. */
+const PARK_TTL_MS = TUN("parkTtlMs", 6 * 60 * 60 * 1000);
 /* v6: how many due jobs one cron tick drives (concurrent chats generating
    while the phone is off all make progress instead of queueing two-by-two) */
 const CRON_JOBS_PER_TICK = TUN("cronJobsPerTick", 4);
@@ -210,7 +230,7 @@ const CONTINUE_INSTRUCTION = "Your previous answer was cut off by a connection d
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title, X-Nexus-Client",
   "Access-Control-Expose-Headers": "X-Nexus-Job, X-Nexus-Offset, X-Nexus-Age, X-Nexus-Waited, X-Nexus-Work, X-Nexus-Attempts, X-Nexus-Status",
   "Access-Control-Max-Age": "86400",
 };
@@ -219,6 +239,16 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json", ...CORS, ...headers } });
+}
+
+/* v9: SHA-256 of the Authorization header — stored on the job row so
+   client-key lookups stay verifiable AFTER the secret is deleted at
+   completion, without keeping the key itself around. */
+async function sha256Hex(text) {
+  try {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(text || "")));
+    return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+  } catch (_) { return null; }
 }
 
 /* ---------- upstream base/path (v2 fix preserved) ---------- */
@@ -257,6 +287,8 @@ const SCHEMA_SQL = [
      content_text TEXT NOT NULL DEFAULT '',
      req TEXT,
      meta TEXT,
+     client_key TEXT,
+     auth_hash TEXT,
      lock_token TEXT
    )`,
   `CREATE TABLE IF NOT EXISTS chunks (
@@ -276,6 +308,14 @@ const SCHEMA_SQL = [
    )`,
   `CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status, next_retry)`,
 ];
+/* v9: migration for EXISTING D1 tables (CREATE TABLE IF NOT EXISTS won't add
+   a column to a table that already exists) — ALTER ADD COLUMN fails with
+   "duplicate column" once applied, which is exactly the guard we need. */
+const SCHEMA_MIGRATIONS = [
+  `ALTER TABLE jobs ADD COLUMN client_key TEXT`,
+  `ALTER TABLE jobs ADD COLUMN auth_hash TEXT`,
+  `CREATE INDEX IF NOT EXISTS idx_jobs_client ON jobs (client_key)`,
+];
 
 function hasDB(env) { return !!(env && env.DB); }
 
@@ -283,6 +323,7 @@ let schemaDone = false;
 async function ensureSchema(env) {
   if (!hasDB(env) || schemaDone) return;
   for (const s of SCHEMA_SQL) await runSQL(env, s, []);
+  for (const s of SCHEMA_MIGRATIONS) { try { await runSQL(env, s, []); } catch (_) {} }
   schemaDone = true;
 }
 
@@ -1168,9 +1209,15 @@ async function handleProxy(request, pathname, ctx, env) {
   const metaFwd = Object.assign({}, fwd);
   delete metaFwd.authorization;
   const meta = { fwd: metaFwd, contentType };
+  /* v9: the app's client key — a deterministic per-(chat,message) handle the
+     NEXT app launch can use to find this job even when the page died before
+     the X-Nexus-Job response header ever arrived (fetch in flight at kill
+     time). Never forwarded upstream; only meaningful for job lookup. */
+  const clientKey = (request.headers.get("X-Nexus-Client") || "").slice(0, 200) || null;
+  const authHash = fwd.authorization ? await sha256Hex(fwd.authorization) : null;
   await runSQL(env,
-    `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, 0, '', ?, ?, NULL)`,
-    [id, kind, now, now, JSON.stringify(parsed), JSON.stringify(meta)]);
+    `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, client_key, auth_hash, lock_token) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, 0, '', ?, ?, ?, ?, NULL)`,
+    [id, kind, now, now, JSON.stringify(parsed), JSON.stringify(meta), clientKey, authHash]);
   if (fwd.authorization) {
     try { await runSQL(env, `INSERT INTO secrets (job, auth) VALUES (?, ?)`, [id, fwd.authorization]); } catch (_) {}
   }
@@ -1222,6 +1269,45 @@ async function handleJobGet(url, ctx, env) {
      {status, attempts, bytes, ageMs, waitedMs, workMs}
    It piggybacks a work pass too, so polling ALSO drives a due job (a
    double win: the app learns the queue state and revives the pump). */
+/* v9: LOOKUP BY CLIENT KEY — the page died before the POST's response
+   headers arrived, so the app never learned its job id. It DID persist a
+   deterministic key (chatId|msgIndex) before the request fired; this route
+   maps that key back to the live/finished job so recovery can re-attach
+   instead of re-asking and double-spending. Auth-checked against the
+   job's stored secret — a wrong or missing key gets a plain 404. */
+async function handleJobByKey(request, url, ctx, env) {
+  if (!hasDB(env)) return json({ error: "job not found (relay in passthrough mode)", gone: true }, 404);
+  const key = decodeURIComponent(url.pathname.split("/")[3] || "");
+  if (!key) return json({ error: "missing client key", gone: true }, 404);
+  const auth = request.headers.get("authorization") || "";
+  const row = await getSQL(env,
+    `SELECT j.id, j.kind, j.status, j.created_at, j.updated_at, j.attempts, j.bytes, j.finish, j.meta, j.auth_hash, s.auth AS secret
+     FROM jobs j LEFT JOIN secrets s ON s.job = j.id
+     WHERE j.client_key = ? AND j.status != 'stopped' AND j.status != 'failed'
+     ORDER BY j.created_at DESC LIMIT 1`, [key]);
+  if (!row || !row.id) return json({ error: "no job for this key (expired or never created)", gone: true }, 404);
+  /* v9: auth survives completion as a SHA-256 hash on the row — the live
+     secret is checked while the job still runs, the hash forever after */
+  let authOk = true;
+  if (row.secret) authOk = row.secret === auth;
+  else if (row.auth_hash) authOk = (await sha256Hex(auth)) === row.auth_hash;
+  if (!authOk) return json({ error: "job not found", gone: true }, 404);
+  /* found and ours — drive it if it's due, then hand back the handle */
+  if (row.status === "queued" || row.status === "streaming") {
+    try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, row.id).catch(() => {})); } catch (_) {}
+  }
+  let meta = {};
+  try { meta = row.meta ? JSON.parse(row.meta) : {}; } catch (_) {}
+  const j = { createdAt: Number(row.created_at), status: row.status, attempts: Number(row.attempts), meta };
+  const t = timingOf(j);
+  return json({
+    ok: true, v: WORKER_VERSION, id: row.id, kind: row.kind, status: row.status,
+    attempts: Number(row.attempts), bytes: Number(row.bytes), finish: !!Number(row.finish),
+    ageMs: Math.max(0, Date.now() - Number(row.created_at)),
+    waitedMs: t.waitedMs, workMs: t.workMs, firstByte: !!t.firstByteAt,
+  });
+}
+
 async function handleJobStatus(url, ctx, env) {
   if (!hasDB(env)) return json({ error: "job not found (relay in passthrough mode)" }, 404);
   const id = url.pathname.split("/")[2];
@@ -1302,7 +1388,7 @@ async function handleFetch(request, env, ctx) {
       let cronAge = -1, active = 0;
       try { cronAge = Date.now() - (await wstateGet(env, "cron_beat") || 0); } catch (_) {}
       try { const n = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','streaming')`); active = n ? Number(n.n) : 0; } catch (_) {}
-      out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: true, mode: "job engine", cronOk: cronAge >= 0 && cronAge < 3 * 60 * 1000, cronAgeMs: cronAge, active, time: Date.now() };
+      out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: true, mode: "job engine", clientKey: true, cronOk: cronAge >= 0 && cronAge < 3 * 60 * 1000, cronAgeMs: cronAge, active, time: Date.now() };
       /* v6: a live jobs digest — every active job's age, size, and attempt
          count ("what is the worker working on and for how long"), plus the
          last few finished ones with their SAVED durations. */
@@ -1348,11 +1434,17 @@ async function handleFetch(request, env, ctx) {
     piggyback();
     return handleJobStatus(url, ctx, env);
   }
+  /* v9: client-key lookup — recovery for pages killed before the job id
+     header arrived */
+  if (request.method === "GET" && /^\/job\/by-key\/.+$/.test(url.pathname)) {
+    piggyback();
+    return handleJobByKey(request, url, ctx, env);
+  }
   if (request.method === "DELETE" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
     piggyback();
     return handleDelete(url, env);
   }
-  return json({ error: "not found", hint: "use /chat, /images, /job/:id?offset=N, /job/:id/status, /health" }, 404);
+  return json({ error: "not found", hint: "use /chat, /images, /job/:id?offset=N, /job/:id/status, /job/by-key/:key, /health" }, 404);
 }
 
 export default {
