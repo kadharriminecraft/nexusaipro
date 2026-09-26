@@ -1,194 +1,93 @@
 /* =====================================================================
-   NEXUS BACKGROUND RELAY v9 — Cloudflare Worker (the honest queue engine)
+   NEXUS BACKGROUND RELAY v10 — Cloudflare Worker
+   THE WORKER OWNS THE REQUEST.
    =====================================================================
-   WHAT v9 ADDS (on top of the v8 durable engine):
-     1. 24-HOUR DONE RETENTION — finished jobs kept their full buffer for
-        only 10 minutes in v8, so "send a prompt, close the app, come back
-        in an hour" fell back to a re-ask: the original thinking was cut
-        off and sometimes nothing showed at all. Done jobs now live 24h
-        (parked 6h) — the app replays the EXACT finished response.
-     2. CLIENT-KEY JOB LOOKUP — the app stamps every request with a
-        deterministic X-Nexus-Client key (chatId|msgIndex) BEFORE the
-        fetch fires. If the page dies before the job id header arrives,
-        the next launch calls GET /job/by-key/:key to find the running or
-        finished job and re-attach — no re-ask, no double spend. The key
-        is auth-checked against the job's stored secret.
-     3. SCHEMA MIGRATION — existing D1 tables gain the client_key column
-        via guarded ALTER (safe on old and fresh databases alike).
+   THE MISSION: submit → the worker takes ownership of the generation the
+   instant your prompt arrives (a durable D1 job exists BEFORE any upstream
+   request is even opened), drives it to completion server-side (re-requesting
+   the model until it gets in, finishing truncated answers), live-casts the
+   stream to your app while you watch, and catches you up from the exact byte
+   you left at whenever you reopen. Your phone's connection quality has ZERO
+   effect on the generation itself.
 
-   WHAT v8 ADDED (kept):
-     1. STRUCTURED NOTICES — every retry/continue/park now emits
-        `: nexus-notice {"kind":"wait","attempt":N,"max":24,"etaMs":X,
-        "waitedMs":Y,"reason":"rate limited"} — human text` as REAL buffer
-        bytes. The app renders "waiting in line · attempt 3/24 · waited
-        1m 12s · next try ~4s" in the status line AND inside the thinking
-        box — a rate-limited request is never again a silent "Thinking…".
-     2. WAIT vs WORK, SAVED — the job's meta records firstByteAt (the
-        moment the model actually got in), doneAt, waitedMs, workMs. Every
-        terminal state (done/parked/failed) stamps them permanently; the
-        /health jobs digest shows waitedMs/workMs per job.
-     3. X-NEXUS TIMING HEADERS — POST /chat, the attach path, and every
-        GET /job/:id tail carry X-Nexus-Status, X-Nexus-Attempts,
-        X-Nexus-Age, X-Nexus-Waited, X-Nexus-Work so the app can paint the
-        queue + timing state the instant a connection opens (even before
-        any byte replays).
-     4. GET /job/:id/status — a one-row JSON probe {status, attempts,
-        bytes, ageMs, waitedMs, workMs}. The app polls it while its tail
-        is quiet: it shows live queue state, detects zombie tails, and
-        every probe piggybacks a work pass (polling DRIVES due jobs).
-     5. ATTEMPT-0 TIMEOUT (30s) — a black-holed upstream connect becomes
-        a durable queued job with honest notices instead of hanging the
-        POST for the app's full 120s timeout.
-     6. PARK NOTICES — when a tool-call cut parks a job, the reason is in
-        the buffer, so a reconnecting app knows exactly why the stream
-        ended and finishes the tool call itself.
+   THE v10 ARCHITECTURE — submit + subscribe (replaces proxy+tee):
+     POST /chat  + header "X-Nexus-Submit: 1"
+       → creates the job row in D1 IMMEDIATELY (the prompt is durable within
+         milliseconds of leaving your phone — even a free model that queues
+         for 7 minutes before responding can no longer lose your prompt),
+         kicks a driver, and returns "202 Accepted" with { jobId }.
+       The old behavior (the POST response itself carrying the stream) is
+         kept for apps that don't send the submit header — legacy clients
+         work unchanged (streaming proxy + X-Nexus-Job + attach-on-continue).
+     GET /job/:id?offset=N
+       → live-cast: replay from byte N, then stream live progress. Attach,
+         drop, re-attach, share — any number of readers at any offset. The
+         generation never notices.
+     GET /job/:id/status
+       → { status, attempts, waitedMs, workMs, bytes, error } — honest queue
+         narration ("Waiting for the model · 2m 10s · worker retry 14").
+     GET /job/by-key/:chatKey
+       → the newest job for a chat (the app tags submissions with
+         "X-Nexus-Chat: <chatId>") — rediscovery even if the app lost its
+         local vault (hard crash / cleared storage).
+     POST /chat + "X-Nexus-Parent: <jobId>"
+       → an explicit continuation: the parent job is retired. No fuzzy
+         matching, no double generation — the app links its tool-result and
+         auto-continue rounds straight to the job they supersede.
+     POST /chat + "X-Nexus-Key: <idempotencyKey>"
+       → network retries of the SAME submission return the SAME job. A
+         connection hiccup can never double-spend a prompt.
+     DELETE /job/:id
+       → user pressed Stop: the job is cancelled server-side (no more spend).
 
-   THE MISSION (unchanged): you send a prompt and walk away. THIS worker
-   owns the request from that moment on. It keeps the generation running
-   SERVER-SIDE in durable storage, re-requests the model until the
-   answer is fully complete (even if OpenRouter is busy or down for
-   minutes), and every time you reopen the app you get either live
-   progress or the whole finished answer. Nothing depends on your phone
-   being on, your screen being unlocked, or the app even being open.
+   AGENTIC TOOL ROUNDS (GitHub writes, phone file-system writes) execute on
+   the phone — by design, that is where the credentials and the files live.
+   The worker finishes each tool round completely (finish_reason: tool_calls
+   + [DONE] = job DONE), then WAITS. The app executes the tools and submits
+   the continuation with the parent link. If the phone was away, the app
+   replays the finished round on return, executes exactly once (its own
+   dedup ledger), and continues. Tool-call arguments cut mid-stream are
+   PARKED — never half-executed, never fabricated server-side.
 
-   WHY v5 EXISTS (what v4 got wrong in real Cloudflare):
-     v4 turned every retryable upstream failure (429 rate-limit, 5xx,
-     network blip) into a durable job — good — but when the first 4
-     inline retries didn't get in (~20s of a busy provider), it RELEASED
-     the job and CLOSED the client's stream cleanly with ZERO bytes.
-     The app read that as "the response ended without a finish marker and
-     without any text" → the cryptic "The response was cut off before it
-     finished. (status 0)" dead end, and the job sat stuck in D1 (nothing
-     drove it: the cron wasn't firing and piggyback only ran on /health).
-     Reproduced under real workerd: a 9-long 429 storm produced exactly
-     bytes:0 + a permanently stuck job.
+   WHAT KEEPS IT ALIVE (unchanged from v4, proven in production):
+     1. ALL job state in D1 (SQLite at the edge): jobs + append-only chunk
+        byte log + secrets. Any event context rebuilds full parse state by
+        replaying the chunk log byte-exactly.
+     2. THREE DRIVERS, each in a fresh event context: the submit event
+        itself, a piggyback work pass on any incoming request, and a Cron
+        Trigger every minute — the phone-off engine.
+     3. ATOMIC JOB CLAIMS (conditional UPDATE on lock_token + heartbeat
+        staleness + next_retry backoff) — racing drivers can never
+        double-generate.
+     4. Discrete upstream attempts with the app's exact CONTINUE protocol:
+        truncated attempts append the seamless rest; 429/408/5xx/network
+        failures re-request on backoff "until it gets in".
 
-   THE v5 FIX — honest retries at every layer (app stays v3, untouched):
-     1. RETRY NOTICES ARE REAL BYTES: every retry emits an SSE comment
-        (": nexus upstream 429 — re-requesting until it gets in (attempt
-        N/24) in ~Xs") into the job buffer — livePush'd to you AND
-        flushed to D1. The app's parser skips comments, its byte-offset
-        accounting stays exact, and its stall watchdog gets fed, so you
-        see a live "Thinking…" stream while the worker fights the
-        provider — never a silent freeze, never a zero-byte close.
-     2. OpenRouter's 429 retry_after is honored (capped 30s) so the
-        re-request cadence is exactly as fast as the provider asks.
-     3. BIGGER INLINE BUDGET: the request-driven pump now retries 12
-        times in-context (~minutes of "re-request until it gets in")
-        instead of v4's 4.
-     4. GIVE-UP = stream ERROR, never a clean close: if the inline
-        budget is exhausted, the job is released for the cron/piggyback
-        AND attached clients get controller.error() — the app treats it
-        as a dropped socket and reconnects to /job/:id?offset=N, where
-        the tail it lands on drives the job the moment the backoff
-        elapses. The stream only ever closes cleanly WITH a finish
-        marker.
-     5. PROVIDER ERRORS ARE REAL BYTES: a fatal upstream error (401
-        invalid key, 402 out of credits, …) is persisted into the job
-        buffer as an SSE error event, so the client you're watching AND
-        every reconnecting tail see the ACTUAL error and status — the
-        app shows "Your API key is invalid…" instead of "(status 0)".
-     6. ANY request piggybacks one due job into its own fresh context
-        (not just /health), so stuck jobs revive the instant ANY traffic
-        arrives — including the app's own reconnect attempts.
-
-   WHY v4 EXISTS (what v3 got wrong) — still true, still fixed:
-     v3 held jobs in worker MEMORY. Cloudflare tears down a request's
-     execution context roughly 30 seconds after the client disconnects —
-     the self-ping keepalive chain kept the ISOLATE warm, but the
-     runtime still killed the running pump promise. Result: the stream
-     you saw "while you were gone" died early, and the app reported the
-     response as interrupted. Local tests never caught it because Bun
-     (the test runtime) never kills promises.
-
-   THE DURABLE ENGINE (unchanged from v4):
-     1. ALL job state lives in D1 (SQLite at the edge — strongly
-        consistent; survives isolate recycling, worker redeploys, and
-        full Cloudflare restarts). Every streamed byte is flushed to the
-        job's chunk log while streaming.
-     2. Generation happens in DISCRETE upstream attempts, not one
-        fragile long-held connection. If an attempt is cut off (no
-        [DONE] / finish_reason), the next driver re-asks the model with
-        the app's exact CONTINUE protocol and appends the rest to the
-        same job. If the upstream is busy/refusing, the worker
-        re-requests on a backoff schedule "until it gets in".
-     3. THREE DRIVERS keep jobs moving, each in a brand-new event
-        context (so the ~30s teardown can't kill them mid-flight):
-          - the request event itself (while you're watching),
-          - a piggyback work pass on ANY incoming request (the moment
-            your app reconnects or polls a job, progress resumes),
-          - a Cron Trigger (every minute) — THIS is what works with
-            your phone completely off.
-     4. ATOMIC JOB CLAIMS: a driver may only take a job whose pump
-        heartbeat went stale and whose retry backoff has elapsed. The
-        conditional UPDATE is atomic in D1, so two racing drivers can
-        never double-generate.
-     5. ATTACH-ON-CONTINUE preserved: when the app sends its own
-        continue request (…conversation, assistant partial, "continue"
-        instruction) and a matching job is running or finished, the
-        worker serves THAT job from the exact byte boundary — no second
-        generation, no double spend. If the app is somehow AHEAD of the
-        job buffer, the stale job is retired and a fresh generation
-        continues from the app's (longer) partial.
-     6. Tool-call cuts are PARKED, not continued server-side (mirrors
-        the app's discard-partial-tools protocol — a half-written file
-        must never be executed). The app finishes those on return via
-        its own auto-resume, cleanly.
-
-   WIRE PROTOCOL (what NexusAiPro.html speaks — unchanged from v3):
-     POST {relay}/chat      → SSE stream + "X-Nexus-Job: <id>" header
-     POST {relay}/images    → JSON + "X-Nexus-Job: <id>" header
-     GET  {relay}/job/:id?offset=N → replay from byte N + live tail
-                              (404/410 when gone → app auto-continues;
-                              failed jobs replay their buffered error)
-     GET  {relay}/health    → {"ok":true,"v":5,...}   ← deploy check
-     DELETE {relay}/job/:id → free the job early
-
-   SETUP / UPGRADE (~4 minutes, dashboard only — no local tools):
+   SETUP / UPGRADE (~4 minutes, dashboard only — no local tools, no secrets):
      1. Cloudflare dashboard → Workers & Pages → nexusaipro → Edit code
         → select all → paste this entire file → Deploy.
-     2. Same worker → Settings → Bindings → Add → D1 database:
-        create one (any name, e.g. nexus-jobs) → bind it with variable
-        name EXACTLY: DB
-     3. Same worker → Settings → Triggers & Events (Cron Triggers)
-        → Add Cron Trigger → schedule EXACTLY:  * * * * *
-        (every minute — this is what finishes answers while your phone
-        is off). NOTE: without the cron, jobs only progress while the
-        app is open; /health will keep saying cronOk:false until it
-        fires — check it after ~1 minute.
-     4. Open https://nexusaipro.kadharri-minecraft.workers.dev/health
-        → it must say "v":5, "d1":true, "cronOk":true.
-        The health output literally tells you which step is missing.
+     2. Settings → Bindings → Add → D1 database (any name) bound with
+        variable name EXACTLY: DB
+     3. Settings → Triggers & Events → Cron Trigger → schedule EXACTLY:
+        * * * * *
+     4. Open https://<your-worker>/health → must say "v":10, "d1":true,
+        "cronOk":true. The health output tells you which step is missing.
 
-   AUTH NOTE (honest): the app's "Authorization: Bearer <OpenRouter key>"
-   is required to re-request the model while you are away, so it is
-   stored in YOUR OWN D1 database for the lifetime of that job only
-   (minutes), and deleted the moment the job finishes, fails, is parked
-   or is pruned. It is never logged, never returned by any endpoint.
-   D1 is private to your Cloudflare account — the same trust boundary
-   as the worker that already proxies that header. If you'd rather not,
-   simply don't bind D1: the worker then runs as a plain passthrough
-   relay (graceful degrade — nothing breaks, you just don't get the
-   phone-off job engine).
+   AUTH NOTE (honest, unchanged): the OpenRouter Bearer key is needed to
+   re-request the model while you are away, so it is stored in YOUR OWN D1
+   for the job's lifetime only, deleted on finish/fail/park/cancel/prune.
+   Never logged, never returned by any endpoint. Without a D1 binding the
+   worker degrades to a plain streaming passthrough relay.
 
-   LIMITS (honest):
-     - Unfinished jobs are worked for up to 30 minutes / 24 attempts,
-       then marked failed (the buffered error event tells the app why;
-       the app still auto-continues on return).
-     - Finished jobs replay for 10 minutes, then are pruned.
-     - 8 MB buffer cap per job (a normal response is < 1 MB).
-     - Free plan: D1 + Cron Triggers are both included. Very long jobs
-       may hit the free plan's per-request subrequest budget — the
-       design degrades gracefully (the stream reconnects in a fresh
-       context and work continues).
-     - D1 must be bound as "DB" and the cron must be "* * * * *" for
-       the full phone-off experience; /health reports both.
+   LIMITS (honest): unfinished jobs are worked for up to 30 min / 24
+   attempts; finished jobs replay for 2h; 8 MB buffer per job; free-plan
+   subrequest budgets degrade gracefully (fresh drivers resume the work).
    ===================================================================== */
 
-const WORKER_VERSION = 9;
+const WORKER_VERSION = 10;
 
-/* test tunables — production reads defaults; the local harness may
-   override via globalThis.__nexusTun to run E2E in seconds. */
+/* test tunables — production reads defaults; the local harness overrides
+   via globalThis.__nexusTun to run E2E in seconds. */
 function TUN(key, def) {
   const t = globalThis.__nexusTun;
   return t && Object.prototype.hasOwnProperty.call(t, key) ? t[key] : def;
@@ -196,32 +95,22 @@ function TUN(key, def) {
 
 const MAX_JOB_BYTES = TUN("maxJobBytes", 8 * 1024 * 1024);
 const JOB_TTL_MS = TUN("jobTtlMs", 30 * 60 * 1000);
-/* v9: DONE jobs live for 24 HOURS, not 10 minutes — "send a prompt, close
-   the app, come back later" must replay the FULL finished response from the
-   durable buffer, not fall back to a re-ask that loses the original answer.
-   v8's 10-minute reap was exactly why coming back late showed a cut-off
-   thinking block or nothing at all. */
-const DONE_TTL_MS = TUN("doneTtlMs", 24 * 60 * 60 * 1000);
+const DONE_TTL_MS = TUN("doneTtlMs", 2 * 60 * 60 * 1000);
 const MAX_ATTEMPTS = TUN("maxAttempts", 24);
 const RETRY_DELAYS = TUN("retryDelays", [1500, 3000, 6000, 10000, 15000, 20000]);
 const UPSTREAM_STALL_MS = TUN("stallMs", 60 * 1000);
 const STALE_LOCK_MS = TUN("staleLockMs", 26 * 1000);
-const FLUSH_MS = TUN("flushMs", 2000);
+const FLUSH_MS = TUN("flushMs", 300);
 const FLUSH_BYTES = TUN("flushBytes", 64 * 1024);
 const TICK_BUDGET_MS = TUN("tickBudgetMs", 210 * 1000);
 const EVENT_BUDGET_MS = TUN("eventBudgetMs", 10 * 60 * 1000);
-const TAIL_POLL_FAST = TUN("tailPollFast", 500);
+const TAIL_POLL_FAST = TUN("tailPollFast", 400);
 const TAIL_POLL_SLOW = TUN("tailPollSlow", 2000);
 const MAX_ACTIVE_JOBS = 64;
-/* v9: parked jobs (agent tool-cuts waiting for the app to come back) live
-   6 hours instead of 30 minutes — a long coding run paused mid-tool-round
-   is still recoverable when you return well after the old window. */
-const PARK_TTL_MS = TUN("parkTtlMs", 6 * 60 * 60 * 1000);
-/* v6: how many due jobs one cron tick drives (concurrent chats generating
-   while the phone is off all make progress instead of queueing two-by-two) */
-const CRON_JOBS_PER_TICK = TUN("cronJobsPerTick", 4);
+const MAX_TOTAL_JOBS = 256;
 
 const FWD_HEADERS = ["authorization", "content-type", "http-referer", "x-title", "accept"];
+const NEXUS_HEADERS = ["x-nexus-submit", "x-nexus-chat", "x-nexus-key", "x-nexus-parent"];
 
 /* server-side continue protocol — the EXACT instruction the app sends,
    so worker retries and app continues are interchangeable */
@@ -230,8 +119,8 @@ const CONTINUE_INSTRUCTION = "Your previous answer was cut off by a connection d
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title, X-Nexus-Client",
-  "Access-Control-Expose-Headers": "X-Nexus-Job, X-Nexus-Offset, X-Nexus-Age, X-Nexus-Waited, X-Nexus-Work, X-Nexus-Attempts, X-Nexus-Status",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title, X-Nexus-Submit, X-Nexus-Chat, X-Nexus-Key, X-Nexus-Parent",
+  "Access-Control-Expose-Headers": "X-Nexus-Job, X-Nexus-Offset, X-Nexus-Status",
   "Access-Control-Max-Age": "86400",
 };
 
@@ -239,16 +128,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json", ...CORS, ...headers } });
-}
-
-/* v9: SHA-256 of the Authorization header — stored on the job row so
-   client-key lookups stay verifiable AFTER the secret is deleted at
-   completion, without keeping the key itself around. */
-async function sha256Hex(text) {
-  try {
-    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(text || "")));
-    return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
-  } catch (_) { return null; }
 }
 
 /* ---------- upstream base/path (v2 fix preserved) ---------- */
@@ -265,11 +144,14 @@ function backoffFor(attempts) {
   const d = RETRY_DELAYS[Math.min(Math.max(attempts - 1, 0), RETRY_DELAYS.length - 1)];
   return Math.round(d * (0.8 + Math.random() * 0.4));
 }
+function sanitizeKey(v) {
+  return v ? String(v).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 128) : "";
+}
 
 /* =====================================================================
    D1 layer — the durable half of the engine.
-   Uses ONLY prepare().bind().run()/all() (the portable subset), so the
-   exact same worker file runs under the local Bun test harness with a
+   Uses ONLY prepare().bind().run()/all()/get() (the portable subset), so
+   the exact same worker file runs under the local Bun test harness with a
    bun:sqlite shim, and under real Cloudflare with real D1.
    ===================================================================== */
 const SCHEMA_SQL = [
@@ -287,44 +169,52 @@ const SCHEMA_SQL = [
      content_text TEXT NOT NULL DEFAULT '',
      req TEXT,
      meta TEXT,
-     client_key TEXT,
-     auth_hash TEXT,
-     lock_token TEXT
-   )`,
+     lock_token TEXT,
+     chat_key TEXT,
+     req_key TEXT,
+     parent TEXT,
+     first_byte INTEGER NOT NULL DEFAULT 0
+     )`,
   `CREATE TABLE IF NOT EXISTS chunks (
      job TEXT NOT NULL,
      seq INTEGER NOT NULL,
      bytes INTEGER NOT NULL,
      data TEXT NOT NULL,
      PRIMARY KEY (job, seq)
-   )`,
+     )`,
   `CREATE TABLE IF NOT EXISTS secrets (
      job TEXT PRIMARY KEY,
      auth TEXT NOT NULL
-   )`,
+     )`,
   `CREATE TABLE IF NOT EXISTS wstate (
      k TEXT PRIMARY KEY,
      v TEXT NOT NULL
-   )`,
+     )`,
   `CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status, next_retry)`,
+  `CREATE INDEX IF NOT EXISTS idx_jobs_chat ON jobs (chat_key, created_at)`,
 ];
-/* v9: migration for EXISTING D1 tables (CREATE TABLE IF NOT EXISTS won't add
-   a column to a table that already exists) — ALTER ADD COLUMN fails with
-   "duplicate column" once applied, which is exactly the guard we need. */
-const SCHEMA_MIGRATIONS = [
-  `ALTER TABLE jobs ADD COLUMN client_key TEXT`,
-  `ALTER TABLE jobs ADD COLUMN auth_hash TEXT`,
-  `CREATE INDEX IF NOT EXISTS idx_jobs_client ON jobs (client_key)`,
+
+/* column adds for D1 databases created by older worker versions — each
+   statement fails silently when the column already exists */
+const SCHEMA_ALTERS = [
+  `ALTER TABLE jobs ADD COLUMN chat_key TEXT`,
+  `ALTER TABLE jobs ADD COLUMN req_key TEXT`,
+  `ALTER TABLE jobs ADD COLUMN parent TEXT`,
+  `ALTER TABLE jobs ADD COLUMN first_byte INTEGER NOT NULL DEFAULT 0`,
 ];
 
 function hasDB(env) { return !!(env && env.DB); }
 
-let schemaDone = false;
+/* schema creation is tracked PER DATABASE (not per module instance): a
+   worker process can serve several D1 bindings (the local harness runs the
+   real + legacy-sim instances from one module) — each must get its tables */
 async function ensureSchema(env) {
-  if (!hasDB(env) || schemaDone) return;
+  if (!hasDB(env)) return;
+  const db = env.DB;
+  if (db.__nexusSchemaDone) return;
   for (const s of SCHEMA_SQL) await runSQL(env, s, []);
-  for (const s of SCHEMA_MIGRATIONS) { try { await runSQL(env, s, []); } catch (_) {} }
-  schemaDone = true;
+  for (const a of SCHEMA_ALTERS) { try { await runSQL(env, a, []); } catch (_) {} }
+  db.__nexusSchemaDone = true;
 }
 
 async function runSQL(env, sql, params) {
@@ -339,8 +229,11 @@ async function allSQL(env, sql, params) {
   return (r && r.results) || [];
 }
 async function getSQL(env, sql, params) {
-  const rows = await allSQL(env, sql, params);
-  return rows.length ? rows[0] : null;
+  const p = env.DB.prepare(sql);
+  const b = params && params.length ? p.bind(...params) : p;
+  if (typeof b.get === "function") return await b.get();
+  const r = await b.all();
+  return (r && r.results && r.results.length) ? r.results[0] : null;
 }
 async function wstateSet(env, k, v) {
   await runSQL(env, `INSERT INTO wstate (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, [k, String(v)]);
@@ -363,39 +256,13 @@ function rowToJob(row) {
     attempts: Number(row.attempts), finish: !!Number(row.finish),
     bytes: Number(row.bytes), contentText: row.content_text || "",
     req, meta,
+    chatKey: row.chat_key || "", reqKey: row.req_key || "",
+    parent: row.parent || "", firstByte: Number(row.first_byte) || 0,
   };
 }
 async function getJobRow(env, id) {
   const r = await getSQL(env, `SELECT * FROM jobs WHERE id = ?`, [id]);
   return r ? rowToJob(r) : null;
-}
-/* v8: WAIT vs WORK timing for any job, from its meta. waitedMs = how long
-   it took the model to GET IN (job created → first real content byte —
-   exactly the rate-limit queue the user waits through). While a job is
-   STILL waiting (no first byte yet, not terminal), waitedMs keeps growing
-   live (now - createdAt). workMs = first byte → terminal (or now). */
-function timingOf(job, nowMs) {
-  const now = nowMs || Date.now();
-  const meta = (job && job.meta) || {};
-  const first = Number(meta.firstByteAt) || 0;
-  const end = Number(meta.doneAt) || Number(meta.failedAt) || Number(meta.parkedAt) || 0;
-  const terminal = !!(end || ["done", "failed", "parked", "stopped"].includes(job && job.status));
-  const waited = first
-    ? Math.max(0, first - job.createdAt)
-    : (terminal ? Math.max(0, (end || now) - job.createdAt) : Math.max(0, now - job.createdAt));
-  const work = first ? Math.max(0, (end || now) - first) : 0;
-  return { waitedMs: waited, workMs: work, firstByteAt: first };
-}
-/* v8: timing + queue headers the app reads on every POST/tail connection */
-function nexusMetaHeaders(job) {
-  const t = timingOf(job);
-  return {
-    "X-Nexus-Status": String(job.status || ""),
-    "X-Nexus-Attempts": String(job.attempts || 0),
-    "X-Nexus-Age": String(Math.max(0, Date.now() - job.createdAt)),
-    "X-Nexus-Waited": String(t.waitedMs),
-    "X-Nexus-Work": String(t.workMs),
-  };
 }
 
 /* lock-guarded write — fails (returns 0) once another driver took over */
@@ -410,18 +277,6 @@ async function lockWrite(env, id, token, fields) {
     const r = await runSQL(env, sql, params);
     return r && r.meta && Number(r.meta.changes) || 0;
   } catch (_) { return 0; }
-}
-
-/* v5: the pump heartbeat period — the liveness clock. A live pump's D1
-   heartbeat is never older than ~1 beat: the interval beats through
-   backoff sleeps and slow first tokens, and every flush refreshes it.
-   The beat rate is tied to the staleness threshold (STALE_LOCK/3, min
-   250ms) so a live pump is NEVER stealable mid-run. (v4's fixed 2s beat
-   lagged tuned staleness windows — the cron stole live jobs and the
-   loser's liveAbort then killed the winner's shared abort handle →
-   endless re-generation churn.) */
-function heartPeriodMs() {
-  return Math.max(250, Math.min(Math.floor(FLUSH_MS / 2), Math.floor(STALE_LOCK_MS / 3)));
 }
 
 /* the atomic claim — the heart of "no double generation" */
@@ -453,8 +308,11 @@ function makeParser() {
     contentText: "",
     eventIndex: [],        // [{c: contentLen, b: byteOffAfterLine}]
     sawToolCalls: false,
-    sawReasoning: false,    // v5: reasoning deltas are real data (the app accumulates them)
+    sawReasoning: false,
     finishSeen: false,
+    errorSeen: false,
+    errorMessage: "",
+    errorCode: 0,
     feed(u8) {
       const text = this.dec.decode(u8, { stream: true });
       const nl = [];
@@ -478,6 +336,7 @@ function makeParser() {
       if (raw === "[DONE]") { this.finishSeen = true; return; }
       let obj = null;
       try { obj = JSON.parse(raw); } catch (_) { return; }
+      if (obj && obj.error) { this.errorSeen = true; this.errorMessage = String(obj.error.message || "upstream error"); this.errorCode = Number(obj.error.code) || 0; }
       const ch = obj && obj.choices && obj.choices[0];
       if (ch && ch.finish_reason) this.finishSeen = true;
       const d = ch && ch.delta;
@@ -525,10 +384,23 @@ async function readAllChunkBytes(env, id) {
   return out;
 }
 
+/* append an error event into the job buffer so ANY later replay (catch-up)
+   sees the real upstream failure — honest sync-back of failures */
+async function appendErrorChunk(env, id, kind, message, code) {
+  const payload = kind === "images"
+    ? JSON.stringify({ error: { message: String(message), code: Number(code) || 0 } })
+    : "data: " + JSON.stringify({ error: { message: String(message), code: Number(code) || 0 } }) + "\n\n";
+  const byteLen = new TextEncoder().encode(payload).length;
+  const r = await getSQL(env, `SELECT COALESCE(MAX(seq), -1) AS mx FROM chunks WHERE job = ?`, [id]);
+  const seq = (r ? Number(r.mx) : -1) + 1;
+  await runSQL(env, `INSERT INTO chunks (job, seq, bytes, data) VALUES (?, ?, ?, ?)`, [id, seq, byteLen, payload]);
+  await runSQL(env, `UPDATE jobs SET bytes = bytes + ?, updated_at = ? WHERE id = ?`, [byteLen, Date.now(), id]);
+}
+
 /* =====================================================================
    Live registry — in-isolate fan-out for the client that is watching
-   right now (zero D1 latency), plus the abort handle used by DELETE
-   and by the local harness to simulate Cloudflare's context teardown.
+   right now (zero D1 latency), plus the abort handle used by DELETE,
+   parent retirement, and the local harness's teardown simulation.
    ===================================================================== */
 const liveMap = globalThis.__nexusLive || (globalThis.__nexusLive = new Map());
 function liveFor(id) {
@@ -590,10 +462,11 @@ function liveSubscriber(live, startOffset) {
 
 /* =====================================================================
    THE PUMP — one discrete attempt loop for one job.
-   Runs inside whatever event claimed the job (POST /chat, a reconnect
-   piggyback, or the cron tick). Every byte fans out to live subscribers
-   AND flushes to D1, so the next driver can always pick up exactly
-   where this one died.
+   Runs inside whatever event claimed the job (the submit event, a
+   reconnect piggyback, or the cron tick). Bytes are flushed to D1 FIRST
+   and fanned out to live subscribers only once they are durable — a
+   subscriber's byte position can never run ahead of the D1 buffer, so
+   ANY reconnect at ANY offset is always byte-exact.
    ===================================================================== */
 async function driveJob(env, ctx, jobId, opts = {}) {
   if (!hasDB(env)) return;
@@ -601,7 +474,6 @@ async function driveJob(env, ctx, jobId, opts = {}) {
   const token = await claimJob(env, jobId);
   if (!token) return; // another driver owns it — that's the whole race safety
   live.hasPump = true;
-  if (opts.cron) live.__cron = true; // v5: cron-driven pumps are exempt from request-context teardown models
   live.abortCtl = new AbortController();
   const signal = live.abortCtl.signal;
   try {
@@ -628,6 +500,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
     parser.feed(all);
     parser.flushPending();
   }
+  if (parser.errorSeen && !job.finish) { await failJob(env, jobId, token, parser.errorMessage, { live }); return; }
   if (parser.finishSeen || job.finish) { await finalizeDone(env, jobId, token, live); return; }
 
   let totalBytes = Math.max(parser.totalBytes(), 0);
@@ -636,6 +509,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
   const maxInline = opts.maxAttempts || 4;
   const deadline = Date.now() + (opts.budgetMs || EVENT_BUDGET_MS);
   let firstUpstream = opts.firstUpstream || null;
+  let firstByteAt = job.firstByte || 0;
 
   let seq = 0;
   {
@@ -644,6 +518,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
   }
 
   const flushDec = new TextDecoder();
+  const flushEnc = new TextEncoder();
   let pendingFlush = "";
   let pendingBytes = 0;
   let lastFlushAt = Date.now();
@@ -663,79 +538,38 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
     if (!pendingFlush) return true;
     const text = pendingFlush;
     pendingFlush = ""; pendingBytes = 0;
-    const byteLen = new TextEncoder().encode(text).length;
+    const u8 = flushEnc.encode(text);
+    const byteLen = u8.length;
     try {
       await runSQL(env, `INSERT INTO chunks (job, seq, bytes, data) VALUES (?, ?, ?, ?)`, [jobId, seq, byteLen, text]);
       seq++;
-      const w = await lockWrite(env, jobId, token, {
+      const fields = {
         bytes: totalBytes, content_text: parser.contentText,
         finish: parser.finishSeen ? 1 : 0,
         heartbeat: Date.now(), updated_at: Date.now(),
-      });
+      };
+      if (!firstByteAt && (parser.contentText.length > 0 || parser.sawReasoning)) {
+        firstByteAt = Date.now();
+        fields.first_byte = firstByteAt; // honest wait/work split for /status
+      }
+      const w = await lockWrite(env, jobId, token, fields);
       if (w !== 1) return false; // lock lost — another driver took over
     } catch (_) { return !signal.aborted; }
+    /* fan out ONLY durable bytes: live subscribers stay byte-aligned with
+       the D1 buffer, so a reconnect at any offset replays exactly */
+    livePush(live, u8);
     lastFlushAt = Date.now();
     return true;
   };
 
-  /* v5 — HONEST PROGRESS BYTES. Retry/deferral notices are SSE comments
-     (`: nexus ...`). They are REAL buffer bytes: livePush'd to attached
-     subscribers, parser-fed (skipped — only `data:` lines matter), and
-     flushed to D1 so every later driver/tail replays them byte-exactly. The
-     app counts them in its byte offset (kept consistent on both sides) but
-     its SSE parser skips comment lines — and its stall watchdog gets fed,
-     so a client watching a retry storm sees a live stream, never a silent
-     60-second freeze. NEVER injected into images bodies (pure JSON). */
-  const emitRaw = (text, immediate) => {
-    if (!text || totalBytes > MAX_JOB_BYTES) return true;
-    const pre = lastByte === 0x0A ? "" : "\n\n"; // line-align before appending
-    const full = pre + text;
-    const u8 = new TextEncoder().encode(full);
-    livePush(live, u8);
-    parser.feed(u8);
-    pendingFlush += full;
-    pendingBytes += u8.length;
-    totalBytes += u8.length;
-    lastByte = 0x0A;
-    if (immediate) return flush();
-    return true;
-  };
-  /* v8: STRUCTURED notices — `: nexus-notice {json} — human text`.
-     The app parses the JSON (kind/attempt/max/etaMs/waitedMs/reason) and
-     shows "waiting in line, attempt N, waited Xs" + the wait/work timers;
-     older apps and generic SSE readers just skip the comment. Still REAL
-     buffer bytes: livePush'd, parser-fed (skipped), D1-flushed — the
-     byte-offset math on both sides stays exact. */
-  const emitNotice = (kind, data, human) => {
-    let j = "";
-    try { j = JSON.stringify({ kind, ...data }); } catch (_) { j = "{\"kind\":\"" + kind + "\"}"; }
-    return emitRaw(": nexus-notice " + j + (human ? " — " + human : "") + "\n\n", true);
-  };
-  const emitNote = (text, immediate) => emitRaw(": nexus " + text + "\n\n", immediate);
-  /* v8: the moment the model actually GETS IN — first real content byte
-     (content / reasoning / tool delta, NOT comments). Stamps firstByteAt
-     into the job meta once; every wait/work number derives from it. */
-  let firstByteAt = Number(job.meta && job.meta.firstByteAt) || 0;
-  const checkFirstByte = () => {
-    if (firstByteAt || signal.aborted) return;
-    if (parser.contentText.length || parser.sawReasoning || parser.sawToolCalls) {
-      firstByteAt = Date.now();
-      try { stampMeta(env, jobId, token, { firstByteAt }); } catch (_) {}
-    }
-  };
-  const waitedSoFar = () => Math.max(0, (firstByteAt || Date.now()) - job.createdAt);
-
   /* heartbeat while a slow first token takes its time — keeps other
-     drivers from falsely claiming an alive-but-quiet pump.
-     v5: the beat rate is tied to the staleness threshold (STALE_LOCK/3,
-     min 250ms) so a live pump is NEVER stealable, even mid-backoff-sleep
-     or during a slow first token. (v4's fixed 2s beat lagged tuned
-     staleness windows — the cron stole live jobs and the loser's
-     liveAbort then killed the winner's shared abort handle → churn.) */
+     drivers from falsely claiming an alive-but-quiet pump. Cadence is tied
+     to the stale-lock threshold (a third of it): a live pump's heartbeat
+     can never age past the claim check, in ANY tunable configuration. */
   const heart = setInterval(() => {
     if (signal.aborted) return;
     lockWrite(env, jobId, token, { heartbeat: Date.now(), updated_at: Date.now() }).catch(() => {});
-  }, heartPeriodMs());
+  }, Math.min(10000, Math.max(400, Math.floor(STALE_LOCK_MS / 3))));
 
   let gaveUp = false;
   try {
@@ -744,29 +578,14 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
       if (Date.now() > deadline) { gaveUp = true; break; }
 
       /* park: tool-call cuts are never continued server-side (app protocol).
-         images never continue either — they re-issue from zero or park.
-         v8: a park NOTICE goes into the buffer first, so a client that
-         reconnects later learns WHY the stream ended (the app finishes
-         the tool call itself and keeps going). */
-      if (parser.sawToolCalls && !parser.finishSeen) {
-        if (job.kind === "chat") { try { await emitNotice("park", { waitedMs: waitedSoFar() }, "a tool call was cut — parked for the app to finish it"); } catch (_) {} }
-        await parkJob(env, jobId, token); liveClose(live); return;
-      }
+         images never continue either — they re-issue from zero or park. */
+      if (parser.sawToolCalls && !parser.finishSeen) { await parkJob(env, jobId, token); liveClose(live); return; }
       if (job.kind !== "chat" && totalBytes > 0 && !parser.finishSeen) { await parkJob(env, jobId, token); liveClose(live); return; }
-      if (attempts >= MAX_ATTEMPTS) { await failJob(env, jobId, token, "retry budget used up"); liveClose(live); return; }
+      if (attempts >= MAX_ATTEMPTS) { await failJob(env, jobId, token, "retry budget used up", { live }); return; }
 
       /* ---- build the upstream request ---- */
-      /* v5: continuation vs plain re-issue is decided by REAL DATA, not
-         bytes — a job whose buffer holds only retry comments must re-issue
-         the original prompt, not "continue" from an empty partial.
-         Reasoning deltas count as data: the app accumulates them, and a
-         continuation with a partial that has only reasoning is exactly
-         what the app itself sends in the same situation. */
-      const hasContent = job.kind === "chat"
-        ? (parser.contentText.length > 0 || parser.sawToolCalls || parser.sawReasoning)
-        : totalBytes > 0;
       let body;
-      if (!hasContent) body = job.req; // plain re-issue
+      if (job.kind !== "chat" || totalBytes === 0) body = job.req; // plain re-issue
       else body = {
         ...job.req,
         messages: (job.req.messages || []).concat([
@@ -817,7 +636,6 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
               if (firstChunk && separatorNeeded) {
                 if (lastByte !== 0x0A) {
                   const sep = new Uint8Array([0x0A, 0x0A]); // line-align before a continuation
-                  livePush(live, sep);
                   parser.feed(sep);
                   pendingFlush += "\n\n"; pendingBytes += 2;
                   totalBytes += 2;
@@ -826,9 +644,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
                 separatorNeeded = false;
               }
               firstChunk = false;
-              livePush(live, value);
               parser.feed(value);
-              checkFirstByte();
               totalBytes += value.length;
               if (totalBytes <= MAX_JOB_BYTES) {
                 pendingFlush += flushDec.decode(value, { stream: true });
@@ -836,11 +652,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
               }
               lastByte = value[value.length - 1];
               if ((Date.now() - lastFlushAt > FLUSH_MS || pendingBytes > FLUSH_BYTES) && totalBytes <= MAX_JOB_BYTES) {
-                /* v5: lock lost = another driver owns this job now — stop
-                   SILENTLY. Never liveAbort here: live/abortCtl are SHARED
-                   with the new owner (same isolate) — aborting them kills
-                   the rightful pump and the client's stream with it. */
-                if (!(await flush())) { try { reader.cancel(); } catch (_) {} clearInterval(wd); signal.removeEventListener("abort", onOuterAbort); return; }
+                if (!(await flush())) { clearInterval(wd); signal.removeEventListener("abort", onOuterAbort); liveAbort(live); return; }
               }
             }
           }
@@ -849,8 +661,8 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
         } catch (_) { /* aborted or the socket died mid-stream → truncated */ }
         clearInterval(wd);
         signal.removeEventListener("abort", onOuterAbort);
-        /* v5: lock lost → the new owner streams on; stop silently */
-        if (!(await flush())) { try { reader.cancel(); } catch (_) {} return; }
+        if (!(await flush())) { liveAbort(live); return; }
+        if (parser.errorSeen) { await failJob(env, jobId, token, parser.errorMessage, { live }); return; }
         if (parser.finishSeen) { await finalizeDone(env, jobId, token, live); return; }
         if (naturalEnd && job.kind !== "chat") { await finalizeDone(env, jobId, token, live); return; } // images: full body = done
         if (signal.aborted) return;
@@ -859,9 +671,6 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
            so no other driver can steal the job mid-run) */
         attempts++; inlineAttempts++;
         try { await lockWrite(env, jobId, token, { attempts, updated_at: Date.now() }); } catch (_) {}
-        if (job.kind === "chat") {
-          try { await emitNotice("cont", { attempt: attempts + 1, max: MAX_ATTEMPTS, waitedMs: waitedSoFar() }, "answer was truncated — seamlessly continuing (attempt " + (attempts + 1) + "/" + MAX_ATTEMPTS + ")"); } catch (_) {}
-        }
         if (inlineAttempts >= maxInline) { gaveUp = true; break; }
         await sleep(backoffFor(attempts));
         separatorNeeded = totalBytes > 0;
@@ -878,66 +687,23 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
       } else if (upstreamErr) message = String((upstreamErr && upstreamErr.message) || upstreamErr);
 
       const fatal = [400, 401, 403, 404, 422].includes(status);
-      /* "real data" = content the app can keep and continue from — retry
-         comments are bytes but NOT data, so they must never reroute a
-         fatal error into the park path (that was the v5.0 bug: a 429
-         comment made totalBytes > 0, so a 401 got parked silently). */
-      const hasRealData = job.kind === "chat"
-        ? (parser.contentText.length > 0 || parser.sawToolCalls)
-        : totalBytes > 0;
-      if (fatal && !hasRealData) {
-        /* v5: the provider's error becomes REAL buffer bytes (an SSE error
-           event / error JSON), so live subscribers AND every reconnecting
-           tail replay it — the app then surfaces the actual provider error
-           ("Your API key is invalid", 401, …) instead of a cryptic
-           "(status 0)". failJob below just flips the row to failed. */
-        let clean = String(message).slice(0, 400);
-        try { const o = JSON.parse(message); if (o && o.error && o.error.message) clean = String(o.error.message).slice(0, 400); } catch (_) {}
-        if (job.kind === "images") {
-          try { await emitRaw(JSON.stringify({ error: { message: clean, code: status } }), true); } catch (_) {}
-        } else {
-          try { await emitRaw("data: " + JSON.stringify({ error: { message: clean, code: status } }) + "\n\n", true); } catch (_) {}
-        }
-        await failJob(env, jobId, token, "upstream " + status + ": " + clean, { live });
+      if (fatal && totalBytes === 0) {
+        await failJob(env, jobId, token, "upstream " + status + ": " + message,
+          { errorEvent: { message: message, code: status }, kind: job.kind, live });
         return;
       }
       if (fatal) { await parkJob(env, jobId, token); liveClose(live); return; }
-      /* retryable: 429 / 408 / 5xx / network — re-request until it gets in.
-         v5: OpenRouter 429s carry retry_after — honor it (capped) so the
-         re-request cadence is exactly as fast as the provider asks for. */
+      /* retryable: 429 / 408 / 5xx / network — re-request until it gets in */
       attempts++; inlineAttempts++;
       try { await lockWrite(env, jobId, token, { attempts, updated_at: Date.now() }); } catch (_) {}
-      let waitMs = backoffFor(attempts);
-      let raSec = 0;
-      try { const o = JSON.parse(message); raSec = Number((o && o.error && o.error.metadata && o.error.metadata.retry_after_seconds) || 0) || 0; } catch (_) {}
-      if (!raSec && upstream && upstream.headers) {
-        const h = Number(upstream.headers.get("retry-after") || 0) || 0;
-        if (h > 0) raSec = h;
-      }
-      if (status === 429 && raSec > 0) waitMs = Math.min(Math.max(raSec * 1000, 500), 30000);
-      if (job.kind === "chat") {
-        const why = upstream ? ("upstream " + status) : "upstream unreachable";
-        const reason = status === 429 ? "rate limited (waiting in line)" : (upstream ? ("upstream " + status) : "upstream unreachable");
-        try { await emitNotice("wait", { attempt: attempts + 1, max: MAX_ATTEMPTS, etaMs: Math.round(waitMs), waitedMs: waitedSoFar(), reason }, why + " — re-requesting until it gets in (attempt " + (attempts + 1) + "/" + MAX_ATTEMPTS + ") in ~" + Math.max(1, Math.round(waitMs / 1000)) + "s"); } catch (_) {}
-      }
       if (inlineAttempts >= maxInline) { gaveUp = true; break; }
-      await sleep(waitMs);
+      await sleep(backoffFor(attempts));
     }
   } finally {
     clearInterval(heart);
     try { await flush(); } catch (_) {}
     if (gaveUp) {
-      /* release for the next driver (cron / piggyback / app reconnect).
-         v5: emit an HONEST error event as real buffer bytes — the watching
-         client and every reconnecting tail see exactly what happened
-         ("provider still busy after N attempts — retrying continues in
-         the background"), then close cleanly. A silent zero-byte close
-         here is what produced the app's "(status 0)" dead end. */
-      const clean = "the provider is still busy after " + attempts + " attempts — the worker keeps retrying in the background; reopen the chat later for the answer";
-      try {
-        if (job.kind === "images") await emitRaw(JSON.stringify({ error: { message: clean, code: 429 } }), true);
-        else await emitRaw("data: " + JSON.stringify({ error: { message: clean, code: 429 } }) + "\n\n", true);
-      } catch (_) {}
+      /* release for the next driver (cron / piggyback / app reconnect) */
       await releaseJob(env, jobId, token, attempts);
       liveClose(live);
     }
@@ -952,26 +718,9 @@ async function releaseJob(env, id, token, attempts) {
     });
   } catch (_) {}
 }
-/* v6: terminal transitions stamp TIMING into the job's meta — startedAt /
-   doneAt / durationMs survive in D1 so "how long did this request work for"
-   is answerable server-side too (visible via /health's jobs list). */
-async function stampMeta(env, id, token, extra) {
-  try {
-    const row = await getJobRow(env, id);
-    if (!row) return;
-    const meta = Object.assign({}, row.meta || {}, extra);
-    await lockWrite(env, id, token, { meta: JSON.stringify(meta) });
-  } catch (_) {}
-}
 async function finalizeDone(env, id, token, live) {
   const now = Date.now();
   try {
-    const row = await getJobRow(env, id);
-    const startedAt = row?.createdAt || now;
-    /* v8: final WAIT/WORK split — "waited X to get in, worked Y on the
-       answer" is now permanently SAVED on the job (and shown in /health). */
-    const t = row ? timingOf(row, now) : { waitedMs: 0, workMs: 0 };
-    await stampMeta(env, id, token, { doneAt: now, durationMs: Math.max(0, now - startedAt), waitedMs: t.waitedMs, workMs: t.firstByteAt ? Math.max(0, now - t.firstByteAt) : 0, outcome: "done" });
     await lockWrite(env, id, token, { status: "done", finish: 1, heartbeat: 0, updated_at: now, lock_token: null });
     await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
   } catch (_) {}
@@ -980,32 +729,97 @@ async function finalizeDone(env, id, token, live) {
 async function parkJob(env, id, token) {
   const now = Date.now();
   try {
-    const row = await getJobRow(env, id);
-    const startedAt = row?.createdAt || now;
-    const t = row ? timingOf(row, now) : { waitedMs: 0, workMs: 0, firstByteAt: 0 };
-    await stampMeta(env, id, token, { parkedAt: now, durationMs: Math.max(0, now - startedAt), waitedMs: t.waitedMs, workMs: t.firstByteAt ? Math.max(0, now - t.firstByteAt) : 0, outcome: "parked" });
     await lockWrite(env, id, token, { status: "parked", heartbeat: 0, updated_at: now, lock_token: null });
     await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
   } catch (_) {}
 }
 async function failJob(env, id, token, reason, o = {}) {
   const now = Date.now();
+  /* 1. bytes FIRST: when a pre-stream failure needs an error event, it must
+     already be in the job buffer before the status flips to failed — a
+     polling tail would otherwise close before the error chunk lands */
+  if (o.errorEvent) {
+    try { await appendErrorChunk(env, id, o.kind || "chat", o.errorEvent.message, o.errorEvent.code); } catch (_) {}
+  }
+  /* 2. status + honest reason in meta (so /job/:id/status can report it) */
   try {
     const row = await getJobRow(env, id);
-    const startedAt = row?.createdAt || now;
-    const t = row ? timingOf(row, now) : { waitedMs: 0, workMs: 0, firstByteAt: 0 };
-    await stampMeta(env, id, token, { failedAt: now, durationMs: Math.max(0, now - startedAt), waitedMs: t.waitedMs, workMs: t.firstByteAt ? Math.max(0, now - t.firstByteAt) : 0, outcome: "failed", reason: String(reason || "").slice(0, 300) });
-    await lockWrite(env, id, token, { status: "failed", heartbeat: 0, updated_at: now, lock_token: null });
-    await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
-  } catch (_) {}
-  /* v5: the error payload itself is already in the job buffer (emitRaw'd
-     by the pump), so every subscriber and reconnecting tail replays it —
-     just close the live stream now. */
+    if (row) {
+      const meta = row.meta || {};
+      meta.error = String(reason).slice(0, 300);
+      await lockWrite(env, id, token, { status: "failed", heartbeat: 0, updated_at: now, lock_token: null, meta: JSON.stringify(meta) });
+    } else {
+      await lockWrite(env, id, token, { status: "failed", heartbeat: 0, updated_at: now, lock_token: null });
+    }
+  } catch (_) {
+    try { await lockWrite(env, id, token, { status: "failed", heartbeat: 0, updated_at: now, lock_token: null }); } catch (_) {}
+  }
+  try { await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]); } catch (_) {}
+  /* 3. live subscribers see the same error immediately */
+  if (o.errorEvent && o.live) {
+    const payload = (o.kind || "chat") === "images"
+      ? JSON.stringify({ error: { message: o.errorEvent.message, code: o.errorEvent.code } })
+      : "data: " + JSON.stringify({ error: { message: o.errorEvent.message, code: o.errorEvent.code } }) + "\n\n";
+    const u8 = new TextEncoder().encode(payload);
+    for (const c of [...o.live.subs]) { try { c.enqueue(u8); } catch (_) {} }
+  }
   if (o.live) liveClose(o.live);
 }
 
 /* =====================================================================
-   ATTACH: the app's continue request meets a job we already hold
+   SUBMIT — the v10 heart. The prompt becomes a durable D1 job BEFORE any
+   upstream request exists; the caller gets 202 { jobId } in milliseconds
+   and subscribes separately. Idempotency + explicit parent retirement.
+   ===================================================================== */
+async function handleSubmit(request, pathname, ctx, env, parsed, fwd) {
+  const reqKey = sanitizeKey(request.headers.get("X-Nexus-Key"));
+  const chatKey = sanitizeKey(request.headers.get("X-Nexus-Chat"));
+  const parent = sanitizeKey(request.headers.get("X-Nexus-Parent"));
+
+  /* idempotency: a network retry of the same submission must not
+     double-spend — hand back the job we already created */
+  if (reqKey) {
+    try {
+      const existing = await getSQL(env,
+        `SELECT id FROM jobs WHERE req_key = ? AND status IN ('queued','streaming','done') AND created_at > ? ORDER BY created_at DESC LIMIT 1`,
+        [reqKey, Date.now() - JOB_TTL_MS]);
+      if (existing && existing.id) {
+        return json({ ok: true, jobId: existing.id, reused: true, v: WORKER_VERSION }, 202, { "X-Nexus-Job": existing.id });
+      }
+    } catch (_) {}
+  }
+
+  /* explicit continuation: retire the job this one replaces (only a
+     RUNNING parent needs stopping; finished ones simply age out) */
+  if (parent) {
+    try {
+      await runSQL(env, `UPDATE jobs SET status = 'stopped', heartbeat = 0, lock_token = NULL, updated_at = ? WHERE id = ? AND status IN ('queued','streaming')`, [Date.now(), parent]);
+      await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [parent]);
+      const pl = liveMap.get(parent);
+      if (pl) liveAbort(pl);
+    } catch (_) {}
+  }
+
+  const id = crypto.randomUUID();
+  const kind = pathname === "/images" ? "images" : "chat";
+  const now = Date.now();
+  const metaFwd = Object.assign({}, fwd);
+  delete metaFwd.authorization;
+  const meta = { fwd: metaFwd, contentType: kind === "images" ? "application/json" : "text/event-stream", submit: true };
+  await runSQL(env,
+    `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token, chat_key, req_key, parent, first_byte) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, 0, '', ?, ?, NULL, ?, ?, ?, 0)`,
+    [id, kind, now, now, JSON.stringify(parsed), JSON.stringify(meta), chatKey, reqKey, parent]);
+  if (fwd.authorization) {
+    try { await runSQL(env, `INSERT INTO secrets (job, auth) VALUES (?, ?)`, [id, fwd.authorization]); } catch (_) {}
+  }
+  try { ctx && ctx.waitUntil && ctx.waitUntil(prune(env).catch(() => {})); } catch (_) {}
+  try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, id).catch(() => {})); } catch (_) {}
+  return json({ ok: true, jobId: id, v: WORKER_VERSION }, 202, { "X-Nexus-Job": id });
+}
+
+/* =====================================================================
+   ATTACH-ON-CONTINUE (legacy clients only) — the app's continue request
+   meets a job we already hold. v10 apps use X-Nexus-Parent instead.
    ===================================================================== */
 async function matchContinueJob(env, parsed) {
   const msgs = parsed && parsed.messages;
@@ -1053,21 +867,10 @@ async function matchContinueJob(env, parsed) {
 function tailStream(env, ctx, jobId, startOffset) {
   const enc = new TextEncoder();
   let closed = false;
-  /* v5: a connected tail is a WATCHER of the job — it registers in the live
-     registry so liveness models (and any same-isolate pump driving this
-     job) know a client is attached. Harmless in production (a counter). */
-  const live = liveFor(jobId);
-  live.__watchers = (live.__watchers || 0) + 1;
   return new ReadableStream({
     start(controller) {
-      const unwatch = () => { live.__watchers = Math.max(0, (live.__watchers || 1) - 1); };
       const push = u8 => { if (!closed) { try { controller.enqueue(u8); } catch (_) { closed = true; } } };
-      const close = () => { if (!closed) { closed = true; unwatch(); try { controller.close(); } catch (_) {} } };
-      /* v5: an internal tail failure (D1 hiccup etc.) must ERROR the stream,
-         never close it — a clean close at incomplete data reads as "response
-         ended" and dead-ends the app at "(status 0)"; an error makes the
-         app reconnect, which is exactly what a transient D1 blip needs. */
-      const fail = () => { if (!closed) { closed = true; unwatch(); try { controller.error(new Error("nexus tail: transient failure — reconnect")); } catch (_) {} } };
+      const close = () => { if (!closed) { closed = true; try { controller.close(); } catch (_) {} } };
       (async () => {
         let pos = 0;           // cumulative byte position of the chunk cursor
         let sent = startOffset; // the next byte the client needs
@@ -1093,6 +896,11 @@ function tailStream(env, ctx, jobId, startOffset) {
           }
           /* ---- live phase ---- */
           while (!closed) {
+            /* a watching tail keeps this job's execution context alive (its
+               response is still streaming) — mark the interest so the runtime
+               model never treats a watched job as orphaned */
+            const liveWatch = liveFor(jobId);
+            liveWatch.__tailSeen = Date.now();
             const r = await getSQL(env, `SELECT status, bytes, heartbeat, created_at FROM jobs WHERE id = ?`, [jobId]);
             if (!r) { close(); return; }
             const status = r.status;
@@ -1105,7 +913,7 @@ function tailStream(env, ctx, jobId, startOffset) {
               }
             }
             if ((status === "done" || status === "failed" || status === "parked" || status === "stopped") && pos >= total) { close(); return; }
-            if (Date.now() - Number(r.created_at) > JOB_TTL_MS) { close(); return; }
+            if (Date.now() - Number(r.created_at) > JOB_TTL_MS + DONE_TTL_MS) { close(); return; }
             /* the job looks stalled — kick a work pass in THIS event (a
                fresh execution context = progress resumes immediately) */
             if (status === "queued" || status === "streaming") {
@@ -1119,10 +927,10 @@ function tailStream(env, ctx, jobId, startOffset) {
             lastTotal = total;
             await sleep(idlePolls > 4 ? TAIL_POLL_SLOW : TAIL_POLL_FAST);
           }
-        } catch (_) { fail(); }
+        } catch (_) { close(); }
       })();
     },
-    cancel() { closed = true; live.__watchers = Math.max(0, (live.__watchers || 1) - 1); },
+    cancel() { closed = true; },
   });
 }
 
@@ -1141,8 +949,11 @@ async function handleProxy(request, pathname, ctx, env) {
   try { parsed = JSON.parse(new TextDecoder().decode(rawBody)); } catch (_) {}
   const fwd = {};
   for (const h of FWD_HEADERS) { const v = request.headers.get(h); if (v) fwd[h] = v; }
+  const submitMode = request.headers.get("X-Nexus-Submit") === "1";
 
-  /* no D1 (or an unparseable body) → plain passthrough (graceful degrade) */
+  /* no D1 (or an unparseable body) → plain passthrough (graceful degrade —
+     a submit-mode app sees the streaming response and falls back to the
+     legacy protocol automatically) */
   if (!hasDB(env) || !parsed) {
     const upstream = await fetch(upstreamBase(env) + (pathname === "/chat" ? "/chat/completions" : "/images"), {
       method: "POST", headers: headersFrom(fwd), body: rawBody,
@@ -1154,7 +965,15 @@ async function handleProxy(request, pathname, ctx, env) {
     return new Response(upstream.body, { status: upstream.status, headers: hdrs });
   }
 
-  /* ATTACH: a continue request that matches a job we're already holding */
+  /* ---- v10 SUBMIT: the job exists before the upstream does ---- */
+  if (submitMode) {
+    try { return await handleSubmit(request, pathname, ctx, env, parsed, fwd); }
+    catch (err) {
+      return json({ error: { message: "submit failed: " + ((err && err.message) || String(err)), code: 502 } }, 502);
+    }
+  }
+
+  /* ---- legacy proxy+tee (apps without the submit header) ---- */
   if (pathname === "/chat") {
     const m = await matchContinueJob(env, parsed);
     if (m) {
@@ -1163,9 +982,8 @@ async function handleProxy(request, pathname, ctx, env) {
       const kick = () => { try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, m.id).catch(() => {})); } catch (_) {} };
       if (job && (job.status === "streaming" || job.status === "queued")) kick();
       /* X-Nexus-Job is hidden when the boundary is > 0 — the app's
-         absolute-offset reconnect math must stay correct.
-         v8: queue/timing headers ride along on attach too */
-      const headers = relayHeaders((job && job.meta.contentType) || "text/event-stream", m.boundary > 0 ? null : m.id, job ? nexusMetaHeaders(job) : null);
+         absolute-offset reconnect math must stay correct */
+      const headers = relayHeaders((job && job.meta.contentType) || "text/event-stream", m.boundary > 0 ? null : m.id);
       if (live.hasPump && live.abortCtl && !live.abortCtl.signal.aborted) {
         return new Response(liveSubscriber(live, m.boundary), { status: 200, headers });
       }
@@ -1173,27 +991,17 @@ async function handleProxy(request, pathname, ctx, env) {
     }
   }
 
-  /* attempt 0 — fatal 4xx passes straight through (v2 behavior: the app
-     maps auth/path errors itself); retryable failures become a durable
-     queued job the pump keeps re-requesting "until it gets in".
-     v8: attempt 0 is TIMEOUT-BOUNDED (30s to response headers) — a
-     black-holed upstream connect used to hang the POST silently for the
-     app's full 120s request timeout before any honest notice could start;
-     now it degrades into the job path immediately and the notices begin. */
+  /* attempt 0 — fatal 4xx passes straight through (the app maps
+     auth/path errors itself); retryable failures become a durable
+     queued job the pump keeps re-requesting "until it gets in". */
   let upstream = null, upstreamErr = null;
-  {
-    const ac0 = new AbortController();
-    const t0 = setTimeout(() => { try { ac0.abort(); } catch (_) {} }, TUN("attempt0TimeoutMs", 30 * 1000));
-    try {
-      upstream = await fetch(upstreamBase(env) + (pathname === "/chat" ? "/chat/completions" : "/images"), {
-        method: "POST", headers: headersFrom(fwd), body: rawBody,
-        signal: ac0.signal,
-        // @ts-ignore runtime-specific
-        cf: { cacheTtl: 0 },
-      });
-    } catch (err) { upstreamErr = err; }
-    finally { clearTimeout(t0); }
-  }
+  try {
+    upstream = await fetch(upstreamBase(env) + (pathname === "/chat" ? "/chat/completions" : "/images"), {
+      method: "POST", headers: headersFrom(fwd), body: rawBody,
+      // @ts-ignore runtime-specific
+      cf: { cacheTtl: 0 },
+    });
+  } catch (err) { upstreamErr = err; }
   const retryable = !!(upstreamErr || (upstream && !upstream.ok && [408, 429, 500, 502, 503, 504, 522, 524].includes(upstream.status)));
   if (!retryable && upstream && (!upstream.ok || !upstream.body)) {
     const hdrs = new Headers(upstream.headers);
@@ -1209,31 +1017,17 @@ async function handleProxy(request, pathname, ctx, env) {
   const metaFwd = Object.assign({}, fwd);
   delete metaFwd.authorization;
   const meta = { fwd: metaFwd, contentType };
-  /* v9: the app's client key — a deterministic per-(chat,message) handle the
-     NEXT app launch can use to find this job even when the page died before
-     the X-Nexus-Job response header ever arrived (fetch in flight at kill
-     time). Never forwarded upstream; only meaningful for job lookup. */
-  const clientKey = (request.headers.get("X-Nexus-Client") || "").slice(0, 200) || null;
-  const authHash = fwd.authorization ? await sha256Hex(fwd.authorization) : null;
   await runSQL(env,
-    `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, client_key, auth_hash, lock_token) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, 0, '', ?, ?, ?, ?, NULL)`,
-    [id, kind, now, now, JSON.stringify(parsed), JSON.stringify(meta), clientKey, authHash]);
+    `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token, chat_key, req_key, parent, first_byte) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, 0, '', ?, ?, NULL, NULL, NULL, NULL, 0)`,
+    [id, kind, now, now, JSON.stringify(parsed), JSON.stringify(meta)]);
   if (fwd.authorization) {
     try { await runSQL(env, `INSERT INTO secrets (job, auth) VALUES (?, ?)`, [id, fwd.authorization]); } catch (_) {}
   }
   try { ctx && ctx.waitUntil && ctx.waitUntil(prune(env).catch(() => {})); } catch (_) {}
 
   const live = liveFor(id);
-  const headers = relayHeaders(contentType, id, {
-    "X-Nexus-Status": "queued", "X-Nexus-Attempts": "0",
-    "X-Nexus-Age": "0", "X-Nexus-Waited": "0", "X-Nexus-Work": "0",
-  });
-  /* v5: the request context is alive as long as the client is connected —
-     give the pump the FULL retry budget in-context ("re-request until it
-     gets in", up to MAX_ATTEMPTS / the 10-minute event budget). The
-     runtime's ~30s post-disconnect teardown is the real give-up signal
-     for clients that leave; the cron/piggyback then carry the job. */
-  try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, id, { firstUpstream: upstream || null, maxAttempts: MAX_ATTEMPTS }).catch(() => {})); } catch (_) {}
+  const headers = relayHeaders(contentType, id);
+  try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, id, { firstUpstream: upstream || null }).catch(() => {})); } catch (_) {}
   return new Response(liveSubscriber(live, 0), { status: 200, headers });
 }
 
@@ -1243,92 +1037,79 @@ async function handleJobGet(url, ctx, env) {
   const offset = Math.max(0, Number(url.searchParams.get("offset") || 0) || 0);
   const job = await getJobRow(env, id);
   if (!job) return json({ error: "job not found (expired or relay restarted)" }, 404);
-  /* v5: a FAILED job no longer 410s blindly — its buffer carries the real
-     provider error (persisted error event), so serve it: the app's reader
-     parses the error and surfaces the actual message + status instead of
-     a generic "job ended". 'stopped' = superseded (the app moved on). */
-  if (job.status === "stopped") return json({ error: "job ended (" + job.status + ")" }, 410);
-  /* v5: reconnects ALWAYS get the D1 tail. workerd forbids cross-request
-     I/O: a stream created in THIS request's context cannot be driven by a
-     pump running in the original POST's context (workerd 500s the response
-     with "Cannot perform I/O on behalf of a different request"). The tail
-     is fully self-contained: byte-exact replay from the chunk log, live
-     D1 polling (every pump flushes every ~2s), stale-pump kicks, and it
-     closes only on done/failed/parked. It also registers as a WATCHER on
-     the job's live registry so liveness models see the attached client.
-     v6: X-Nexus-Age tells the app how long this job has been running
-     server-side ("the worker has been on this request for 47s").
-     v8: X-Nexus-Status / -Attempts / -Waited / -Work tell the app the
-     job's queue state and its WAIT/WORK split at the moment of attach —
-     the app shows "waiting in line, tried N times" instantly. */
-  return new Response(tailStream(env, ctx, id, offset), { status: 200, headers: relayHeaders(job.meta.contentType, id, Object.assign({ "X-Nexus-Offset": String(job.bytes) }, nexusMetaHeaders(job))) });
-}
-
-/* v8: STATUS PROBE — a cheap, honest, one-row JSON read the app polls
-   while its tail is quiet (or while it waits on a rate-limited job):
-     {status, attempts, bytes, ageMs, waitedMs, workMs}
-   It piggybacks a work pass too, so polling ALSO drives a due job (a
-   double win: the app learns the queue state and revives the pump). */
-/* v9: LOOKUP BY CLIENT KEY — the page died before the POST's response
-   headers arrived, so the app never learned its job id. It DID persist a
-   deterministic key (chatId|msgIndex) before the request fired; this route
-   maps that key back to the live/finished job so recovery can re-attach
-   instead of re-asking and double-spending. Auth-checked against the
-   job's stored secret — a wrong or missing key gets a plain 404. */
-async function handleJobByKey(request, url, ctx, env) {
-  if (!hasDB(env)) return json({ error: "job not found (relay in passthrough mode)", gone: true }, 404);
-  const key = decodeURIComponent(url.pathname.split("/")[3] || "");
-  if (!key) return json({ error: "missing client key", gone: true }, 404);
-  const auth = request.headers.get("authorization") || "";
-  const row = await getSQL(env,
-    `SELECT j.id, j.kind, j.status, j.created_at, j.updated_at, j.attempts, j.bytes, j.finish, j.meta, j.auth_hash, s.auth AS secret
-     FROM jobs j LEFT JOIN secrets s ON s.job = j.id
-     WHERE j.client_key = ? AND j.status != 'stopped' AND j.status != 'failed'
-     ORDER BY j.created_at DESC LIMIT 1`, [key]);
-  if (!row || !row.id) return json({ error: "no job for this key (expired or never created)", gone: true }, 404);
-  /* v9: auth survives completion as a SHA-256 hash on the row — the live
-     secret is checked while the job still runs, the hash forever after */
-  let authOk = true;
-  if (row.secret) authOk = row.secret === auth;
-  else if (row.auth_hash) authOk = (await sha256Hex(auth)) === row.auth_hash;
-  if (!authOk) return json({ error: "job not found", gone: true }, 404);
-  /* found and ours — drive it if it's due, then hand back the handle */
-  if (row.status === "queued" || row.status === "streaming") {
-    try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, row.id).catch(() => {})); } catch (_) {}
+  maybeWorkAny(env, ctx); // a live-cast reader just attached — drive due work now
+  const live = liveFor(id);
+  /* same-isolate live pump → zero-latency fan-out */
+  if (live.hasPump && live.abortCtl && !live.abortCtl.signal.aborted) {
+    return new Response(liveSubscriber(live, Math.min(offset, live.total)), { status: 200, headers: relayHeaders(job.meta.contentType, id, { "X-Nexus-Offset": String(live.total) }) });
   }
-  let meta = {};
-  try { meta = row.meta ? JSON.parse(row.meta) : {}; } catch (_) {}
-  const j = { createdAt: Number(row.created_at), status: row.status, attempts: Number(row.attempts), meta };
-  const t = timingOf(j);
-  return json({
-    ok: true, v: WORKER_VERSION, id: row.id, kind: row.kind, status: row.status,
-    attempts: Number(row.attempts), bytes: Number(row.bytes), finish: !!Number(row.finish),
-    ageMs: Math.max(0, Date.now() - Number(row.created_at)),
-    waitedMs: t.waitedMs, workMs: t.workMs, firstByte: !!t.firstByteAt,
-  });
+  return new Response(tailStream(env, ctx, id, offset), { status: 200, headers: relayHeaders(job.meta.contentType, id, { "X-Nexus-Offset": String(job.bytes) }) });
 }
 
+/* honest job status — the app's wait monitor + timing chips read this */
 async function handleJobStatus(url, ctx, env) {
   if (!hasDB(env)) return json({ error: "job not found (relay in passthrough mode)" }, 404);
   const id = url.pathname.split("/")[2];
   const job = await getJobRow(env, id);
   if (!job) return json({ error: "job not found (expired or relay restarted)", gone: true }, 404);
-  const t = timingOf(job);
-  return json({
-    ok: true, v: WORKER_VERSION, id, kind: job.kind, status: job.status,
-    attempts: job.attempts, bytes: job.bytes,
-    ageMs: Math.max(0, Date.now() - job.createdAt),
-    waitedMs: t.waitedMs, workMs: t.workMs,
-    firstByte: !!t.firstByteAt,
-    finish: !!job.finish,
-  });
+  maybeWorkAny(env, ctx); // the app polls this while waiting — progress resumes NOW
+  const now = Date.now();
+  const born = job.createdAt;
+  const fb = job.firstByte;
+  const done = job.status === "done";
+  const running = !done && job.status !== "failed" && job.status !== "stopped";
+  /* waitedMs = send → first real token; workMs = first token → end.
+     While still waiting (queue, keepalives only) the whole span is wait. */
+  const waitedMs = fb ? Math.max(0, fb - born) : (done ? 0 : Math.max(0, now - born));
+  const workMs = fb
+    ? Math.max(0, (running ? now : job.updatedAt) - fb)
+    : (done ? Math.max(0, job.updatedAt - born) : 0);
+  const out = {
+    ok: true, id: job.id, jobId: job.id, kind: job.kind, status: job.status,
+    attempts: job.attempts, waitedMs, workMs, bytes: job.bytes,
+    createdAt: born, updatedAt: job.updatedAt, v: WORKER_VERSION,
+  };
+  if (job.meta && job.meta.error) out.error = job.meta.error;
+  return json(out);
+}
+
+/* rediscovery: the newest job for a chat key (X-Nexus-Chat on submit) */
+async function handleJobByKey(url, ctx, env) {
+  if (!hasDB(env)) return json({ error: "no job for this key (passthrough mode)" }, 404);
+  const key = sanitizeKey(decodeURIComponent(url.pathname.split("/")[3] || ""));
+  if (!key) return json({ error: "missing key" }, 400);
+  maybeWorkAny(env, ctx); // a returning app just asked — drive due work now
+  let rows = [];
+  try {
+    rows = await allSQL(env, `SELECT id, kind, status, bytes, created_at FROM jobs WHERE chat_key = ? ORDER BY created_at DESC LIMIT 8`, [key]);
+  } catch (_) {}
+  const now = Date.now();
+  for (const r of rows) {
+    const age = now - Number(r.created_at);
+    const st = String(r.status);
+    if (["queued", "streaming", "parked"].includes(st) && age < JOB_TTL_MS) {
+      return json({ ok: true, jobId: r.id, id: r.id, kind: r.kind, status: st, bytes: Number(r.bytes) });
+    }
+    if (st === "done" && age < DONE_TTL_MS) {
+      return json({ ok: true, jobId: r.id, id: r.id, kind: r.kind, status: st, bytes: Number(r.bytes) });
+    }
+    if ((st === "failed" || st === "stopped") && age < 120000) {
+      return json({ ok: true, jobId: r.id, id: r.id, kind: r.kind, status: st, bytes: Number(r.bytes) });
+    }
+  }
+  return json({ error: "no job for this key" }, 404);
 }
 
 async function handleDelete(url, env) {
   const id = url.pathname.split("/")[2];
   const live = liveMap.get(id);
-  if (live) { liveAbort(live); liveMap.delete(id); }
-  if (hasDB(env)) { try { await deleteJobRows(env, id); } catch (_) {} }
+  if (live) liveAbort(live);
+  if (hasDB(env)) {
+    /* stop the spend: mark cancelled (running pumps lose their lock on the
+       next flush and self-terminate); rows are pruned by TTL shortly after */
+    try { await runSQL(env, `UPDATE jobs SET status = 'stopped', heartbeat = 0, lock_token = NULL, updated_at = ? WHERE id = ?`, [Date.now(), id]); } catch (_) {}
+    try { await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]); } catch (_) {}
+  }
   return json({ ok: true });
 }
 
@@ -1337,16 +1118,19 @@ async function prune(env) {
   if (!hasDB(env)) return;
   const now = Date.now();
   try {
-    /* v6: PARKED jobs (agent tool-cuts, waiting for the app) get their own
-       longer TTL — a mid-agent run stays recoverable for 30 minutes. */
     const dead = await allSQL(env,
-      `SELECT id FROM jobs WHERE ((status IN ('done','failed','stopped') AND updated_at < ?) OR (status = 'parked' AND updated_at < ?) OR (created_at < ?))`,
-      [now - DONE_TTL_MS, now - PARK_TTL_MS, now - JOB_TTL_MS - DONE_TTL_MS]);
+      `SELECT id FROM jobs WHERE (status IN ('done','failed','parked','stopped') AND updated_at < ?) OR (created_at < ?)`,
+      [now - DONE_TTL_MS, now - JOB_TTL_MS - DONE_TTL_MS]);
     for (const r of dead) await deleteJobRows(env, r.id);
     await runSQL(env,
       `UPDATE jobs SET status = 'failed', heartbeat = 0, lock_token = NULL, updated_at = ? WHERE status IN ('queued','streaming') AND created_at < ?`,
       [now, now - JOB_TTL_MS]);
     await runSQL(env, `DELETE FROM secrets WHERE job NOT IN (SELECT id FROM jobs)`);
+    const total = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs`);
+    if (total && Number(total.n) > MAX_TOTAL_JOBS) {
+      const old = await allSQL(env, `SELECT id FROM jobs WHERE status IN ('done','stopped','failed','parked') ORDER BY updated_at ASC LIMIT ?`, [Number(total.n) - MAX_TOTAL_JOBS]);
+      for (const r of old) await deleteJobRows(env, r.id);
+    }
     const n = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','streaming')`);
     if (n && Number(n.n) > MAX_ACTIVE_JOBS) {
       const old = await allSQL(env, `SELECT id FROM jobs WHERE status IN ('done','stopped') ORDER BY updated_at ASC LIMIT ?`, [Number(n.n) - MAX_ACTIVE_JOBS]);
@@ -1355,120 +1139,73 @@ async function prune(env) {
   } catch (_) {}
 }
 
-/* piggyback work: any incoming request can drive due jobs in its own
+/* piggyback work: any incoming request can drive one due job in its own
    fresh execution context — this is what makes progress resume the
-   instant the app reconnects, without waiting for the cron tick.
-   v6: two jobs per request (concurrent chats revive together). */
+   instant the app reconnects, without waiting for the cron tick */
 async function maybeWorkAny(env, ctx) {
   if (!hasDB(env)) return;
   try {
     const now = Date.now();
-    const rows = await allSQL(env,
-      `SELECT id FROM jobs WHERE status IN ('queued','streaming') AND next_retry <= ? AND heartbeat < ? ORDER BY next_retry ASC LIMIT 2`,
+    const r = await getSQL(env,
+      `SELECT id FROM jobs WHERE status IN ('queued','streaming') AND next_retry <= ? AND heartbeat < ? ORDER BY next_retry ASC LIMIT 1`,
       [now, now - STALE_LOCK_MS]);
-    for (const r of rows) {
-      try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, r.id, { maxAttempts: 6, budgetMs: 90000 }).catch(() => {})); } catch (_) {}
+    if (r && r.id) {
+      try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, r.id, { maxAttempts: 3, budgetMs: 90000 }).catch(() => {})); } catch (_) {}
     }
   } catch (_) {}
 }
 
-/* the real router — wrapped by the default export's catch-all */
-async function handleFetch(request, env, ctx) {
-  const url = new URL(request.url);
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-  if (hasDB(env)) { try { await ensureSchema(env); } catch (_) {} }
-  /* v5: ANY request piggybacks one due job into its own fresh context —
-     previously only /health did, so a stuck job only revived on a health
-     poll. Fire-and-forget (waitUntil'd) — zero added latency. */
-  const piggyback = () => { try { ctx && ctx.waitUntil && ctx.waitUntil(maybeWorkAny(env, ctx).catch(() => {})); } catch (_) {} };
-
-  if (url.pathname === "/health") {
-    let out;
-    if (hasDB(env)) {
-      let cronAge = -1, active = 0;
-      try { cronAge = Date.now() - (await wstateGet(env, "cron_beat") || 0); } catch (_) {}
-      try { const n = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','streaming')`); active = n ? Number(n.n) : 0; } catch (_) {}
-      out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: true, mode: "job engine", clientKey: true, cronOk: cronAge >= 0 && cronAge < 3 * 60 * 1000, cronAgeMs: cronAge, active, time: Date.now() };
-      /* v6: a live jobs digest — every active job's age, size, and attempt
-         count ("what is the worker working on and for how long"), plus the
-         last few finished ones with their SAVED durations. */
-      try {
-        const rows = await allSQL(env, `SELECT id, kind, status, created_at, updated_at, attempts, bytes, meta FROM jobs ORDER BY updated_at DESC LIMIT 8`);
-        const now = Date.now();
-        out.jobs = rows.map(r => {
-          let meta = {}; try { meta = r.meta ? JSON.parse(r.meta) : {}; } catch (_) {}
-          const j = { createdAt: Number(r.created_at), status: r.status, attempts: Number(r.attempts), meta };
-          const t = timingOf(j, now);
-          return {
-            id: String(r.id).slice(0, 8), kind: r.kind, status: r.status,
-            ageMs: Math.max(0, now - Number(r.created_at)),
-            bytes: Number(r.bytes), attempts: Number(r.attempts),
-            waitedMs: t.waitedMs, workMs: t.workMs,
-            ...(meta.durationMs != null ? { durationMs: meta.durationMs } : {}),
-          };
-        });
-      } catch (_) {}
-      if (!out.cronOk) out.setup = "add a Cron Trigger with schedule * * * * * (Settings → Triggers & Events) so jobs finish while your phone is off";
-    } else {
-      out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: false, mode: "passthrough (bind D1 as DB for the background job engine)", time: Date.now(), setup: "create a D1 database and bind it with variable name DB (Settings → Bindings)" };
-    }
-    maybeWorkAny(env, ctx);
-    return json(out);
-  }
-
-  if (request.method === "POST" && (url.pathname === "/chat" || url.pathname === "/images")) {
-    piggyback();
-    try {
-      return await handleProxy(request, url.pathname, ctx, env);
-    } catch (err) {
-      return json({ error: { message: "relay upstream failed: " + (err && err.message || String(err)), code: 502 } }, 502);
-    }
-  }
-  if (request.method === "GET" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
-    piggyback();
-    return handleJobGet(url, ctx, env);
-  }
-  /* v8: the status probe — cheap JSON the app polls while its tail is
-     quiet; polling piggybacks a work pass, so it also drives due jobs */
-  if (request.method === "GET" && /^\/job\/[A-Za-z0-9-]+\/status$/.test(url.pathname)) {
-    piggyback();
-    return handleJobStatus(url, ctx, env);
-  }
-  /* v9: client-key lookup — recovery for pages killed before the job id
-     header arrived */
-  if (request.method === "GET" && /^\/job\/by-key\/.+$/.test(url.pathname)) {
-    piggyback();
-    return handleJobByKey(request, url, ctx, env);
-  }
-  if (request.method === "DELETE" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
-    piggyback();
-    return handleDelete(url, env);
-  }
-  return json({ error: "not found", hint: "use /chat, /images, /job/:id?offset=N, /job/:id/status, /job/by-key/:key, /health" }, 404);
-}
-
 export default {
   async fetch(request, env, ctx) {
-    try {
-      return await handleFetch(request, env, ctx);
-    } catch (err) {
-      /* v5: nothing 500s opaquely — a CORS'd JSON error the app can read,
-         instead of a bare runtime 500 the browser blocks as a network
-         failure ("status 0"). */
-      return json({ error: { message: "relay internal error: " + (err && err.message || String(err)), code: 500 } }, 500);
+    const url = new URL(request.url);
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+    if (hasDB(env)) { try { await ensureSchema(env); } catch (_) {} }
+
+    if (url.pathname === "/health") {
+      let out;
+      if (hasDB(env)) {
+        let cronAge = -1, active = 0;
+        try { cronAge = Date.now() - (await wstateGet(env, "cron_beat") || 0); } catch (_) {}
+        try { const n = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','streaming')`); active = n ? Number(n.n) : 0; } catch (_) {}
+        out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: true, mode: "job engine (worker owns the request)", cronOk: cronAge >= 0 && cronAge < 3 * 60 * 1000, cronAgeMs: cronAge, active, time: Date.now() };
+        if (!out.cronOk) out.setup = "add a Cron Trigger with schedule * * * * * (Settings → Triggers & Events) so jobs finish while your phone is off";
+      } else {
+        out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: false, mode: "passthrough (bind D1 as DB for the background job engine)", time: Date.now(), setup: "create a D1 database and bind it with variable name DB (Settings → Bindings)" };
+      }
+      maybeWorkAny(env, ctx);
+      return json(out);
     }
+
+    if (request.method === "POST" && (url.pathname === "/chat" || url.pathname === "/images")) {
+      try {
+        return await handleProxy(request, url.pathname, ctx, env);
+      } catch (err) {
+        return json({ error: { message: "relay upstream failed: " + (err && err.message || String(err)), code: 502 } }, 502);
+      }
+    }
+    if (request.method === "GET" && /^\/job\/by-key\/[A-Za-z0-9._:%-]+$/.test(url.pathname)) {
+      return handleJobByKey(url, ctx, env);
+    }
+    if (request.method === "GET" && /^\/job\/[A-Za-z0-9-]+\/status$/.test(url.pathname)) {
+      return handleJobStatus(url, ctx, env);
+    }
+    if (request.method === "GET" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
+      return handleJobGet(url, ctx, env);
+    }
+    if (request.method === "DELETE" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
+      return handleDelete(url, env);
+    }
+    return json({ error: "not found", hint: "use /chat (X-Nexus-Submit: 1), /job/:id?offset=N, /job/:id/status, /job/by-key/:key, /health" }, 404);
   },
 
-  /* cron tick: heartbeat + prune + up to CRON_JOBS_PER_TICK jobs of real work.
-     v6: four jobs per tick — several chats generating with the phone off all
-     advance instead of finishing two-per-minute. */
+  /* cron tick: heartbeat + prune + up to two jobs of real work */
   async scheduled(_event, env, ctx) {
     if (!hasDB(env)) return;
     try { await ensureSchema(env); } catch (_) { return; }
     try { await wstateSet(env, "cron_beat", Date.now()); } catch (_) {}
     try { await prune(env); } catch (_) {}
     const deadline = Date.now() + TICK_BUDGET_MS;
-    for (let i = 0; i < CRON_JOBS_PER_TICK; i++) {
+    for (let i = 0; i < 2; i++) {
       if (Date.now() > deadline - 15000) break;
       try {
         const now = Date.now();
@@ -1476,7 +1213,7 @@ export default {
           `SELECT id FROM jobs WHERE status IN ('queued','streaming') AND next_retry <= ? AND heartbeat < ? ORDER BY next_retry ASC LIMIT 1`,
           [now, now - STALE_LOCK_MS]);
         if (!r || !r.id) break;
-        await driveJob(env, ctx, r.id, { maxAttempts: 8, cron: true, budgetMs: Math.max(30000, Math.floor((deadline - Date.now()) / Math.max(1, CRON_JOBS_PER_TICK - i)) - 10000) });
+        await driveJob(env, ctx, r.id, { maxAttempts: 6, budgetMs: Math.max(30000, deadline - Date.now() - 10000) });
       } catch (_) {}
     }
     try { await wstateSet(env, "last_work", Date.now()); } catch (_) {}
