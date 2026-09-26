@@ -32,6 +32,24 @@
    you left at whenever you reopen. Your phone's connection quality has ZERO
    effect on the generation itself.
 
+   v14 — "honest meters + your finger on the pace":
+   1. WAIT vs WORK, redefined to match what actually happens: WORK is any
+      time the model is actively doing something on an ACCEPTED attempt
+      (thinking, writing text, drafting tool arguments, searching); WAIT is
+      only the time the request is caught in a line (queue, 429 backoffs,
+      refused attempts, waiting for the next driver). Both meters are
+      accumulated on the job row (wait_ms / work_ms + live start markers),
+      so /job/:id/status and /jobs report the true split at any moment —
+      across driver handoffs and isolate teardowns included. A finished
+      request reports the time it SPENT WORKING, not how long ago it ended.
+   2. The retry pace is yours to pick MID-WAIT: POST /job/:id/retry-mode
+      (relaxed | standard | aggressive | relentless — the app's exact four
+      paces) changes the backoff of a queued/streaming job live; a faster
+      pick shortens the countdown that is already ticking. A submit may
+      carry "X-Nexus-Retry: <mode>" to set the starting pace.
+   3. Finished requests are removable: DELETE /jobs/:id deletes a terminal
+      job's rows outright; POST /jobs/clear removes every finished one.
+
    v13 — "the tail never lies":
    1. The in-isolate live fast-path is RETIRED: GET /job/:id always serves
       the D1-polling tail. The fast path closed the app's stream when the
@@ -123,7 +141,7 @@
    subrequest budgets degrade gracefully (fresh drivers resume the work).
    ===================================================================== */
 
-const WORKER_VERSION = 13;
+const WORKER_VERSION = 14;
 
 /* test tunables — production reads defaults; the local harness overrides
    via globalThis.__nexusTun to run E2E in seconds. */
@@ -158,12 +176,24 @@ const CONTINUE_INSTRUCTION = "Your previous answer was cut off by a connection d
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title, X-Nexus-Submit, X-Nexus-Chat, X-Nexus-Key, X-Nexus-Parent",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title, X-Nexus-Submit, X-Nexus-Chat, X-Nexus-Key, X-Nexus-Parent, X-Nexus-Retry",
   "Access-Control-Expose-Headers": "X-Nexus-Job, X-Nexus-Offset, X-Nexus-Status",
   "Access-Control-Max-Age": "86400",
 };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* v14: every job's buffer STARTS with one real SSE comment line. The local
+   harness taught us the hard way that a streaming Response whose body has
+   produced ZERO bytes can leave the client's fetch promise unresolved until
+   the first real byte (curl sees the headers instantly; the browser's fetch
+   does not resolve). A refusal-phase job (429 queue, model never took it yet)
+   produces no bytes for seconds — the app's attach, its wait narration and
+   the pace bubble all stalled behind that. The comment chunk gives the tail
+   something byte-real to deliver the instant a reader attaches. It is part
+   of the D1 buffer (byte-exact reconnects stay exact) and every SSE parser —
+   the app's included — ignores comment lines. */
+const OPEN_CHUNK = ": nexus job opened\n\n";
 
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json", ...CORS, ...headers } });
@@ -182,6 +212,58 @@ function headersFrom(fwd) {
 function backoffFor(attempts) {
   const d = RETRY_DELAYS[Math.min(Math.max(attempts - 1, 0), RETRY_DELAYS.length - 1)];
   return Math.round(d * (0.8 + Math.random() * 0.4));
+}
+
+/* =====================================================================
+   v14: RETRY PACES — the exact four profiles the app's pace row offers,
+   mirrored server-side so "pick the retry mode while it waits" works even
+   while the phone is closed. Stored per-job in meta.retry; the pump
+   re-reads it before every backoff sleep, so a mid-wait change lands on
+   the countdown that is already ticking.
+   ===================================================================== */
+const DEFAULT_RETRY_MODES = {
+  relaxed:    { label: "Relaxed",    max: 12,  delays: [3000, 6000, 12000, 24000, 60000, 120000] },
+  standard:   { label: "Standard",   max: 15,  delays: [2000, 4000, 8000, 15000, 30000, 60000] },
+  aggressive: { label: "Aggressive", max: 30,  delays: [800, 1500, 2500, 4000, 6000, 10000, 15000, 30000] },
+  relentless: { label: "Relentless", max: 100, delays: [400, 800, 1200, 2000, 3000, 5000, 8000, 12000] },
+};
+function retryModes() { return TUN("retryModes", DEFAULT_RETRY_MODES) || DEFAULT_RETRY_MODES; }
+function profDelays(retry) {
+  if (!retry || !Array.isArray(retry.delays) || !retry.delays.length) return RETRY_DELAYS;
+  return retry.delays.map(d => Math.max(50, Math.min(600000, Number(d) || 1000)));
+}
+function profMax(retry) {
+  if (!retry || !Number(retry.max)) return MAX_ATTEMPTS;
+  return Math.min(200, Math.max(1, Math.floor(Number(retry.max))));
+}
+function paceDelay(delays, attempts) {
+  const d = delays[Math.min(Math.max(attempts - 1, 0), delays.length - 1)] || delays[delays.length - 1];
+  return Math.round(d * (0.8 + Math.random() * 0.4));
+}
+/* the job's live retry profile (meta.retry), or null for the default pace */
+async function jobRetryProfile(env, id) {
+  try {
+    const r = await getSQL(env, `SELECT meta FROM jobs WHERE id = ?`, [id]);
+    if (!r || !r.meta) return null;
+    const meta = JSON.parse(r.meta);
+    return meta && meta.retry ? meta.retry : null;
+  } catch (_) { return null; }
+}
+/* pace-aware sleep between attempts: re-reads the profile while waiting;
+   a faster pace picked mid-wait SHORTENS the live countdown (a gentler
+   pick applies from the next attempt — the same rule as the app). */
+async function pacedSleep(env, jobId, pace, attempts, signal) {
+  const delays = profDelays(pace);
+  let deadline = Date.now() + paceDelay(delays, attempts);
+  while (Date.now() < deadline) {
+    await sleep(Math.min(400, Math.max(30, deadline - Date.now())));
+    if (signal && signal.aborted) return;
+    const fresh = await jobRetryProfile(env, jobId);
+    if (fresh) {
+      const nd = Date.now() + paceDelay(profDelays(fresh), attempts);
+      if (nd < deadline) deadline = nd; // only ever shortens
+    }
+  }
 }
 function sanitizeKey(v) {
   return v ? String(v).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 128) : "";
@@ -216,7 +298,11 @@ const SCHEMA_TABLES = [
      chat_key TEXT,
      req_key TEXT,
      parent TEXT,
-     first_byte INTEGER NOT NULL DEFAULT 0
+     first_byte INTEGER NOT NULL DEFAULT 0,
+     wait_ms INTEGER NOT NULL DEFAULT 0,
+     work_ms INTEGER NOT NULL DEFAULT 0,
+     work_start INTEGER NOT NULL DEFAULT 0,
+     wait_start INTEGER NOT NULL DEFAULT 0
      )`,
   `CREATE TABLE IF NOT EXISTS chunks (
      job TEXT NOT NULL,
@@ -262,6 +348,10 @@ const SCHEMA_ALTERS = [
   `ALTER TABLE jobs ADD COLUMN req_key TEXT`,
   `ALTER TABLE jobs ADD COLUMN parent TEXT`,
   `ALTER TABLE jobs ADD COLUMN first_byte INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE jobs ADD COLUMN wait_ms INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE jobs ADD COLUMN work_ms INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE jobs ADD COLUMN work_start INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE jobs ADD COLUMN wait_start INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE chunks ADD COLUMN job TEXT`,
   `ALTER TABLE chunks ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE chunks ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0`,
@@ -299,7 +389,7 @@ async function trySQL(env, sql) {
 async function probeTables(env) {
   const pid = "probe-" + crypto.randomUUID().slice(0, 12);
   const tests = [
-    { ins: `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token, chat_key, req_key, parent, first_byte) VALUES (?, 'chat', 'probe', 0, 0, 0, 0, 0, 0, 0, '', '{}', '{}', NULL, '', '', '', 0)`, del: `DELETE FROM jobs WHERE id = ?`, params: [pid] },
+    { ins: `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token, chat_key, req_key, parent, first_byte, wait_ms, work_ms, work_start, wait_start) VALUES (?, 'chat', 'probe', 0, 0, 0, 0, 0, 0, 0, '', '{}', '{}', NULL, '', '', '', 0, 0, 0, 0, 0)`, del: `DELETE FROM jobs WHERE id = ?`, params: [pid] },
     { ins: `INSERT INTO chunks (job, seq, bytes, data) VALUES (?, 0, 0, '')`, del: `DELETE FROM chunks WHERE job = ?`, params: [pid] },
     { ins: `INSERT INTO secrets (job, auth) VALUES (?, 'probe')`, del: `DELETE FROM secrets WHERE job = ?`, params: [pid] },
     { ins: `INSERT INTO wstate (k, v) VALUES (?, '0')`, del: `DELETE FROM wstate WHERE k = ?`, params: [pid] },
@@ -412,7 +502,43 @@ function rowToJob(row) {
     req, meta,
     chatKey: row.chat_key || "", reqKey: row.req_key || "",
     parent: row.parent || "", firstByte: Number(row.first_byte) || 0,
+    waitMs: Number(row.wait_ms) || 0, workMs: Number(row.work_ms) || 0,
+    workStart: Number(row.work_start) || 0, waitStart: Number(row.wait_start) || 0,
   };
+}
+
+/* v14: the honest wait/work meters, computed from the row so ANY isolate
+   can answer without the pump's help:
+     WAIT = in-line time (queue / backoff / refused / no driver attached)
+     WORK = the model actively streaming on an accepted attempt
+   Live periods are derived from the start markers (wait_start / work_start);
+   a live WORK period is capped at the last heartbeat when the pump looks
+   dead, and legacy v13 rows (no markers, no accumulated meters) fall back
+   to the old first-byte approximation. */
+function liveWaitWork(job, now) {
+  const terminal = ["done", "failed", "stopped", "parked"].includes(job.status);
+  const hasMeters = !!(job.waitMs || job.workMs || job.waitStart || job.workStart);
+  if (!hasMeters) {
+    const fb = job.firstByte || 0;
+    const done = job.status === "done";
+    const running = !done && !terminal;
+    const waitedMs = fb ? Math.max(0, fb - job.createdAt) : (done ? 0 : Math.max(0, now - job.createdAt));
+    const workMs = fb ? Math.max(0, (running ? now : job.updatedAt) - fb) : (done ? Math.max(0, job.updatedAt - job.createdAt) : 0);
+    return { waitedMs, workMs, working: running && fb > 0 };
+  }
+  let waitedMs = job.waitMs, workMs = job.workMs;
+  let working = false;
+  if (!terminal) {
+    if (job.waitStart) waitedMs += Math.max(0, now - job.waitStart);
+    if (job.workStart) {
+      const hb = Number(job.heartbeat) || 0;
+      const fresh = now - hb < STALE_LOCK_MS + 5000;
+      const cut = fresh ? now : Math.max(job.workStart, hb);
+      workMs += Math.max(0, cut - job.workStart);
+      working = fresh;
+    }
+  }
+  return { waitedMs: Math.max(0, waitedMs), workMs: Math.max(0, workMs), working };
 }
 async function getJobRow(env, id) {
   const r = await getSQL(env, `SELECT * FROM jobs WHERE id = ?`, [id]);
@@ -450,6 +576,25 @@ async function deleteJobRows(env, id) {
   await runSQL(env, `DELETE FROM jobs WHERE id = ?`, [id]);
 }
 
+/* v14: retire job rows OUTSIDE the pump (user stop / stop-all / parent
+   retirement) — settles the wait/work meters in SQL so the row's final
+   numbers stay honest, then marks it stopped and drops its secret. */
+async function stopJobRows(env, ids) {
+  const now = Date.now();
+  for (const id of ids) {
+    try {
+      await runSQL(env,
+        `UPDATE jobs SET
+           wait_ms = wait_ms + CASE WHEN wait_start > 0 THEN ? - wait_start ELSE 0 END,
+           work_ms = work_ms + CASE WHEN work_start > 0 THEN ? - work_start ELSE 0 END,
+           wait_start = 0, work_start = 0,
+           status = 'stopped', heartbeat = 0, lock_token = NULL, updated_at = ?
+         WHERE id = ?`, [now, now, now, id]);
+    } catch (_) {}
+    try { await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]); } catch (_) {}
+  }
+}
+
 /* =====================================================================
    SSE parser — stateless construction, so ANY event context can rebuild
    the full job state by replaying the D1 chunk log (byte-exact).
@@ -463,6 +608,7 @@ function makeParser() {
     eventIndex: [],        // [{c: contentLen, b: byteOffAfterLine}]
     sawToolCalls: false,
     sawReasoning: false,
+    sawData: false,        // any real `data:` line seen (comments/keepalives never count)
     finishSeen: false,
     errorSeen: false,
     errorMessage: "",
@@ -487,6 +633,7 @@ function makeParser() {
       if (!s.startsWith("data:")) return;
       const raw = s.slice(5).trim();
       if (!raw) return;
+      this.sawData = true; // a real event line — not a comment/keepalive
       if (raw === "[DONE]") { this.finishSeen = true; return; }
       let obj = null;
       try { obj = JSON.parse(raw); } catch (_) { return; }
@@ -642,6 +789,28 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
   let job = await getJobRow(env, jobId);
   if (!job) return;
 
+  /* ---- v14 wait/work meters (see liveWaitWork) ----
+     WAIT  = in a line: queued, backoff sleep, refused attempt, no driver.
+     WORK  = an accepted upstream attempt is open — the model is thinking,
+             writing text, or drafting tool arguments. */
+  let waitMs = job.waitMs || 0, workMs = job.workMs || 0;
+  let workStart = job.workStart || 0, waitStart = job.waitStart || 0;
+  const settleWork = () => { if (workStart) { workMs += Math.max(0, Date.now() - workStart); workStart = 0; } };
+  const settleWait = () => { if (waitStart) { waitMs += Math.max(0, Date.now() - waitStart); waitStart = 0; } };
+  const timingFields = () => ({ wait_ms: waitMs, work_ms: workMs, work_start: workStart, wait_start: waitStart });
+  /* hand-off for the terminal helpers: settles BOTH meters and returns them */
+  const tsettle = () => { settleWork(); settleWait(); return { waitMs, workMs }; };
+  /* a previous pump died mid-work (isolate teardown): settle its period,
+     capped at the last heartbeat it managed to write */
+  if (workStart) {
+    const hb = job.heartbeat || 0;
+    const cut = Date.now() - hb < STALE_LOCK_MS + 5000 ? Date.now() : Math.max(workStart, hb);
+    workMs += Math.max(0, cut - workStart);
+    workStart = 0;
+  }
+  if (!waitStart && !workStart) waitStart = Date.now(); // in line until an attempt is accepted
+  try { await lockWrite(env, jobId, token, { ...timingFields(), updated_at: Date.now() }); } catch (_) {}
+
   /* ---- rebuild parse state (byte-exact) ---- */
   const parser = makeParser();
   if (live.total >= job.bytes && (live.chunks.length || job.bytes === 0)) {
@@ -654,8 +823,8 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
     parser.feed(all);
     parser.flushPending();
   }
-  if (parser.errorSeen && !job.finish) { await failJob(env, jobId, token, parser.errorMessage, { live }); return; }
-  if (parser.finishSeen || job.finish) { await finalizeDone(env, jobId, token, live); return; }
+  if (parser.errorSeen && !job.finish) { await failJob(env, jobId, token, parser.errorMessage, { live, t: tsettle }); return; }
+  if (parser.finishSeen || job.finish) { await finalizeDone(env, jobId, token, live, tsettle); return; }
 
   let totalBytes = Math.max(parser.totalBytes(), 0);
   let attempts = job.attempts;      // total across all drivers (persisted)
@@ -701,10 +870,11 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
         bytes: totalBytes, content_text: parser.contentText,
         finish: parser.finishSeen ? 1 : 0,
         heartbeat: Date.now(), updated_at: Date.now(),
+        ...timingFields(), // v14 meters ride every flush — cheap, always fresh
       };
       if (!firstByteAt && (parser.contentText.length > 0 || parser.sawReasoning)) {
         firstByteAt = Date.now();
-        fields.first_byte = firstByteAt; // honest wait/work split for /status
+        fields.first_byte = firstByteAt; // legacy wait/work split (v13 rows)
       }
       const w = await lockWrite(env, jobId, token, fields);
       if (w !== 1) return false; // lock lost — another driver took over
@@ -733,13 +903,20 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
 
       /* park: tool-call cuts are never continued server-side (app protocol).
          images never continue either — they re-issue from zero or park. */
-      if (parser.sawToolCalls && !parser.finishSeen) { await parkJob(env, jobId, token); liveClose(live); return; }
-      if (job.kind !== "chat" && totalBytes > 0 && !parser.finishSeen) { await parkJob(env, jobId, token); liveClose(live); return; }
-      if (attempts >= MAX_ATTEMPTS) { await failJob(env, jobId, token, "retry budget used up", { live }); return; }
+      if (parser.sawToolCalls && !parser.finishSeen) { await parkJob(env, jobId, token, tsettle); liveClose(live); return; }
+      if (job.kind !== "chat" && totalBytes > 0 && !parser.finishSeen) { await parkJob(env, jobId, token, tsettle); liveClose(live); return; }
+      /* v14: the attempt ceiling follows the job's pace profile (a
+         Relentless pick earns its 100 attempts; the default stays put) */
+      const pace = await jobRetryProfile(env, jobId);
+      if (attempts >= profMax(pace)) { await failJob(env, jobId, token, "retry budget used up", { live, t: tsettle }); return; }
 
       /* ---- build the upstream request ---- */
       let body;
-      if (job.kind !== "chat" || totalBytes === 0) body = job.req; // plain re-issue
+      /* v14: the buffer may carry the open-chunk comment (and provider
+         keepalives) with ZERO real events — a job the model never took yet
+         re-issues the ORIGINAL request; only a buffer that has actually
+         seen a data line continues from the partial content. */
+      if (job.kind !== "chat" || !parser.sawData) body = job.req; // plain re-issue
       else body = {
         ...job.req,
         messages: (job.req.messages || []).concat([
@@ -775,6 +952,11 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
       }
 
       if (!upstreamErr && upstream && upstream.ok && upstream.body) {
+        /* ---- ACCEPTED: the model took the request — the line wait ends,
+           the work meter starts (thinking, text, tool args all count) ---- */
+        settleWait();
+        workStart = Date.now();
+        try { await lockWrite(env, jobId, token, { ...timingFields(), updated_at: Date.now() }); } catch (_) {}
         /* ---- stream it: fan out + parse + flush ---- */
         const reader = upstream.body.getReader();
         let firstChunk = true;
@@ -816,17 +998,19 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
         clearInterval(wd);
         signal.removeEventListener("abort", onOuterAbort);
         if (!(await flush())) { liveAbort(live); return; }
-        if (parser.errorSeen) { await failJob(env, jobId, token, parser.errorMessage, { live }); return; }
-        if (parser.finishSeen) { await finalizeDone(env, jobId, token, live); return; }
-        if (naturalEnd && job.kind !== "chat") { await finalizeDone(env, jobId, token, live); return; } // images: full body = done
+        settleWork(); // the accepted attempt is over — work stops, line resumes below
+        if (parser.errorSeen) { await failJob(env, jobId, token, parser.errorMessage, { live, t: tsettle }); return; }
+        if (parser.finishSeen) { await finalizeDone(env, jobId, token, live, tsettle); return; }
+        if (naturalEnd && job.kind !== "chat") { await finalizeDone(env, jobId, token, live, tsettle); return; } // images: full body = done
         if (signal.aborted) return;
         /* truncated → persist the attempt count and try again inline
            (the lock is NOT released: fresh heartbeats prove we're alive,
            so no other driver can steal the job mid-run) */
         attempts++; inlineAttempts++;
-        try { await lockWrite(env, jobId, token, { attempts, updated_at: Date.now() }); } catch (_) {}
+        if (!waitStart) waitStart = Date.now(); // backoff = back in line
+        try { await lockWrite(env, jobId, token, { attempts, updated_at: Date.now(), ...timingFields() }); } catch (_) {}
         if (inlineAttempts >= maxInline) { gaveUp = true; break; }
-        await sleep(backoffFor(attempts));
+        await pacedSleep(env, jobId, pace, attempts, signal);
         separatorNeeded = totalBytes > 0;
         continue;
       }
@@ -843,52 +1027,73 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
       const fatal = [400, 401, 403, 404, 422].includes(status);
       if (fatal && totalBytes === 0) {
         await failJob(env, jobId, token, "upstream " + status + ": " + message,
-          { errorEvent: { message: message, code: status }, kind: job.kind, live });
+          { errorEvent: { message: message, code: status }, kind: job.kind, live, t: tsettle });
         return;
       }
-      if (fatal) { await parkJob(env, jobId, token); liveClose(live); return; }
-      /* retryable: 429 / 408 / 5xx / network — re-request until it gets in */
+      if (fatal) { await parkJob(env, jobId, token, tsettle); liveClose(live); return; }
+      /* retryable: 429 / 408 / 5xx / network — re-request until it gets in.
+         A refused attempt is pure line time: wait_start stays running. */
       attempts++; inlineAttempts++;
-      try { await lockWrite(env, jobId, token, { attempts, updated_at: Date.now() }); } catch (_) {}
+      if (!waitStart) waitStart = Date.now();
+      try { await lockWrite(env, jobId, token, { attempts, updated_at: Date.now(), ...timingFields() }); } catch (_) {}
       if (inlineAttempts >= maxInline) { gaveUp = true; break; }
-      await sleep(backoffFor(attempts));
+      await pacedSleep(env, jobId, pace, attempts, signal);
     }
   } finally {
     clearInterval(heart);
     try { await flush(); } catch (_) {}
+    settleWork(); // whatever ended this pump, an open work period is over
     if (gaveUp) {
-      /* release for the next driver (cron / piggyback / app reconnect) */
-      await releaseJob(env, jobId, token, attempts);
+      /* release for the next driver (cron / piggyback / app reconnect).
+         The line WAIT keeps running: wait_start stays set so /status and
+         /jobs keep narrating honest in-line time across the handoff. */
+      await releaseJob(env, jobId, token, attempts, timingFields());
       liveClose(live);
+    } else {
+      /* every non-gaveUp exit path already settled via its terminal helper;
+         persist the final meters anyway (cheap, and covers the abort path) */
+      try { await lockWrite(env, jobId, token, timingFields()); } catch (_) {}
     }
   }
 }
 
-async function releaseJob(env, id, token, attempts) {
+async function releaseJob(env, id, token, attempts, timing) {
   const now = Date.now();
+  /* v14: next_retry honors the job's pace profile — a gentle pick spaces
+     the next driver out the same way an inline backoff would */
+  const pace = await jobRetryProfile(env, id);
   try {
-    await lockWrite(env, id, token, {
-      heartbeat: 0, next_retry: now + backoffFor(attempts), attempts, updated_at: now, lock_token: null,
-    });
+    const fields = {
+      heartbeat: 0, next_retry: now + paceDelay(profDelays(pace), attempts), attempts, updated_at: now, lock_token: null,
+    };
+    if (timing) Object.assign(fields, timing); // work settled; wait_start stays live
+    await lockWrite(env, id, token, fields);
   } catch (_) {}
 }
-async function finalizeDone(env, id, token, live) {
+async function finalizeDone(env, id, token, live, t) {
   const now = Date.now();
+  const tv = t ? t() : null; // settle both meters at the true end
   try {
-    await lockWrite(env, id, token, { status: "done", finish: 1, heartbeat: 0, updated_at: now, lock_token: null });
+    const fields = { status: "done", finish: 1, heartbeat: 0, updated_at: now, lock_token: null };
+    if (tv) Object.assign(fields, { wait_ms: tv.waitMs, work_ms: tv.workMs, wait_start: 0, work_start: 0 });
+    await lockWrite(env, id, token, fields);
     await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
   } catch (_) {}
   liveClose(live);
 }
-async function parkJob(env, id, token) {
+async function parkJob(env, id, token, t) {
   const now = Date.now();
+  const tv = t ? t() : null;
   try {
-    await lockWrite(env, id, token, { status: "parked", heartbeat: 0, updated_at: now, lock_token: null });
+    const fields = { status: "parked", heartbeat: 0, updated_at: now, lock_token: null };
+    if (tv) Object.assign(fields, { wait_ms: tv.waitMs, work_ms: tv.workMs, wait_start: 0, work_start: 0 });
+    await lockWrite(env, id, token, fields);
     await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
   } catch (_) {}
 }
 async function failJob(env, id, token, reason, o = {}) {
   const now = Date.now();
+  const tv = o.t ? o.t() : null; // settle both meters — failure is terminal
   /* 1. bytes FIRST: when a pre-stream failure needs an error event, it must
      already be in the job buffer before the status flips to failed — a
      polling tail would otherwise close before the error chunk lands */
@@ -896,17 +1101,18 @@ async function failJob(env, id, token, reason, o = {}) {
     try { await appendErrorChunk(env, id, o.kind || "chat", o.errorEvent.message, o.errorEvent.code); } catch (_) {}
   }
   /* 2. status + honest reason in meta (so /job/:id/status can report it) */
+  const timingFields = tv ? { wait_ms: tv.waitMs, work_ms: tv.workMs, wait_start: 0, work_start: 0 } : {};
   try {
     const row = await getJobRow(env, id);
     if (row) {
       const meta = row.meta || {};
       meta.error = String(reason).slice(0, 300);
-      await lockWrite(env, id, token, { status: "failed", heartbeat: 0, updated_at: now, lock_token: null, meta: JSON.stringify(meta) });
+      await lockWrite(env, id, token, { status: "failed", heartbeat: 0, updated_at: now, lock_token: null, meta: JSON.stringify(meta), ...timingFields });
     } else {
-      await lockWrite(env, id, token, { status: "failed", heartbeat: 0, updated_at: now, lock_token: null });
+      await lockWrite(env, id, token, { status: "failed", heartbeat: 0, updated_at: now, lock_token: null, ...timingFields });
     }
   } catch (_) {
-    try { await lockWrite(env, id, token, { status: "failed", heartbeat: 0, updated_at: now, lock_token: null }); } catch (_) {}
+    try { await lockWrite(env, id, token, { status: "failed", heartbeat: 0, updated_at: now, lock_token: null, ...timingFields }); } catch (_) {}
   }
   try { await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]); } catch (_) {}
   /* 3. live subscribers see the same error immediately */
@@ -929,6 +1135,8 @@ async function handleSubmit(request, pathname, ctx, env, parsed, fwd) {
   const reqKey = sanitizeKey(request.headers.get("X-Nexus-Key"));
   const chatKey = sanitizeKey(request.headers.get("X-Nexus-Chat"));
   const parent = sanitizeKey(request.headers.get("X-Nexus-Parent"));
+  /* v14: the starting retry pace rides the submit (the app's pace row) */
+  const retryMode = sanitizeKey(request.headers.get("X-Nexus-Retry"));
 
   /* idempotency: a network retry of the same submission must not
      double-spend — hand back the job we already created */
@@ -947,8 +1155,7 @@ async function handleSubmit(request, pathname, ctx, env, parsed, fwd) {
      RUNNING parent needs stopping; finished ones simply age out) */
   if (parent) {
     try {
-      await runSQL(env, `UPDATE jobs SET status = 'stopped', heartbeat = 0, lock_token = NULL, updated_at = ? WHERE id = ? AND status IN ('queued','streaming')`, [Date.now(), parent]);
-      await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [parent]);
+      await stopJobRows(env, [parent]);
       const pl = liveMap.get(parent);
       if (pl) liveAbort(pl);
     } catch (_) {}
@@ -960,9 +1167,18 @@ async function handleSubmit(request, pathname, ctx, env, parsed, fwd) {
   const metaFwd = Object.assign({}, fwd);
   delete metaFwd.authorization;
   const meta = { fwd: metaFwd, contentType: kind === "images" ? "application/json" : "text/event-stream", submit: true };
+  if (retryModes()[retryMode]) {
+    const prof = retryModes()[retryMode];
+    meta.retry = { mode: retryMode, label: prof.label, max: prof.max, delays: prof.delays, at: now };
+  }
+  const openChunk = kind === "chat" ? OPEN_CHUNK : ""; // images: JSON body, no comment
+  const openLen = new TextEncoder().encode(openChunk).length;
   await runSQL(env,
-    `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token, chat_key, req_key, parent, first_byte) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, 0, '', ?, ?, NULL, ?, ?, ?, 0)`,
-    [id, kind, now, now, JSON.stringify(parsed), JSON.stringify(meta), chatKey, reqKey, parent]);
+    `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token, chat_key, req_key, parent, first_byte, wait_ms, work_ms, work_start, wait_start) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, ?, '', ?, ?, NULL, ?, ?, ?, 0, 0, 0, 0, ?)`,
+    [id, kind, now, now, openLen, JSON.stringify(parsed), JSON.stringify(meta), chatKey, reqKey, parent, now]);
+  if (openLen) {
+    try { await runSQL(env, `INSERT INTO chunks (job, seq, bytes, data) VALUES (?, 0, ?, ?)`, [id, openLen, openChunk]); } catch (_) {}
+  }
   if (fwd.authorization) {
     try { await runSQL(env, `INSERT INTO secrets (job, auth) VALUES (?, ?)`, [id, fwd.authorization]); } catch (_) {}
   }
@@ -1000,7 +1216,7 @@ async function matchContinueJob(env, parsed) {
     if (ct.length > bestLen) { best = r; bestLen = ct.length; }
   }
   for (const id of superseded) {
-    try { await runSQL(env, `UPDATE jobs SET status = 'stopped', heartbeat = 0, updated_at = ? WHERE id = ? AND status IN ('queued','streaming')`, [now, id]); } catch (_) {}
+    try { await stopJobRows(env, [id]); } catch (_) {}
   }
   if (!best) return null;
   /* exact byte boundary for the app's partial (replay-parse the job) */
@@ -1226,9 +1442,14 @@ async function handleProxy(request, pathname, ctx, env) {
   delete metaFwd.authorization;
   const meta = { fwd: metaFwd, contentType };
   try {
+    const openChunk = kind === "chat" ? OPEN_CHUNK : "";
+    const openLen = new TextEncoder().encode(openChunk).length;
     await runSQL(env,
-      `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token, chat_key, req_key, parent, first_byte) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, 0, '', ?, ?, NULL, NULL, NULL, NULL, 0)`,
-      [id, kind, now, now, JSON.stringify(parsed), JSON.stringify(meta)]);
+      `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token, chat_key, req_key, parent, first_byte, wait_ms, work_ms, work_start, wait_start) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, ?, '', ?, ?, NULL, NULL, NULL, NULL, 0, 0, 0, 0, ?)`,
+      [id, kind, now, now, openLen, JSON.stringify(parsed), JSON.stringify(meta), now]);
+    if (openLen) {
+      try { await runSQL(env, `INSERT INTO chunks (job, seq, bytes, data) VALUES (?, 0, ?, ?)`, [id, openLen, openChunk]); } catch (_) {}
+    }
   } catch (_) {
     try { await invalidateSchema(env); } catch (_) {}
     const hdrs2 = new Headers(upstream.headers);
@@ -1286,21 +1507,22 @@ async function handleJobStatus(url, ctx, env) {
   if (!job) return json({ error: "job not found (expired or relay restarted)", gone: true }, 404);
   maybeWorkAny(env, ctx); // the app polls this while waiting — progress resumes NOW
   const now = Date.now();
-  const born = job.createdAt;
-  const fb = job.firstByte;
-  const done = job.status === "done";
-  const running = !done && job.status !== "failed" && job.status !== "stopped";
-  /* waitedMs = send → first real token; workMs = first token → end.
-     While still waiting (queue, keepalives only) the whole span is wait. */
-  const waitedMs = fb ? Math.max(0, fb - born) : (done ? 0 : Math.max(0, now - born));
-  const workMs = fb
-    ? Math.max(0, (running ? now : job.updatedAt) - fb)
-    : (done ? Math.max(0, job.updatedAt - born) : 0);
+  /* v14: the true wait/work split — WAIT is line time, WORK is the model
+     actively streaming on an accepted attempt (see liveWaitWork) */
+  const tw = liveWaitWork(job, now);
+  const running = !["done", "failed", "stopped", "parked"].includes(job.status);
   const out = {
     ok: true, id: job.id, jobId: job.id, kind: job.kind, status: job.status,
-    attempts: job.attempts, waitedMs, workMs, bytes: job.bytes,
-    createdAt: born, updatedAt: job.updatedAt, v: WORKER_VERSION,
+    attempts: job.attempts, waitedMs: tw.waitedMs, workMs: tw.workMs, bytes: job.bytes,
+    working: tw.working, waiting: running && !tw.working,
+    nextRetryAt: running ? job.nextRetry : 0,
+    createdAt: job.createdAt, updatedAt: job.updatedAt, v: WORKER_VERSION,
   };
+  if (job.meta && job.meta.retry) {
+    out.retryMode = String(job.meta.retry.mode || "");
+    out.retryLabel = String(job.meta.retry.label || "");
+    out.retryMax = Number(job.meta.retry.max) || 0;
+  }
   if (job.meta && job.meta.error) out.error = job.meta.error;
   return json(out);
 }
@@ -1342,20 +1564,24 @@ async function handleDelete(url, env) {
   const live = liveMap.get(id);
   if (live) liveAbort(live);
   if (jobEngineOk(env)) {
-    /* stop the spend: mark cancelled (running pumps lose their lock on the
-       next flush and self-terminate); rows are pruned by TTL shortly after */
-    try { await runSQL(env, `UPDATE jobs SET status = 'stopped', heartbeat = 0, lock_token = NULL, updated_at = ? WHERE id = ?`, [Date.now(), id]); } catch (_) {}
-    try { await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]); } catch (_) {}
+    /* stop the spend AND settle the meters (v14): mark cancelled (running
+       pumps lose their lock on the next flush and self-terminate); rows are
+       pruned by TTL shortly after */
+    try { await stopJobRows(env, [id]); } catch (_) {}
   }
   return json({ ok: true });
 }
 
 /* =====================================================================
-   v13: WORKER REQUESTS — the monitoring surface for the app's Settings
-   panel ("see all current worker requests, cancel/stop them").
-   GET /jobs    → newest 40 jobs with honest progress fields
-   DELETE /jobs → stop every non-terminal job (the panel's "Stop all")
-   Both require an Authorization header — the same Bearer every /chat call
+   v13+v14: WORKER REQUESTS — the monitoring surface for the app's Settings
+   panel ("see all current worker requests, cancel/stop them, remove the
+   finished ones, pick the retry pace while one waits").
+   GET    /jobs        → newest 40 jobs with honest progress fields
+   DELETE /jobs        → stop every non-terminal job (the panel's "Stop all")
+   DELETE /jobs/:id    → remove a FINISHED job's rows (v14)
+   POST   /jobs/clear  → remove every finished job (v14)
+   POST   /job/:id/retry-mode → change a waiting job's pace (v14)
+   All require an Authorization header — the same Bearer every /chat call
    carries. It is a casual-scan guard, not real auth (the worker cannot
    verify the key without spending a subrequest; job ids stay unguessable
    UUIDs and full buffers are only readable per-id).
@@ -1390,7 +1616,7 @@ async function handleJobsList(request, ctx, env) {
   try { await ensureSchema(env); } catch (_) {}
   let rows, sqlErr = null;
   try {
-    rows = await allSQL(env, `SELECT id, kind, status, created_at, updated_at, attempts, finish, bytes, first_byte, chat_key, req, meta FROM jobs ORDER BY created_at DESC LIMIT ?`, [JOBS_LIST_CAP]);
+    rows = await allSQL(env, `SELECT id, kind, status, created_at, updated_at, attempts, finish, bytes, first_byte, chat_key, req, meta, heartbeat, next_retry, wait_ms, work_ms, work_start, wait_start FROM jobs ORDER BY created_at DESC LIMIT ?`, [JOBS_LIST_CAP]);
   } catch (err) { sqlErr = err; }
   /* same rule as /job/:id: a D1 failure (even a total one) answers 503
      retryable — the app's panel re-polls; 404 means "no engine" only */
@@ -1401,19 +1627,40 @@ async function handleJobsList(request, ctx, env) {
   const jobs = (rows || []).map(r => {
     const born = Number(r.created_at);
     const upd = Number(r.updated_at);
-    const fb = Number(r.first_byte) || 0;
     const st = String(r.status);
     const done = st === "done";
     const running = !done && st !== "failed" && st !== "stopped" && st !== "parked";
     if (running) active++;
     const { model, preview } = previewFromReq(r.req);
     let error = "";
-    try { const meta = r.meta ? JSON.parse(r.meta) : null; error = meta && meta.error ? String(meta.error) : ""; } catch (_) {}
+    let retryMode = "", retryLabel = "", retryMax = 0;
+    try {
+      const meta = r.meta ? JSON.parse(r.meta) : null;
+      if (meta) {
+        if (meta.error) error = String(meta.error);
+        if (meta.retry) {
+          retryMode = String(meta.retry.mode || "");
+          retryLabel = String(meta.retry.label || "");
+          retryMax = Number(meta.retry.max) || 0;
+        }
+      }
+    } catch (_) {}
+    /* v14: the true wait/work split from the meters (line time vs the model
+       actively streaming) — a finished job reports the time it SPENT
+       WORKING, not how long ago it ended */
+    const tw = liveWaitWork({
+      status: st, createdAt: born, updatedAt: upd,
+      heartbeat: Number(r.heartbeat) || 0, firstByte: Number(r.first_byte) || 0,
+      waitMs: Number(r.wait_ms) || 0, workMs: Number(r.work_ms) || 0,
+      waitStart: Number(r.wait_start) || 0, workStart: Number(r.work_start) || 0,
+    }, now);
     return {
       id: r.id, kind: String(r.kind), status: st, running,
       attempts: Number(r.attempts), bytes: Number(r.bytes), finish: !!Number(r.finish),
-      waitedMs: fb ? Math.max(0, fb - born) : (done ? 0 : Math.max(0, now - born)),
-      workMs: fb ? Math.max(0, (running ? now : upd) - fb) : (done ? Math.max(0, upd - born) : 0),
+      waitedMs: tw.waitedMs, workMs: tw.workMs,
+      working: running && tw.working, waiting: running && !tw.working,
+      nextRetryAt: running ? (Number(r.next_retry) || 0) : 0,
+      retryMode, retryLabel, retryMax,
       createdAt: born, updatedAt: upd, chatKey: String(r.chat_key || ""),
       model, preview, error,
     };
@@ -1436,12 +1683,96 @@ async function handleJobsDelete(request, env) {
       const live = liveMap.get(row.id);
       if (live) liveAbort(live);
     }
-    await runSQL(env, `UPDATE jobs SET status = 'stopped', heartbeat = 0, lock_token = NULL, updated_at = ? WHERE status IN ('queued','streaming')`, [Date.now()]);
-    await runSQL(env, `DELETE FROM secrets WHERE job IN (SELECT id FROM jobs WHERE status = 'stopped')`);
+    await stopJobRows(env, (r || []).map(x => x.id));
   } catch (err) {
     return json({ error: "stop-all failed on the database", retry: true }, 503);
   }
   return json({ ok: true, stopped });
+}
+
+/* v14: remove ONE finished request from the panel — its rows (job + chunk
+   log + secret) are deleted outright. Only terminal jobs qualify: a
+   running one must be stopped first (the panel offers Stop for those). */
+async function handleJobsRemoveOne(request, env) {
+  if (!request.headers.get("authorization")) {
+    return json({ error: "send your API key as the Authorization header (same as /chat)" }, 401);
+  }
+  if (!hasDB(env)) {
+    return json({ error: "job removal needs the job engine (bind a D1 database as DB)", needsEngine: true }, 404);
+  }
+  const id = new URL(request.url).pathname.split("/")[2];
+  try { await ensureSchema(env); } catch (_) {}
+  let row = null, sqlErr = null;
+  try { row = await getSQL(env, `SELECT id, status FROM jobs WHERE id = ?`, [id]); } catch (err) { sqlErr = err; }
+  if (sqlErr) return json({ error: "job lookup failed on the database", retry: true }, 503);
+  if (!row) return json({ ok: true, removed: 0, v: WORKER_VERSION }); // already gone — idempotent
+  if (["queued", "streaming"].includes(String(row.status))) {
+    return json({ error: "still running — stop it first, then remove it", running: true }, 409);
+  }
+  const live = liveMap.get(id);
+  if (live) liveClose(live); // no pump can live on a terminal row — tidy anyway
+  try { await deleteJobRows(env, id); } catch (err) {
+    return json({ error: "removal failed on the database", retry: true }, 503);
+  }
+  return json({ ok: true, removed: 1, v: WORKER_VERSION });
+}
+
+/* v14: remove EVERY finished request (the panel's "Clear finished") */
+async function handleJobsClearFinished(request, env) {
+  if (!request.headers.get("authorization")) {
+    return json({ error: "send your API key as the Authorization header (same as /chat)" }, 401);
+  }
+  if (!hasDB(env)) {
+    return json({ error: "job removal needs the job engine (bind a D1 database as DB)", needsEngine: true }, 404);
+  }
+  try { await ensureSchema(env); } catch (_) {}
+  let ids = [];
+  try {
+    ids = (await allSQL(env, `SELECT id FROM jobs WHERE status IN ('done','failed','parked','stopped')`)).map(r => r.id);
+  } catch (err) {
+    return json({ error: "clear-finished failed on the database", retry: true }, 503);
+  }
+  let removed = 0;
+  for (const id of ids) {
+    try { await deleteJobRows(env, id); removed++; } catch (_) {}
+  }
+  return json({ ok: true, removed, v: WORKER_VERSION });
+}
+
+/* v14: change a waiting job's retry pace — the app's pace row in the chat
+   bubble POSTs here while the job sits in the provider queue. The pump
+   re-reads meta.retry while it sleeps, so a faster pick shortens the live
+   countdown; a gentler one lands on the next attempt. */
+async function handleJobRetryMode(request, env) {
+  if (!request.headers.get("authorization")) {
+    return json({ error: "send your API key as the Authorization header (same as /chat)" }, 401);
+  }
+  if (!hasDB(env)) {
+    return json({ error: "retry pacing needs the job engine (bind a D1 database as DB)", needsEngine: true }, 404);
+  }
+  const id = new URL(request.url).pathname.split("/")[2];
+  let body = null;
+  try { body = await request.json(); } catch (_) {}
+  const mode = String((body && body.mode) || "");
+  const prof = retryModes()[mode];
+  if (!prof) return json({ error: "unknown mode", modes: Object.keys(retryModes()) }, 400);
+  try { await ensureSchema(env); } catch (_) {}
+  let row = null, sqlErr = null;
+  try { row = await getSQL(env, `SELECT id, status, meta, next_retry FROM jobs WHERE id = ?`, [id]); } catch (err) { sqlErr = err; }
+  if (sqlErr) return json({ error: "lookup failed on the database", retry: true }, 503);
+  if (!row) return json({ error: "job not found (expired or relay restarted)" }, 404);
+  if (["done", "failed", "stopped", "parked"].includes(String(row.status))) {
+    return json({ error: "this request already ended — its pace can't change anymore", ended: true }, 409);
+  }
+  let meta = {};
+  try { meta = row.meta ? JSON.parse(row.meta) : {}; } catch (_) {}
+  meta.retry = { mode, label: prof.label, max: prof.max, delays: prof.delays, at: Date.now() };
+  try {
+    await runSQL(env, `UPDATE jobs SET meta = ?, updated_at = ? WHERE id = ?`, [JSON.stringify(meta), Date.now(), id]);
+  } catch (err) {
+    return json({ error: "pace change failed on the database", retry: true }, 503);
+  }
+  return json({ ok: true, id, mode, label: prof.label, max: prof.max, delays: prof.delays, nextRetryAt: Number(row.next_retry) || 0, v: WORKER_VERSION });
 }
 
 /* ---------- maintenance ---------- */
@@ -1524,6 +1855,16 @@ export default {
     if (request.method === "DELETE" && url.pathname === "/jobs") {
       return handleJobsDelete(request, env);
     }
+    /* v14: finished-request removal + waiting-pace control */
+    if (request.method === "POST" && url.pathname === "/jobs/clear") {
+      return handleJobsClearFinished(request, env);
+    }
+    if (request.method === "DELETE" && /^\/jobs\/[A-Za-z0-9-]+$/.test(url.pathname)) {
+      return handleJobsRemoveOne(request, env);
+    }
+    if (request.method === "POST" && /^\/job\/[A-Za-z0-9-]+\/retry-mode$/.test(url.pathname)) {
+      return handleJobRetryMode(request, env);
+    }
     if (request.method === "GET" && /^\/job\/by-key\/[A-Za-z0-9._:%-]+$/.test(url.pathname)) {
       return handleJobByKey(url, ctx, env);
     }
@@ -1536,7 +1877,7 @@ export default {
     if (request.method === "DELETE" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
       return handleDelete(url, env);
     }
-    return json({ error: "not found", hint: "use /chat (X-Nexus-Submit: 1), /job/:id?offset=N, /job/:id/status, /job/by-key/:key, /jobs, /health" }, 404);
+    return json({ error: "not found", hint: "use /chat (X-Nexus-Submit: 1), /job/:id?offset=N, /job/:id/status, /job/:id/retry-mode, /job/by-key/:key, /jobs, DELETE /jobs/:id, POST /jobs/clear, /health" }, 404);
   },
 
   /* cron tick: heartbeat + prune + up to two jobs of real work */
