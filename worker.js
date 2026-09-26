@@ -32,6 +32,22 @@
    you left at whenever you reopen. Your phone's connection quality has ZERO
    effect on the generation itself.
 
+   v13 — "the tail never lies":
+   1. The in-isolate live fast-path is RETIRED: GET /job/:id always serves
+      the D1-polling tail. The fast path closed the app's stream when the
+      pump exhausted its inline attempt budget — while the job was still
+      queued — and the app correctly read that clean close as "the response
+      was cut off before it finished (status 0)". The D1 tail closes ONLY
+      on justified ends (terminal status + all bytes delivered, row gone,
+      age cap, sustained D1 outage).
+   2. The tail survives transient D1 errors (backoff + retry; only 15
+      consecutive failures give up).
+   3. NEW monitoring surface for the app's Settings panel:
+      GET /jobs    → newest 40 jobs (status, model, preview, timing, chat)
+      DELETE /jobs → stop every non-terminal job (the panel's "Stop all")
+      Both want an Authorization header (casual-scan guard; job buffers
+      remain readable only by unguessable job id).
+
    THE v10 ARCHITECTURE — submit + subscribe (replaces proxy+tee):
      POST /chat  + header "X-Nexus-Submit: 1"
        → creates the job row in D1 IMMEDIATELY (the prompt is durable within
@@ -107,7 +123,7 @@
    subrequest budgets degrade gracefully (fresh drivers resume the work).
    ===================================================================== */
 
-const WORKER_VERSION = 12;
+const WORKER_VERSION = 13;
 
 /* test tunables — production reads defaults; the local harness overrides
    via globalThis.__nexusTun to run E2E in seconds. */
@@ -1002,6 +1018,15 @@ async function matchContinueJob(env, parsed) {
    NEVER inject heartbeat bytes — the app's byte-offset math counts every
    byte we send, so the body must be pure buffer bytes.
    ===================================================================== */
+/* v13: the tail is now the ONLY delivery path (the in-isolate live
+   fast-path was retired — see handleJobGet). Two hard rules it must obey:
+   1. it may close ONLY on justified ends: terminal status + all bytes
+      delivered, the row is genuinely gone, or the age cap. NEVER because a
+      pump gave up its inline attempt budget (the job keeps running for the
+      next driver) — that clean close read as "truncated" on the app and
+      produced the user's "response was cut off (status 0)" error card.
+   2. a transient D1 error must NOT close it — retry with backoff; only a
+      SUSTAINED database outage (15 consecutive failures) gives up. */
 function tailStream(env, ctx, jobId, startOffset) {
   const enc = new TextEncoder();
   let closed = false;
@@ -1016,6 +1041,7 @@ function tailStream(env, ctx, jobId, startOffset) {
         let lastKick = 0;
         let idlePolls = 0;
         let lastTotal = -1;
+        let dbFails = 0;       // consecutive D1 errors — tolerance, then give up
         const deliver = u8 => {
           /* contiguous delivery: a chunk may start BEFORE the client's
              offset (its tail was already seen live before the flush
@@ -1026,8 +1052,14 @@ function tailStream(env, ctx, jobId, startOffset) {
           sent = Math.max(sent, pos);
         };
         try {
-          /* ---- replay phase ---- */
-          const rows = await allSQL(env, `SELECT seq, bytes, data FROM chunks WHERE job = ? ORDER BY seq ASC`, [jobId]);
+          /* ---- replay phase (retried — a transient D1 blip must not kill
+             the tail before a single byte is served) ---- */
+          let rows = null;
+          for (let i = 0; i < 4 && !rows; i++) {
+            try { rows = await allSQL(env, `SELECT seq, bytes, data FROM chunks WHERE job = ? ORDER BY seq ASC`, [jobId]); dbFails = 0; }
+            catch (_) { await sleep(300 * (i + 1)); }
+          }
+          if (!rows) { close(); return; } // cannot read the buffer at all
           for (const r of rows) {
             deliver(enc.encode(r.data));
             lastSeq = Number(r.seq);
@@ -1039,12 +1071,31 @@ function tailStream(env, ctx, jobId, startOffset) {
                model never treats a watched job as orphaned */
             const liveWatch = liveFor(jobId);
             liveWatch.__tailSeen = Date.now();
-            const r = await getSQL(env, `SELECT status, bytes, heartbeat, created_at FROM jobs WHERE id = ?`, [jobId]);
-            if (!r) { close(); return; }
+            let r;
+            try {
+              r = await getSQL(env, `SELECT status, bytes, heartbeat, created_at FROM jobs WHERE id = ?`, [jobId]);
+              dbFails = 0;
+            } catch (_) {
+              /* transient D1 hiccup: back off and keep the stream open —
+                 the job row is still there on the other side of the blip */
+              if (++dbFails >= 15) { close(); return; }
+              await sleep(Math.min(2000 * dbFails, 8000));
+              continue;
+            }
+            if (!r) { close(); return; } // row genuinely gone (pruned/expired)
             const status = r.status;
             const total = Number(r.bytes);
             if (total > pos || status === "done") {
-              const rows2 = await allSQL(env, `SELECT seq, data FROM chunks WHERE job = ? AND seq > ? ORDER BY seq ASC`, [jobId, lastSeq]);
+              let rows2 = null;
+              try {
+                rows2 = await allSQL(env, `SELECT seq, data FROM chunks WHERE job = ? AND seq > ? ORDER BY seq ASC`, [jobId, lastSeq]);
+              } catch (_) {
+                /* skip this delivery round — lastSeq has NOT advanced, so the
+                   next poll re-reads the same range; no bytes are lost */
+                if (++dbFails >= 15) { close(); return; }
+                await sleep(Math.min(2000 * dbFails, 8000));
+                continue;
+              }
               for (const c of rows2) {
                 deliver(enc.encode(c.data));
                 lastSeq = Number(c.seq);
@@ -1211,11 +1262,13 @@ async function handleJobGet(url, ctx, env) {
   if (sqlErr) return json({ error: "job lookup failed on the database (the job keeps running — retry is safe)", retry: true }, 503);
   if (!job) return json({ error: "job not found (expired or relay restarted)" }, 404);
   maybeWorkAny(env, ctx); // a live-cast reader just attached — drive due work now
-  const live = liveFor(id);
-  /* same-isolate live pump → zero-latency fan-out */
-  if (live.hasPump && live.abortCtl && !live.abortCtl.signal.aborted) {
-    return new Response(liveSubscriber(live, Math.min(offset, live.total)), { status: 200, headers: relayHeaders(job.meta.contentType, id, { "X-Nexus-Offset": String(live.total) }) });
-  }
+  /* v13: the D1-polling tail is the ONLY delivery path. The old in-isolate
+     live fast-path (liveSubscriber) was retired: it closed the client's
+     stream whenever the pump gave up its inline attempt budget — while the
+     job was still queued — which the app correctly read as a truncated
+     response ("cut off before it finished, status 0"). The D1 tail only
+     closes on justified ends, and every byte it sends comes from the chunk
+     log, so cross-isolate reconnects stay byte-exact by construction. */
   return new Response(tailStream(env, ctx, id, offset), { status: 200, headers: relayHeaders(job.meta.contentType, id, { "X-Nexus-Offset": String(job.bytes) }) });
 }
 
@@ -1297,6 +1350,100 @@ async function handleDelete(url, env) {
   return json({ ok: true });
 }
 
+/* =====================================================================
+   v13: WORKER REQUESTS — the monitoring surface for the app's Settings
+   panel ("see all current worker requests, cancel/stop them").
+   GET /jobs    → newest 40 jobs with honest progress fields
+   DELETE /jobs → stop every non-terminal job (the panel's "Stop all")
+   Both require an Authorization header — the same Bearer every /chat call
+   carries. It is a casual-scan guard, not real auth (the worker cannot
+   verify the key without spending a subrequest; job ids stay unguessable
+   UUIDs and full buffers are only readable per-id).
+   No D1 → 404 with an honest hint (the app's panel shows its upgrade note).
+   D1 failure → 503 retryable, same rule as /job/:id.
+   ===================================================================== */
+const JOBS_LIST_CAP = 40;
+function previewFromReq(reqText) {
+  try {
+    const req = JSON.parse(reqText || "");
+    const msgs = Array.isArray(req && req.messages) ? req.messages : [];
+    const model = req && typeof req.model === "string" ? req.model : "";
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (m && m.role === "user") {
+        let t = typeof m.content === "string" ? m.content : "";
+        if (!t && Array.isArray(m.content)) t = (m.content.find(p => p && p.type === "text") || {}).text || "";
+        t = String(t || "").replace(/\s+/g, " ").trim();
+        return { model, preview: t.slice(0, 70) };
+      }
+    }
+    return { model, preview: "" };
+  } catch (_) { return { model: "", preview: "" }; }
+}
+async function handleJobsList(request, ctx, env) {
+  if (!request.headers.get("authorization")) {
+    return json({ error: "send your API key as the Authorization header (same as /chat)" }, 401);
+  }
+  if (!hasDB(env)) {
+    return json({ error: "job listing needs the job engine (bind a D1 database as DB)", needsEngine: true }, 404);
+  }
+  try { await ensureSchema(env); } catch (_) {}
+  let rows, sqlErr = null;
+  try {
+    rows = await allSQL(env, `SELECT id, kind, status, created_at, updated_at, attempts, finish, bytes, first_byte, chat_key, req, meta FROM jobs ORDER BY created_at DESC LIMIT ?`, [JOBS_LIST_CAP]);
+  } catch (err) { sqlErr = err; }
+  /* same rule as /job/:id: a D1 failure (even a total one) answers 503
+     retryable — the app's panel re-polls; 404 means "no engine" only */
+  if (sqlErr) return json({ error: "job listing failed on the database", retry: true }, 503);
+  maybeWorkAny(env, ctx); // the panel is watching — drive due work while it is
+  const now = Date.now();
+  let active = 0;
+  const jobs = (rows || []).map(r => {
+    const born = Number(r.created_at);
+    const upd = Number(r.updated_at);
+    const fb = Number(r.first_byte) || 0;
+    const st = String(r.status);
+    const done = st === "done";
+    const running = !done && st !== "failed" && st !== "stopped" && st !== "parked";
+    if (running) active++;
+    const { model, preview } = previewFromReq(r.req);
+    let error = "";
+    try { const meta = r.meta ? JSON.parse(r.meta) : null; error = meta && meta.error ? String(meta.error) : ""; } catch (_) {}
+    return {
+      id: r.id, kind: String(r.kind), status: st, running,
+      attempts: Number(r.attempts), bytes: Number(r.bytes), finish: !!Number(r.finish),
+      waitedMs: fb ? Math.max(0, fb - born) : (done ? 0 : Math.max(0, now - born)),
+      workMs: fb ? Math.max(0, (running ? now : upd) - fb) : (done ? Math.max(0, upd - born) : 0),
+      createdAt: born, updatedAt: upd, chatKey: String(r.chat_key || ""),
+      model, preview, error,
+    };
+  });
+  return json({ ok: true, v: WORKER_VERSION, now, active, total: jobs.length, jobs });
+}
+async function handleJobsDelete(request, env) {
+  if (!request.headers.get("authorization")) {
+    return json({ error: "send your API key as the Authorization header (same as /chat)" }, 401);
+  }
+  if (!hasDB(env)) {
+    return json({ error: "job listing needs the job engine (bind a D1 database as DB)", needsEngine: true }, 404);
+  }
+  try { await ensureSchema(env); } catch (_) {}
+  let stopped = 0;
+  try {
+    const r = await allSQL(env, `SELECT id FROM jobs WHERE status IN ('queued','streaming')`);
+    stopped = (r || []).length;
+    for (const row of r || []) {
+      const live = liveMap.get(row.id);
+      if (live) liveAbort(live);
+    }
+    await runSQL(env, `UPDATE jobs SET status = 'stopped', heartbeat = 0, lock_token = NULL, updated_at = ? WHERE status IN ('queued','streaming')`, [Date.now()]);
+    await runSQL(env, `DELETE FROM secrets WHERE job IN (SELECT id FROM jobs WHERE status = 'stopped')`);
+  } catch (err) {
+    return json({ error: "stop-all failed on the database", retry: true }, 503);
+  }
+  return json({ ok: true, stopped });
+}
+
 /* ---------- maintenance ---------- */
 async function prune(env) {
   if (!jobEngineOk(env)) return;
@@ -1371,6 +1518,12 @@ export default {
         return json({ error: { message: "relay upstream failed: " + (err && err.message || String(err)), code: 502 } }, 502);
       }
     }
+    if (request.method === "GET" && url.pathname === "/jobs") {
+      return handleJobsList(request, ctx, env);
+    }
+    if (request.method === "DELETE" && url.pathname === "/jobs") {
+      return handleJobsDelete(request, env);
+    }
     if (request.method === "GET" && /^\/job\/by-key\/[A-Za-z0-9._:%-]+$/.test(url.pathname)) {
       return handleJobByKey(url, ctx, env);
     }
@@ -1383,7 +1536,7 @@ export default {
     if (request.method === "DELETE" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
       return handleDelete(url, env);
     }
-    return json({ error: "not found", hint: "use /chat (X-Nexus-Submit: 1), /job/:id?offset=N, /job/:id/status, /job/by-key/:key, /health" }, 404);
+    return json({ error: "not found", hint: "use /chat (X-Nexus-Submit: 1), /job/:id?offset=N, /job/:id/status, /job/by-key/:key, /jobs, /health" }, 404);
   },
 
   /* cron tick: heartbeat + prune + up to two jobs of real work */
