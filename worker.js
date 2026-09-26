@@ -1,1484 +1,1489 @@
-/* =====================================================================
-   NEXUS BACKGROUND RELAY v9 — Cloudflare Worker (the honest queue engine)
-   =====================================================================
-   WHAT v9 ADDS (on top of the v8 durable engine):
-     1. 24-HOUR DONE RETENTION — finished jobs kept their full buffer for
-        only 10 minutes in v8, so "send a prompt, close the app, come back
-        in an hour" fell back to a re-ask: the original thinking was cut
-        off and sometimes nothing showed at all. Done jobs now live 24h
-        (parked 6h) — the app replays the EXACT finished response.
-     2. CLIENT-KEY JOB LOOKUP — the app stamps every request with a
-        deterministic X-Nexus-Client key (chatId|msgIndex) BEFORE the
-        fetch fires. If the page dies before the job id header arrives,
-        the next launch calls GET /job/by-key/:key to find the running or
-        finished job and re-attach — no re-ask, no double spend. The key
-        is auth-checked against the job's stored secret.
-     3. SCHEMA MIGRATION — existing D1 tables gain the client_key column
-        via guarded ALTER (safe on old and fresh databases alike).
+/* ============================================================
+ * z.ai pocket — Cloudflare Worker reverse proxy (v3)
+ * ------------------------------------------------------------
+ * WHAT THIS DOES
+ *   Open THIS WORKER'S URL in your phone browser — that URL is
+ *   the app. The worker serves the real chat.z.ai full-screen
+ *   (no iframe, no local HTML file). Every request the site
+ *   makes (HTML, JS/CSS assets, API calls, SSE streams,
+ *   uploads, downloads, websockets) is answered by THIS worker,
+ *   which forwards it to the z.ai family of hosts. The browser
+ *   never talks to z.ai directly.
+ *
+ * v3 CHANGES — fixes "opens straight to a blocked page"
+ *   1. Cloudflare-edge headers that arrive on every request
+ *      hitting this worker (cf-connecting-ip, cf-ipcountry,
+ *      cf-ray, cf-visitor, x-forwarded-for, cdn-loop,
+ *      true-client-ip, ...) are NO LONGER forwarded upstream.
+ *      chat.z.ai is itself behind Cloudflare, and handing it
+ *      forged CF headers is classic WAF bait: some regions
+ *      answer with a block page.
+ *   2. If z.ai still answers 403/429 on a GET, the worker
+ *      retries ONCE with a minimal clean header set before it
+ *      gives up (successful retries are tagged x-zp-retry: 1).
+ *   3. New public /__diag page — open it on the phone and it
+ *      shows, live, what z.ai returns for this worker: three
+ *      probes (browser-like / minimal / the old v2 forged-header
+ *      way) with status, colo and body preview, plus what this
+ *      worker received from your network. If z.ai is blocking,
+ *      this page says so in plain words.
+ *
+ * DEPLOY (you already have a worker)
+ *   1. dash.cloudflare.com → Workers & Pages → your worker
+ *   2. "Edit code" / Quick Edit → select all → paste this file
+ *   3. Save & Deploy
+ *   4. (optional) Settings → Variables → PROXY_TOKEN with a long
+ *      random string (then / asks for it once) and/or
+ *      EXTRA_HOSTS="a.com,b.com" to allowlist more first-party
+ *      hosts.
+ *   5. Open the worker URL — that IS the app. The zai-pocket.html
+ *      file already saved on your phone keeps working unchanged
+ *      (it only talks to /__status, which is unchanged).
+ *      If the app ever shows a blocked or error page, open
+ *      https://<your-worker>/__diag and read what it says.
+ *
+ * ROUTES
+ *   /            -> https://chat.z.ai/   — the app itself,
+ *                    full-screen, no prefix (the SPA only works
+ *                    at "/"; on /chat/ it renders its own error
+ *                    page). With PROXY_TOKEN set and unsatisfied,
+ *                    / shows the token setup page.
+ *   /chat/*      -> 302 to /*            (legacy v2 prefix)
+ *   /p/<host>/*  -> https://<host>/*     (allowlisted hosts only)
+ *   anything else -> https://chat.z.ai/<path> (transparent
+ *                    catch-all: runtime-built root-absolute URLs
+ *                    like /static/logo.png behave like on the
+ *                    real site)
+ *   /__status    -> health-check JSON (the pocket file uses this)
+ *   /__diag      -> live upstream probe report (see v3 notes)
+ *   /__clear     -> wipe all session cookies, back to /
+ *
+ * SECURITY
+ *   - Only z.ai / chatglm.cn / chatglm.site family hosts are
+ *     proxied. This is NOT an open proxy.
+ *   - With PROXY_TOKEN set, everything except the token page,
+ *     /__status and /__diag requires the token.
+ *   - Upstream cookies are re-issued for this worker's own domain
+ *     so the whole app is one same-origin page; sessions stick.
+ * ============================================================ */
 
-   WHAT v8 ADDED (kept):
-     1. STRUCTURED NOTICES — every retry/continue/park now emits
-        `: nexus-notice {"kind":"wait","attempt":N,"max":24,"etaMs":X,
-        "waitedMs":Y,"reason":"rate limited"} — human text` as REAL buffer
-        bytes. The app renders "waiting in line · attempt 3/24 · waited
-        1m 12s · next try ~4s" in the status line AND inside the thinking
-        box — a rate-limited request is never again a silent "Thinking…".
-     2. WAIT vs WORK, SAVED — the job's meta records firstByteAt (the
-        moment the model actually got in), doneAt, waitedMs, workMs. Every
-        terminal state (done/parked/failed) stamps them permanently; the
-        /health jobs digest shows waitedMs/workMs per job.
-     3. X-NEXUS TIMING HEADERS — POST /chat, the attach path, and every
-        GET /job/:id tail carry X-Nexus-Status, X-Nexus-Attempts,
-        X-Nexus-Age, X-Nexus-Waited, X-Nexus-Work so the app can paint the
-        queue + timing state the instant a connection opens (even before
-        any byte replays).
-     4. GET /job/:id/status — a one-row JSON probe {status, attempts,
-        bytes, ageMs, waitedMs, workMs}. The app polls it while its tail
-        is quiet: it shows live queue state, detects zombie tails, and
-        every probe piggybacks a work pass (polling DRIVES due jobs).
-     5. ATTEMPT-0 TIMEOUT (30s) — a black-holed upstream connect becomes
-        a durable queued job with honest notices instead of hanging the
-        POST for the app's full 120s timeout.
-     6. PARK NOTICES — when a tool-call cut parks a job, the reason is in
-        the buffer, so a reconnecting app knows exactly why the stream
-        ended and finishes the tool call itself.
+const VERSION = 'zai-pocket-proxy 3.1';
 
-   THE MISSION (unchanged): you send a prompt and walk away. THIS worker
-   owns the request from that moment on. It keeps the generation running
-   SERVER-SIDE in durable storage, re-requests the model until the
-   answer is fully complete (even if OpenRouter is busy or down for
-   minutes), and every time you reopen the app you get either live
-   progress or the whole finished answer. Nothing depends on your phone
-   being on, your screen being unlocked, or the app even being open.
-
-   WHY v5 EXISTS (what v4 got wrong in real Cloudflare):
-     v4 turned every retryable upstream failure (429 rate-limit, 5xx,
-     network blip) into a durable job — good — but when the first 4
-     inline retries didn't get in (~20s of a busy provider), it RELEASED
-     the job and CLOSED the client's stream cleanly with ZERO bytes.
-     The app read that as "the response ended without a finish marker and
-     without any text" → the cryptic "The response was cut off before it
-     finished. (status 0)" dead end, and the job sat stuck in D1 (nothing
-     drove it: the cron wasn't firing and piggyback only ran on /health).
-     Reproduced under real workerd: a 9-long 429 storm produced exactly
-     bytes:0 + a permanently stuck job.
-
-   THE v5 FIX — honest retries at every layer (app stays v3, untouched):
-     1. RETRY NOTICES ARE REAL BYTES: every retry emits an SSE comment
-        (": nexus upstream 429 — re-requesting until it gets in (attempt
-        N/24) in ~Xs") into the job buffer — livePush'd to you AND
-        flushed to D1. The app's parser skips comments, its byte-offset
-        accounting stays exact, and its stall watchdog gets fed, so you
-        see a live "Thinking…" stream while the worker fights the
-        provider — never a silent freeze, never a zero-byte close.
-     2. OpenRouter's 429 retry_after is honored (capped 30s) so the
-        re-request cadence is exactly as fast as the provider asks.
-     3. BIGGER INLINE BUDGET: the request-driven pump now retries 12
-        times in-context (~minutes of "re-request until it gets in")
-        instead of v4's 4.
-     4. GIVE-UP = stream ERROR, never a clean close: if the inline
-        budget is exhausted, the job is released for the cron/piggyback
-        AND attached clients get controller.error() — the app treats it
-        as a dropped socket and reconnects to /job/:id?offset=N, where
-        the tail it lands on drives the job the moment the backoff
-        elapses. The stream only ever closes cleanly WITH a finish
-        marker.
-     5. PROVIDER ERRORS ARE REAL BYTES: a fatal upstream error (401
-        invalid key, 402 out of credits, …) is persisted into the job
-        buffer as an SSE error event, so the client you're watching AND
-        every reconnecting tail see the ACTUAL error and status — the
-        app shows "Your API key is invalid…" instead of "(status 0)".
-     6. ANY request piggybacks one due job into its own fresh context
-        (not just /health), so stuck jobs revive the instant ANY traffic
-        arrives — including the app's own reconnect attempts.
-
-   WHY v4 EXISTS (what v3 got wrong) — still true, still fixed:
-     v3 held jobs in worker MEMORY. Cloudflare tears down a request's
-     execution context roughly 30 seconds after the client disconnects —
-     the self-ping keepalive chain kept the ISOLATE warm, but the
-     runtime still killed the running pump promise. Result: the stream
-     you saw "while you were gone" died early, and the app reported the
-     response as interrupted. Local tests never caught it because Bun
-     (the test runtime) never kills promises.
-
-   THE DURABLE ENGINE (unchanged from v4):
-     1. ALL job state lives in D1 (SQLite at the edge — strongly
-        consistent; survives isolate recycling, worker redeploys, and
-        full Cloudflare restarts). Every streamed byte is flushed to the
-        job's chunk log while streaming.
-     2. Generation happens in DISCRETE upstream attempts, not one
-        fragile long-held connection. If an attempt is cut off (no
-        [DONE] / finish_reason), the next driver re-asks the model with
-        the app's exact CONTINUE protocol and appends the rest to the
-        same job. If the upstream is busy/refusing, the worker
-        re-requests on a backoff schedule "until it gets in".
-     3. THREE DRIVERS keep jobs moving, each in a brand-new event
-        context (so the ~30s teardown can't kill them mid-flight):
-          - the request event itself (while you're watching),
-          - a piggyback work pass on ANY incoming request (the moment
-            your app reconnects or polls a job, progress resumes),
-          - a Cron Trigger (every minute) — THIS is what works with
-            your phone completely off.
-     4. ATOMIC JOB CLAIMS: a driver may only take a job whose pump
-        heartbeat went stale and whose retry backoff has elapsed. The
-        conditional UPDATE is atomic in D1, so two racing drivers can
-        never double-generate.
-     5. ATTACH-ON-CONTINUE preserved: when the app sends its own
-        continue request (…conversation, assistant partial, "continue"
-        instruction) and a matching job is running or finished, the
-        worker serves THAT job from the exact byte boundary — no second
-        generation, no double spend. If the app is somehow AHEAD of the
-        job buffer, the stale job is retired and a fresh generation
-        continues from the app's (longer) partial.
-     6. Tool-call cuts are PARKED, not continued server-side (mirrors
-        the app's discard-partial-tools protocol — a half-written file
-        must never be executed). The app finishes those on return via
-        its own auto-resume, cleanly.
-
-   WIRE PROTOCOL (what NexusAiPro.html speaks — unchanged from v3):
-     POST {relay}/chat      → SSE stream + "X-Nexus-Job: <id>" header
-     POST {relay}/images    → JSON + "X-Nexus-Job: <id>" header
-     GET  {relay}/job/:id?offset=N → replay from byte N + live tail
-                              (404/410 when gone → app auto-continues;
-                              failed jobs replay their buffered error)
-     GET  {relay}/health    → {"ok":true,"v":5,...}   ← deploy check
-     DELETE {relay}/job/:id → free the job early
-
-   SETUP / UPGRADE (~4 minutes, dashboard only — no local tools):
-     1. Cloudflare dashboard → Workers & Pages → nexusaipro → Edit code
-        → select all → paste this entire file → Deploy.
-     2. Same worker → Settings → Bindings → Add → D1 database:
-        create one (any name, e.g. nexus-jobs) → bind it with variable
-        name EXACTLY: DB
-     3. Same worker → Settings → Triggers & Events (Cron Triggers)
-        → Add Cron Trigger → schedule EXACTLY:  * * * * *
-        (every minute — this is what finishes answers while your phone
-        is off). NOTE: without the cron, jobs only progress while the
-        app is open; /health will keep saying cronOk:false until it
-        fires — check it after ~1 minute.
-     4. Open https://nexusaipro.kadharri-minecraft.workers.dev/health
-        → it must say "v":5, "d1":true, "cronOk":true.
-        The health output literally tells you which step is missing.
-
-   AUTH NOTE (honest): the app's "Authorization: Bearer <OpenRouter key>"
-   is required to re-request the model while you are away, so it is
-   stored in YOUR OWN D1 database for the lifetime of that job only
-   (minutes), and deleted the moment the job finishes, fails, is parked
-   or is pruned. It is never logged, never returned by any endpoint.
-   D1 is private to your Cloudflare account — the same trust boundary
-   as the worker that already proxies that header. If you'd rather not,
-   simply don't bind D1: the worker then runs as a plain passthrough
-   relay (graceful degrade — nothing breaks, you just don't get the
-   phone-off job engine).
-
-   LIMITS (honest):
-     - Unfinished jobs are worked for up to 30 minutes / 24 attempts,
-       then marked failed (the buffered error event tells the app why;
-       the app still auto-continues on return).
-     - Finished jobs replay for 10 minutes, then are pruned.
-     - 8 MB buffer cap per job (a normal response is < 1 MB).
-     - Free plan: D1 + Cron Triggers are both included. Very long jobs
-       may hit the free plan's per-request subrequest budget — the
-       design degrades gracefully (the stream reconnects in a fresh
-       context and work continues).
-     - D1 must be bound as "DB" and the cron must be "* * * * *" for
-       the full phone-off experience; /health reports both.
-   ===================================================================== */
-
-const WORKER_VERSION = 9;
-
-/* test tunables — production reads defaults; the local harness may
-   override via globalThis.__nexusTun to run E2E in seconds. */
-function TUN(key, def) {
-  const t = globalThis.__nexusTun;
-  return t && Object.prototype.hasOwnProperty.call(t, key) ? t[key] : def;
-}
-
-const MAX_JOB_BYTES = TUN("maxJobBytes", 8 * 1024 * 1024);
-const JOB_TTL_MS = TUN("jobTtlMs", 30 * 60 * 1000);
-/* v9: DONE jobs live for 24 HOURS, not 10 minutes — "send a prompt, close
-   the app, come back later" must replay the FULL finished response from the
-   durable buffer, not fall back to a re-ask that loses the original answer.
-   v8's 10-minute reap was exactly why coming back late showed a cut-off
-   thinking block or nothing at all. */
-const DONE_TTL_MS = TUN("doneTtlMs", 24 * 60 * 60 * 1000);
-const MAX_ATTEMPTS = TUN("maxAttempts", 24);
-const RETRY_DELAYS = TUN("retryDelays", [1500, 3000, 6000, 10000, 15000, 20000]);
-const UPSTREAM_STALL_MS = TUN("stallMs", 60 * 1000);
-const STALE_LOCK_MS = TUN("staleLockMs", 26 * 1000);
-const FLUSH_MS = TUN("flushMs", 2000);
-const FLUSH_BYTES = TUN("flushBytes", 64 * 1024);
-const TICK_BUDGET_MS = TUN("tickBudgetMs", 210 * 1000);
-const EVENT_BUDGET_MS = TUN("eventBudgetMs", 10 * 60 * 1000);
-const TAIL_POLL_FAST = TUN("tailPollFast", 500);
-const TAIL_POLL_SLOW = TUN("tailPollSlow", 2000);
-const MAX_ACTIVE_JOBS = 64;
-/* v9: parked jobs (agent tool-cuts waiting for the app to come back) live
-   6 hours instead of 30 minutes — a long coding run paused mid-tool-round
-   is still recoverable when you return well after the old window. */
-const PARK_TTL_MS = TUN("parkTtlMs", 6 * 60 * 60 * 1000);
-/* v6: how many due jobs one cron tick drives (concurrent chats generating
-   while the phone is off all make progress instead of queueing two-by-two) */
-const CRON_JOBS_PER_TICK = TUN("cronJobsPerTick", 4);
-
-const FWD_HEADERS = ["authorization", "content-type", "http-referer", "x-title", "accept"];
-
-/* server-side continue protocol — the EXACT instruction the app sends,
-   so worker retries and app continues are interchangeable */
-const CONTINUE_INSTRUCTION = "Your previous answer was cut off by a connection drop. Continue exactly where you stopped. Do not repeat any text you already wrote, do not apologize, just continue the content seamlessly.";
-
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title, X-Nexus-Client",
-  "Access-Control-Expose-Headers": "X-Nexus-Job, X-Nexus-Offset, X-Nexus-Age, X-Nexus-Waited, X-Nexus-Work, X-Nexus-Attempts, X-Nexus-Status",
-  "Access-Control-Max-Age": "86400",
-};
-
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-function json(data, status = 200, headers = {}) {
-  return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json", ...CORS, ...headers } });
-}
-
-/* v9: SHA-256 of the Authorization header — stored on the job row so
-   client-key lookups stay verifiable AFTER the secret is deleted at
-   completion, without keeping the key itself around. */
-async function sha256Hex(text) {
-  try {
-    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(text || "")));
-    return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
-  } catch (_) { return null; }
-}
-
-/* ---------- upstream base/path (v2 fix preserved) ---------- */
-function upstreamBase(env) {
-  return ((env && env.NEXUS_UPSTREAM_BASE) || "https://openrouter.ai/api/v1").replace(/\/+$/, "");
-}
-function headersFrom(fwd) {
-  const h = new Headers();
-  for (const k of FWD_HEADERS) { const v = fwd && fwd[k]; if (v) h.set(k, v); }
-  if (!h.has("content-type")) h.set("content-type", "application/json");
-  return h;
-}
-function backoffFor(attempts) {
-  const d = RETRY_DELAYS[Math.min(Math.max(attempts - 1, 0), RETRY_DELAYS.length - 1)];
-  return Math.round(d * (0.8 + Math.random() * 0.4));
-}
-
-/* =====================================================================
-   D1 layer — the durable half of the engine.
-   Uses ONLY prepare().bind().run()/all() (the portable subset), so the
-   exact same worker file runs under the local Bun test harness with a
-   bun:sqlite shim, and under real Cloudflare with real D1.
-   ===================================================================== */
-const SCHEMA_SQL = [
-  `CREATE TABLE IF NOT EXISTS jobs (
-     id TEXT PRIMARY KEY,
-     kind TEXT NOT NULL DEFAULT 'chat',
-     status TEXT NOT NULL DEFAULT 'queued',
-     created_at INTEGER NOT NULL,
-     updated_at INTEGER NOT NULL,
-     heartbeat INTEGER NOT NULL DEFAULT 0,
-     next_retry INTEGER NOT NULL DEFAULT 0,
-     attempts INTEGER NOT NULL DEFAULT 0,
-     finish INTEGER NOT NULL DEFAULT 0,
-     bytes INTEGER NOT NULL DEFAULT 0,
-     content_text TEXT NOT NULL DEFAULT '',
-     req TEXT,
-     meta TEXT,
-     client_key TEXT,
-     auth_hash TEXT,
-     lock_token TEXT
-   )`,
-  `CREATE TABLE IF NOT EXISTS chunks (
-     job TEXT NOT NULL,
-     seq INTEGER NOT NULL,
-     bytes INTEGER NOT NULL,
-     data TEXT NOT NULL,
-     PRIMARY KEY (job, seq)
-   )`,
-  `CREATE TABLE IF NOT EXISTS secrets (
-     job TEXT PRIMARY KEY,
-     auth TEXT NOT NULL
-   )`,
-  `CREATE TABLE IF NOT EXISTS wstate (
-     k TEXT PRIMARY KEY,
-     v TEXT NOT NULL
-   )`,
-  `CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status, next_retry)`,
-];
-/* v9: migration for EXISTING D1 tables (CREATE TABLE IF NOT EXISTS won't add
-   a column to a table that already exists) — ALTER ADD COLUMN fails with
-   "duplicate column" once applied, which is exactly the guard we need. */
-const SCHEMA_MIGRATIONS = [
-  `ALTER TABLE jobs ADD COLUMN client_key TEXT`,
-  `ALTER TABLE jobs ADD COLUMN auth_hash TEXT`,
-  `CREATE INDEX IF NOT EXISTS idx_jobs_client ON jobs (client_key)`,
+/* z.ai first-party family (suffix match — covers subdomains) */
+const ALLOW = [
+  'z.ai',               // chat.z.ai, zcode.z.ai, *.space-z.ai sandboxes, ...
+  'chatglm.cn',         // z-cdn.chatglm.cn (frontend assets), z-cdn-media, cdn-proxy, sdata
+  'chatglm.site',       // artifacts-cdn, adapter-prod, test envs
+  'glm-chat.oss-cn-hongkong.aliyuncs.com', // file upload/download bucket
+  'alicdn.com',         // o.alicdn.com — z.ai's shared frontend libs (jquery …)
+  'aliyuncs.com'        // sdk.rum / log endpoints the z.ai frontend loads at boot
 ];
 
-function hasDB(env) { return !!(env && env.DB); }
-
-let schemaDone = false;
-async function ensureSchema(env) {
-  if (!hasDB(env) || schemaDone) return;
-  for (const s of SCHEMA_SQL) await runSQL(env, s, []);
-  for (const s of SCHEMA_MIGRATIONS) { try { await runSQL(env, s, []); } catch (_) {} }
-  schemaDone = true;
+/* upstream origin for the /chat route (env CHAT_UPSTREAM overrides, e.g. for staging) */
+function chatUpstream(event) { return envOf(event).CHAT_UPSTREAM || 'https://chat.z.ai'; }
+function chatHost(event) {
+  try { return new URL(chatUpstream(event)).host; } catch (e) { return 'chat.z.ai'; }
 }
 
-async function runSQL(env, sql, params) {
-  const p = env.DB.prepare(sql);
-  const b = params && params.length ? p.bind(...params) : p;
-  return b.run();
-}
-async function allSQL(env, sql, params) {
-  const p = env.DB.prepare(sql);
-  const b = params && params.length ? p.bind(...params) : p;
-  const r = await b.all();
-  return (r && r.results) || [];
-}
-async function getSQL(env, sql, params) {
-  const rows = await allSQL(env, sql, params);
-  return rows.length ? rows[0] : null;
-}
-async function wstateSet(env, k, v) {
-  await runSQL(env, `INSERT INTO wstate (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, [k, String(v)]);
-}
-async function wstateGet(env, k) {
-  const r = await getSQL(env, `SELECT v FROM wstate WHERE k = ?`, [k]);
-  return r ? Number(r.v) || 0 : 0;
-}
+/* markers filled by the build script */
+const PATCH_JS = [
+"/* ============================================================",
+" * z.ai pocket \u2014 runtime patch",
+" * Injected by the proxy worker into every proxied HTML document",
+" * as the FIRST script inside <head>. It rewrites every network",
+" * call, navigation and popup so the SPA believes it lives on its",
+" * real origin while every byte actually flows through the worker.",
+" *",
+" * NOTE: this source is embedded inside a <script> tag in proxied",
+" * pages, so it must never contain the literal sequence \"</scr\" +",
+" * \"ipt>\" \u2014 keep it that way.",
+" * ============================================================ */",
+"(function () {",
+"  'use strict';",
+"  if (window.__ZAI_PATCHED__) return;",
+"  window.__ZAI_PATCHED__ = true;",
+"",
+"  var CFG = window.__ZAI__ || {};",
+"  var PFX = CFG.pfx || '';            // proxy prefix for this document, e.g. \"/chat\" or \"/p/z-cdn.chatglm.cn\"",
+"  var HOST = (CFG.host || '').toLowerCase(); // upstream host this document belongs to",
+"  var WORKER = CFG.worker || '';      // worker origin, e.g. https://name.workers.dev",
+"  var TOKEN = CFG.token || '';        // optional shared proxy token",
+"  var ALLOW = CFG.allow || [];        // allowlisted host suffixes",
+"",
+"  var jar = [];                       // fallback cookie jar (mirrored by the shell)",
+"  var lsMirror = {};                  // fallback localStorage mirror (for browsers that block it in iframes)",
+"  var upQueue = [];",
+"",
+"  /* ---------- messaging ---------- */",
+"  function up(msg) {",
+"    try {",
+"      msg.zai = 1;",
+"      if (window.parent && window.parent !== window) window.parent.postMessage(msg, '*');",
+"    } catch (e) { /* ignore */ }",
+"  }",
+"",
+"  /* ---------- on-page toast (top-level mode: no shell above us) ---------- */",
+"  var toastCount = 0;",
+"  function pageToast(msg) {",
+"    try {",
+"      if (window.parent && window.parent !== window) return; // shell handles messages",
+"      if (toastCount >= 4) return;",
+"      toastCount++;",
+"      var d = document.createElement('div');",
+"      d.textContent = msg;",
+"      d.setAttribute('style', 'position:fixed;left:12px;right:12px;bottom:max(18px,env(safe-area-inset-bottom));z-index:2147483647;background:#20232F;color:#E7E9EE;border:1px solid rgba(255,255,255,.16);border-radius:14px;padding:13px 15px;font:13px/1.5 -apple-system,BlinkMacSystemFont,system-ui,\"Segoe UI\",Roboto,sans-serif;box-shadow:0 12px 32px rgba(0,0,0,.45);word-break:break-all;opacity:0;transition:opacity .25s;pointer-events:none');",
+"      (document.body || document.documentElement).appendChild(d);",
+"      var raf = window.requestAnimationFrame || function (f) { setTimeout(f, 16); };",
+"      raf(function () { d.style.opacity = '1'; });",
+"      setTimeout(function () {",
+"        try { d.style.opacity = '0'; setTimeout(function () { d.remove(); }, 300); } catch (e) { /* ignore */ }",
+"      }, 4500);",
+"    } catch (e) { /* ignore */ }",
+"  }",
+"",
+"  /* ---------- host matching ---------- */",
+"  function allowedHost(h) {",
+"    h = (h || '').toLowerCase().replace(/\\.$/, '');",
+"    if (!h) return false;",
+"    for (var i = 0; i < ALLOW.length; i++) {",
+"      var a = String(ALLOW[i]).toLowerCase();",
+"      if (h === a || h.slice(-(a.length + 1)) === '.' + a) return true;",
+"    }",
+"    return false;",
+"  }",
+"",
+"  /* ---------- proxy-path bookkeeping ----------",
+"   * Guards against double-prefixing and recognises URLs that already",
+"   * point at the worker (same-origin) instead of the upstream host.",
+"   */",
+"  function originStr() {",
+"    try { return location.origin || (location.protocol + '//' + location.host); } catch (e) { return ''; }",
+"  }",
+"  function hasPfx(str) {",
+"    if (!PFX) return true;",
+"    if (str === PFX) return true;",
+"    return str.indexOf(PFX) === 0 && /^[\\/?#;]/.test(str.charAt(PFX.length));",
+"  }",
+"  function isCrossHostPath(str) { // \"/p/<allowlisted host>/\u2026\"",
+"    if (/^\\/p\\//.test(str)) {",
+"      var h = str.slice(3).split(/[\\/?#]/)[0].toLowerCase();",
+"      if (allowedHost(h)) return true;",
+"    }",
+"    return false;",
+"  }",
+"  function isProxyPath(p) {",
+"    if (!p) return false;",
+"    if (hasPfx(p)) return true;",
+"    if (isCrossHostPath(p)) return true;",
+"    if (/^\\/__(status|clear)([\\/?#]|$)/.test(p)) return true;",
+"    return false;",
+"  }",
+"",
+"  /* ---------- URL mapping ----------",
+"   * absolute / protocol-relative allowlisted URLs -> proxy paths",
+"   * same-origin (worker) absolute URLs -> normalised proxy paths",
+"   * root-absolute paths -> PFX + path  (they belong to this doc's upstream host)",
+"   * relative / data: / blob: / #...   -> untouched",
+"   */",
+"  function mapUrl(u) {",
+"    try {",
+"      if (u == null) return u;",
+"      if (typeof u === 'object' && u instanceof URL) {",
+"        var s = mapUrl(u.href);",
+"        return s;",
+"      }",
+"      if (typeof u !== 'string') return u;",
+"      var str = u.trim();",
+"      if (!str) return str;",
+"      if (/^(data|blob|about|javascript|mailto|tel|sms|intent|ms-|chrome|file|ws|wss):/i.test(str)) {",
+"        // wss/ws handled by the WebSocket wrapper below; here pass through",
+"        return str;",
+"      }",
+"      if (str.charAt(0) === '#') return str;",
+"      var m;",
+"      if ((m = str.match(/^https?:\\/\\/([^\\/?#]+)/i))) {",
+"        var host = m[1].toLowerCase();",
+"        var org = originStr();",
+"        if (org && (str === org || str.indexOf(org + '/') === 0)) {",
+"          // same-origin (worker) absolute URL \u2014 either already proxied",
+"          // (\"/chat/\u2026\", \"/p/host/\u2026\") or a bare worker-root path that",
+"          // still belongs to this document's upstream",
+"          var sp = str.slice(org.length) || '/';",
+"          if (isProxyPath(sp)) return sp;",
+"          return PFX + sp;",
+"        }",
+"        if (!allowedHost(host)) return str;                    // external: leave (usually analytics)",
+"        var rest = str.slice(m[0].length) || '/';",
+"        if (host === HOST) return PFX + rest;",
+"        return '/p/' + host + rest;",
+"      }",
+"      if ((m = str.match(/^\\/\\/([^\\/?#]+)/))) {",
+"        var h2 = m[1].toLowerCase();",
+"        if (!allowedHost(h2)) return str;",
+"        var rest2 = str.slice(m[0].length) || '/';",
+"        if (h2 === HOST) return PFX + rest2;",
+"        return '/p/' + h2 + rest2;",
+"      }",
+"      if (str.charAt(0) === '/' && str.charAt(1) !== '/') {",
+"        if (hasPfx(str)) return str;          // already carries this doc's proxy prefix",
+"        if (isCrossHostPath(str)) return str; // already a /p/<host>/ proxy path",
+"        return PFX + str;",
+"      }",
+"      return str; // relative \u2192 resolves against the proxied document URL",
+"    } catch (e) { return u; }",
+"  }",
+"",
+"  /* ---------- cookies ---------- */",
+"  function docCookies() {",
+"    var out = [];",
+"    try {",
+"      (document.cookie || '').split(';').forEach(function (kv) {",
+"        kv = kv.trim();",
+"        if (kv) out.push(kv);",
+"      });",
+"    } catch (e) { /* ignore */ }",
+"    return out;",
+"  }",
+"",
+"  function cookieHeader() {",
+"    var seen = {};",
+"    var parts = [];",
+"    docCookies().forEach(function (kv) {",
+"      var name = kv.split('=')[0];",
+"      if (!seen[name]) { seen[name] = 1; parts.push(kv); }",
+"    });",
+"    jar.forEach(function (c) {",
+"      if (c && c.name && !seen[c.name]) { seen[c.name] = 1; parts.push(c.name + '=' + c.value); }",
+"    });",
+"    return parts.join('; ');",
+"  }",
+"",
+"  function ingestSetCookie(hdrVal) {",
+"    try {",
+"      if (!hdrVal) return;",
+"      var arr = JSON.parse(decodeURIComponent(hdrVal));",
+"      if (!Array.isArray(arr)) return;",
+"      var map = {};",
+"      jar.forEach(function (c) { map[c.name] = c; });",
+"      arr.forEach(function (raw) {",
+"        var bits = String(raw).split(';');",
+"        var nv = bits[0];",
+"        var eq = nv.indexOf('=');",
+"        if (eq < 1) return;",
+"        var c = { name: nv.slice(0, eq).trim(), value: nv.slice(eq + 1).trim() };",
+"        for (var i = 1; i < bits.length; i++) {",
+"          var b = bits[i].trim();",
+"          var k = b.split('=')[0].toLowerCase();",
+"          if (k === 'max-age') {",
+"            var ma = parseInt(b.slice(8), 10);",
+"            if (ma === 0) { c.del = true; }",
+"            c.maxAge = ma;",
+"          }",
+"        }",
+"        if (c.del) delete map[c.name];",
+"        else map[c.name] = c;",
+"      });",
+"      jar = [];",
+"      Object.keys(map).forEach(function (k) { jar.push(map[k]); });",
+"      up({ type: 'cookies', cookies: jar });",
+"    } catch (e) { /* ignore */ }",
+"  }",
+"",
+"  function seedDocumentCookies() {",
+"    jar.forEach(function (c) {",
+"      try {",
+"        document.cookie = c.name + '=' + c.value + '; path=/; Max-Age=31536000; Secure; SameSite=None; Partitioned';",
+"      } catch (e) { /* ignore */ }",
+"    });",
+"  }",
+"",
+"  /* ---------- header injection ---------- */",
+"  function applyHeaders(h) {",
+"    try {",
+"      var ch = cookieHeader();",
+"      if (ch && !h.has('x-cookie')) h.set('x-cookie', ch);",
+"      if (TOKEN && !h.has('x-proxy-token')) h.set('x-proxy-token', TOKEN);",
+"    } catch (e) { /* ignore */ }",
+"    return h;",
+"  }",
+"",
+"  /* ---------- fetch ---------- */",
+"  var _fetch = window.fetch ? window.fetch.bind(window) : null;",
+"  if (_fetch) {",
+"    window.fetch = function (input, init) {",
+"      try {",
+"        if (input && typeof input === 'object' && typeof input.url === 'string' && input.constructor && input.constructor.name === 'Request') {",
+"          var mapped = mapUrl(input.url);",
+"          if (mapped !== input.url) {",
+"            try { input = new Request(mapped, input); } catch (e2) { /* keep original */ }",
+"          }",
+"        } else if (typeof input === 'string' || input instanceof URL) {",
+"          var u2 = mapUrl(String(input));",
+"          if (u2 !== String(input)) input = u2;",
+"        }",
+"        init = init || {};",
+"        var H;",
+"        try { H = (init.headers instanceof Headers) ? init.headers : new Headers(init.headers || {}); }",
+"        catch (e3) { H = new Headers(); }",
+"        init.headers = applyHeaders(H);",
+"        var p = _fetch(input, init);",
+"        p.then(function (r) {",
+"          try { ingestSetCookie(r.headers && r.headers.get('x-set-cookie')); } catch (e4) { /* ignore */ }",
+"        }, function () { /* network error \u2014 swallow */ });",
+"        return p;",
+"      } catch (e) {",
+"        return _fetch(input, init);",
+"      }",
+"    };",
+"  }",
+"",
+"  /* ---------- XMLHttpRequest ---------- */",
+"  try {",
+"    var _open = XMLHttpRequest.prototype.open;",
+"    XMLHttpRequest.prototype.open = function (method, url) {",
+"      try {",
+"        var mu = mapUrl(String(url));",
+"        if (mu !== String(url)) {",
+"          if (arguments.length > 2) {",
+"            arguments[1] = mu;",
+"            return _open.apply(this, arguments);",
+"          }",
+"          return _open.call(this, method, mu);",
+"        }",
+"      } catch (e) { /* ignore */ }",
+"      return _open.apply(this, arguments);",
+"    };",
+"    var _send = XMLHttpRequest.prototype.send;",
+"    XMLHttpRequest.prototype.send = function () {",
+"      try {",
+"        var ch = cookieHeader();",
+"        if (ch) this.setRequestHeader('x-cookie', ch);",
+"        if (TOKEN) this.setRequestHeader('x-proxy-token', TOKEN);",
+"      } catch (e) { /* ignore */ }",
+"      var xhr = this;",
+"      try {",
+"        xhr.addEventListener('loadend', function () {",
+"          try { ingestSetCookie(xhr.getResponseHeader && xhr.getResponseHeader('x-set-cookie')); } catch (e2) { /* ignore */ }",
+"        });",
+"      } catch (e3) { /* ignore */ }",
+"      return _send.apply(this, arguments);",
+"    };",
+"  } catch (e) { /* ignore */ }",
+"",
+"  /* ---------- EventSource ---------- */",
+"  try {",
+"    if (window.EventSource) {",
+"      var _ES = window.EventSource;",
+"      window.EventSource = function (url, cfg) {",
+"        try {",
+"          var mu = mapUrl(String(url));",
+"          /* EventSource cannot set headers \u2014 carry the token in the query */",
+"          if (TOKEN && mu !== String(url) && String(mu).indexOf('__t=') < 0) {",
+"            mu += (mu.indexOf('?') < 0 ? '?' : '&') + '__t=' + encodeURIComponent(TOKEN);",
+"          }",
+"          url = mu;",
+"        } catch (e) { /* ignore */ }",
+"        return new _ES(url, cfg);",
+"      };",
+"      window.EventSource.prototype = _ES.prototype;",
+"    }",
+"  } catch (e) { /* ignore */ }",
+"",
+"  /* ---------- WebSocket ---------- */",
+"  try {",
+"    if (window.WebSocket) {",
+"      var _WS = window.WebSocket;",
+"      window.WebSocket = function (url, protocols) {",
+"        try {",
+"          var s = String(url);",
+"          var m = s.match(/^(wss?):\\/\\/([^\\/?#]+)(\\/.*)?$/i);",
+"          if (m) {",
+"            var host = m[2].toLowerCase();",
+"            var scheme = m[1].toLowerCase() === 'ws' ? 'ws' : 'wss';",
+"            if (allowedHost(host)) {",
+"              var rest = m[3] || '/';",
+"              var path = (host === HOST ? PFX : '/p/' + host) + rest;",
+"              if (TOKEN && path.indexOf('__t=') < 0) {",
+"                path += (path.indexOf('?') < 0 ? '?' : '&') + '__t=' + encodeURIComponent(TOKEN);",
+"              }",
+"              url = (location.protocol === 'https:' ? 'wss' : scheme) + '://' + location.host + path;",
+"            }",
+"          }",
+"        } catch (e) { /* ignore */ }",
+"        return protocols === undefined ? new _WS(url) : new _WS(url, protocols);",
+"      };",
+"      window.WebSocket.prototype = _WS.prototype;",
+"      window.WebSocket.CONNECTING = _WS.CONNECTING;",
+"      window.WebSocket.OPEN = _WS.OPEN;",
+"      window.WebSocket.CLOSING = _WS.CLOSING;",
+"      window.WebSocket.CLOSED = _WS.CLOSED;",
+"    }",
+"  } catch (e) { /* ignore */ }",
+"",
+"  /* ---------- sendBeacon ---------- */",
+"  try {",
+"    if (navigator.sendBeacon) {",
+"      var _sb = navigator.sendBeacon.bind(navigator);",
+"      navigator.sendBeacon = function (url, data) {",
+"        try {",
+"          var mu = mapUrl(String(url));",
+"          if (mu !== String(url)) {",
+"            // beacons cannot carry custom headers; fall back to keepalive fetch",
+"            return _fetch(mu, { method: 'POST', body: data, keepalive: true, mode: 'no-cors' }) ? true : true;",
+"          }",
+"        } catch (e) { /* ignore */ }",
+"        return _sb(url, data);",
+"      };",
+"    }",
+"  } catch (e) { /* ignore */ }",
+"",
+"  /* ---------- navigation reporting ---------- */",
+"  function curUrl() { return location.pathname + location.search + location.hash; }",
+"  function reportNav() { up({ type: 'nav', url: curUrl(), title: document.title || '' }); }",
+"",
+"  try {",
+"    var _push = history.pushState;",
+"    var _replace = history.replaceState;",
+"    // SPA history entries must stay inside the proxy prefix: a bare",
+"    // \"/login\" pushed from \"/chat/\" would escape the sandbox on the next",
+"    // reload, and a cross-origin URL would throw SecurityError outright.",
+"    function fixHistUrl(u) {",
+"      try {",
+"        var s = String(u);",
+"        if (!s || s.charAt(0) === '#') return s;",
+"        var org = originStr();",
+"        if (org && (s === org || s.indexOf(org + '/') === 0)) {",
+"          var p = s.slice(org.length) || '/';",
+"          if (isProxyPath(p)) return p;",
+"          return PFX + p;",
+"        }",
+"        var mapped = mapUrl(s);",
+"        if (/^(https?:)?\\/\\//i.test(mapped)) return curUrl(); // cross-origin \u2192 would throw",
+"        return mapped;",
+"      } catch (e) { return u; }",
+"    }",
+"    history.pushState = function () {",
+"      try { if (arguments.length > 2 && arguments[2] != null) arguments[2] = fixHistUrl(arguments[2]); } catch (e2) { /* ignore */ }",
+"      var r = _push.apply(this, arguments); reportNav(); return r;",
+"    };",
+"    history.replaceState = function () {",
+"      try { if (arguments.length > 2 && arguments[2] != null) arguments[2] = fixHistUrl(arguments[2]); } catch (e2) { /* ignore */ }",
+"      var r = _replace.apply(this, arguments); reportNav(); return r;",
+"    };",
+"    window.addEventListener('popstate', reportNav);",
+"    window.addEventListener('hashchange', reportNav);",
+"    window.addEventListener('pageshow', reportNav);",
+"  } catch (e) { /* ignore */ }",
+"",
+"  /* ---------- Navigation API interception (Chrome/Edge) ----------",
+"   * catches location.href=..., form submits, link clicks \u2014 anything",
+"   * that would navigate this frame to an absolute or external URL.",
+"   */",
+"  try {",
+"    if (window.navigation && window.navigation.addEventListener) {",
+"      window.navigation.addEventListener('navigate', function (e) {",
+"        try {",
+"          if (!e.canIntercept || !e.destination || e.destination.sameDocument) return;",
+"          var dest = String(e.destination.url || '');",
+"          if (!dest) return;",
+"          var org = originStr();",
+"          if (org && (dest === org || dest.indexOf(org + '/') === 0)) {",
+"            // same-origin destination on the worker itself: either an",
+"            // already-proxied path (proceed natively \u2014 the old code used to",
+"            // eat these as \"external\") or a bare worker-root path that must",
+"            // regain this document's proxy prefix",
+"            var p = dest.slice(org.length) || '/';",
+"            if (isProxyPath(p)) return;",
+"            e.preventDefault();",
+"            location.href = PFX + p;",
+"            return;",
+"          }",
+"          var mapped = mapUrl(dest);",
+"          if (mapped !== dest) {",
+"            // z.ai-family absolute URL \u2192 swap for the proxied path",
+"            e.preventDefault();",
+"            location.href = mapped;",
+"            return;",
+"          }",
+"          if (/^https?:\\/\\//i.test(dest) || /^\\/\\//.test(dest)) {",
+"            // external site \u2014 the phone will block it anyway; tell the user",
+"            e.preventDefault();",
+"            up({ type: 'ext', url: dest });",
+"            pageToast('Blocked (outside the proxy): ' + dest);",
+"          }",
+"          // relative destinations proceed natively",
+"        } catch (err) { /* ignore */ }",
+"      });",
+"    }",
+"  } catch (e) { /* ignore */ }",
+"",
+"  /* ---------- window.open ---------- */",
+"  function stubWindow() {",
+"    return {",
+"      closed: false,",
+"      close: function () { this.closed = true; },",
+"      focus: function () {}, blur: function () {},",
+"      postMessage: function () {},",
+"      location: { href: 'about:blank', replace: function () {}, assign: function () {} },",
+"      document: { write: function () {}, open: function () {}, close: function () {}, createElement: function () { return { setAttribute: function () {}, appendChild: function () {} }; } }",
+"    };",
+"  }",
+"  window.open = function (url) {",
+"    try {",
+"      var u = url == null ? '' : String(url);",
+"      if (!u || u === 'about:blank') return stubWindow();",
+"      var mapped = mapUrl(u);",
+"      if (mapped !== u) { location.href = mapped; return stubWindow(); }",
+"      if (/^(https?:)?\\/\\//i.test(u)) { up({ type: 'ext', url: u }); pageToast('Blocked (outside the proxy): ' + u); return stubWindow(); }",
+"      location.href = u;",
+"      return stubWindow();",
+"    } catch (e) { return stubWindow(); }",
+"  };",
+"",
+"  /* ---------- click / submit capture (fallback layer) ---------- */",
+"  document.addEventListener('click', function (e) {",
+"    try {",
+"      if (e.defaultPrevented || (e.button !== undefined && e.button !== 0)) return;",
+"      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;",
+"      var el = e.target;",
+"      var a = el && el.closest ? el.closest('a[' + 'href]') : null;",
+"      if (!a) return;",
+"      var href = a.getAttribute('href') || '';",
+"      if (!href || href.charAt(0) === '#' || /^(data|blob|javascript|mailto|tel):/i.test(href)) return;",
+"      var target = (a.target || '').toLowerCase();",
+"      var mapped = mapUrl(href);",
+"      if (mapped !== href) {",
+"        if (target === '_top' || target === '_parent' || target === '_blank') {",
+"          e.preventDefault();",
+"          location.href = mapped;",
+"        } else {",
+"          a.setAttribute('href', mapped); // let native navigation use the proxied href",
+"        }",
+"        return;",
+"      }",
+"      if (/^(https?:)?\\/\\//i.test(href)) {",
+"        e.preventDefault();",
+"        up({ type: 'ext', url: href });",
+"        pageToast('Blocked (outside the proxy): ' + href);",
+"        return;",
+"      }",
+"      if (target === '_top' || target === '_parent') {",
+"        e.preventDefault();",
+"        location.href = href;",
+"      }",
+"    } catch (err) { /* ignore */ }",
+"  }, true);",
+"",
+"  document.addEventListener('submit', function (e) {",
+"    try {",
+"      var f = e.target;",
+"      if (!f || !f.getAttribute) return;",
+"      var action = f.getAttribute('action') || '';",
+"      if (action) {",
+"        var mapped = mapUrl(action);",
+"        if (mapped !== action) f.setAttribute('action', mapped);",
+"      }",
+"      var target = (f.target || '').toLowerCase();",
+"      if (target === '_top' || target === '_parent' || target === '_blank') {",
+"        e.preventDefault();",
+"        var dest = f.getAttribute('action') || curUrl();",
+"        if (/^(https?:)?\\/\\//i.test(dest) && mapUrl(dest) === dest) { up({ type: 'ext', url: dest }); return; }",
+"        location.href = dest;",
+"      }",
+"    } catch (err) { /* ignore */ }",
+"  }, true);",
+"",
+"  /* ---------- service worker: never register ----------",
+"   * a SW would bypass every patch we installed.",
+"   */",
+"  try {",
+"    if (navigator.serviceWorker && navigator.serviceWorker.register) {",
+"      navigator.serviceWorker.register = function () {",
+"        return Promise.resolve({ scope: '/', active: null, installing: null, waiting: null, unregister: function () { return Promise.resolve(true); }, addEventListener: function () {}, state: 'activated' });",
+"      };",
+"    }",
+"  } catch (e) { /* ignore */ }",
+"",
+"  /* ---------- dynamic subresource rewriting ----------",
+"   * The SPA builds absolute URLs at runtime for images, scripts,",
+"   * stylesheets and downloads (e.g. https://z-cdn.chatglm.cn/\u2026).",
+"   * Those would leave the proxy and die on a network that can only",
+"   * reach the worker. Rewrite them as they are inserted \u2014 hosts that",
+"   * are not allowlisted are left untouched (they fail quietly, like",
+"   * analytics does on the real site in China).",
+"   */",
+"  var RES_ATTRS = { IMG: ['src', 'srcset'], SCRIPT: ['src'], LINK: ['href'], SOURCE: ['src', 'srcset'], AUDIO: ['src', 'poster'], VIDEO: ['src', 'poster'], IFRAME: ['src'], OBJECT: ['data'], EMBED: ['src'], IMAGE: ['href'] };",
+"  function fixEl(el) {",
+"    try {",
+"      if (!el || !el.tagName || !el.getAttribute || !el.setAttribute) return;",
+"      var attrs = RES_ATTRS[el.tagName.toUpperCase()];",
+"      if (!attrs) return;",
+"      for (var i = 0; i < attrs.length; i++) {",
+"        var a = attrs[i];",
+"        var v = el.getAttribute(a);",
+"        if (!v) continue;",
+"        var nv = mapUrl(v);",
+"        if (nv !== v) el.setAttribute(a, nv);",
+"      }",
+"    } catch (e) { /* ignore */ }",
+"  }",
+"  function scanTree(node) {",
+"    try {",
+"      if (!node || node.nodeType !== 1) return;",
+"      fixEl(node);",
+"      if (node.querySelectorAll) {",
+"        var els = node.querySelectorAll('img,script,link,source,audio,video,iframe,object,embed,image');",
+"        for (var i = 0; i < els.length; i++) fixEl(els[i]);",
+"      }",
+"    } catch (e) { /* ignore */ }",
+"  }",
+"  try {",
+"    if (window.MutationObserver && document.documentElement) {",
+"      var mo = new MutationObserver(function (muts) {",
+"        for (var i = 0; i < muts.length; i++) {",
+"          var m = muts[i];",
+"          if (m.type === 'attributes') { fixEl(m.target); continue; }",
+"          for (var j = 0; j < m.addedNodes.length; j++) scanTree(m.addedNodes[j]);",
+"        }",
+"      });",
+"      mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href', 'srcset', 'poster', 'data'] });",
+"    }",
+"  } catch (e) { /* ignore */ }",
+"",
+"  /* Detached elements bypass the observer: telemetry beacons and preload",
+"   * probes set img.src (or setAttribute) without ever entering the DOM.",
+"   * Patch the property setter and setAttribute so those URLs are mapped",
+"   * onto the worker as well. */",
+"  try {",
+"    var imgProto = window.HTMLImageElement && window.HTMLImageElement.prototype;",
+"    var srcDesc = imgProto && Object.getOwnPropertyDescriptor(imgProto, 'src');",
+"    if (srcDesc && srcDesc.set) {",
+"      Object.defineProperty(imgProto, 'src', {",
+"        get: function () { return srcDesc.get.call(this); },",
+"        set: function (v) {",
+"          try {",
+"            var mu = mapUrl(String(v));",
+"            if (mu !== String(v)) v = mu;",
+"          } catch (e) { /* ignore */ }",
+"          return srcDesc.set.call(this, v);",
+"        },",
+"        configurable: true,",
+"        enumerable: srcDesc.enumerable",
+"      });",
+"    }",
+"  } catch (e) { /* ignore */ }",
+"",
+"  try {",
+"    var _setattr = Element.prototype.setAttribute;",
+"    Element.prototype.setAttribute = function (name, value) {",
+"      try {",
+"        var n = String(name).toLowerCase();",
+"        if ((n === 'src' || n === 'href' || n === 'srcset' || n === 'poster' || n === 'data') &&",
+"            typeof value === 'string' && this && this.tagName) {",
+"          var attrs = RES_ATTRS[this.tagName.toUpperCase()];",
+"          if (attrs && attrs.indexOf(n) >= 0) {",
+"            var mu = mapUrl(value);",
+"            if (mu !== value) value = mu;",
+"          }",
+"        }",
+"      } catch (e) { /* ignore */ }",
+"      return _setattr.call(this, name, value);",
+"    };",
+"  } catch (e) { /* ignore */ }",
+"",
+"  /* ---------- analytics shims (their hosts are blocked anyway) ---------- */",
+"  window.dataLayer = window.dataLayer || [];",
+"  window.gtag = window.gtag || function () { window.dataLayer.push(arguments); };",
+"",
+"  /* ---------- localStorage fallback for browsers that block it in iframes ----------",
+"   * backed by the shell through postMessage so sessions survive reloads.",
+"   */",
+"  (function setupStorage() {",
+"    function usable(store) {",
+"      try {",
+"        var k = '__zai_probe__';",
+"        store.setItem(k, '1');",
+"        store.removeItem(k);",
+"        return true;",
+"      } catch (e) { return false; }",
+"    }",
+"    function makeShim(name) {",
+"      var mem = (name === 'localStorage') ? lsMirror : {};",
+"      return {",
+"        getItem: function (k) { return Object.prototype.hasOwnProperty.call(mem, k) ? mem[k] : null; },",
+"        setItem: function (k, v) { mem[k] = String(v); up({ type: 'ls', store: name, k: String(k), v: String(v) }); },",
+"        removeItem: function (k) { delete mem[k]; up({ type: 'ls', store: name, k: String(k), v: null }); },",
+"        clear: function () { mem = {}; up({ type: 'ls', store: name, k: '__clear__', v: null }); },",
+"        key: function (i) { return Object.keys(mem)[i] || null; }",
+"      };",
+"    }",
+"    ['localStorage', 'sessionStorage'].forEach(function (name) {",
+"      try {",
+"        if (!usable(window[name])) {",
+"          Object.defineProperty(window, name, { value: makeShim(name), configurable: true, writable: false });",
+"        }",
+"      } catch (e) { /* ignore */ }",
+"    });",
+"  })();",
+"",
+"  /* ---------- title watcher ---------- */",
+"  function watchTitle() {",
+"    try {",
+"      var t = document.querySelector('title');",
+"      if (t && window.MutationObserver) {",
+"        new MutationObserver(reportNav).observe(t, { childList: true, characterData: true, subtree: true });",
+"      }",
+"    } catch (e) { /* ignore */ }",
+"  }",
+"  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', watchTitle);",
+"  else watchTitle();",
+"",
+"  /* ---------- error forwarding (diagnostics) ---------- */",
+"  var errCount = 0;",
+"  window.addEventListener('error', function (e) {",
+"    var msg = String((e && e.message) || e).slice(0, 300);",
+"    if (errCount < 10) up({ type: 'err', msg: msg });",
+"    if (errCount < 3) pageToast('Page error: ' + msg);",
+"    errCount++;",
+"  });",
+"",
+"  /* ---------- shell commands ---------- */",
+"  window.addEventListener('message', function (e) {",
+"    try {",
+"      var d = e.data;",
+"      if (!d || d.zai !== 1 || !d.cmd) return;",
+"      if (e.origin !== 'null' && WORKER && e.origin !== WORKER) return;",
+"      switch (d.cmd) {",
+"        case 'init':",
+"          jar = Array.isArray(d.jar) ? d.jar : [];",
+"          if (d.ls) {",
+"            Object.keys(d.ls).forEach(function (k) {",
+"              if (!(k in lsMirror)) lsMirror[k] = d.ls[k];",
+"            });",
+"          }",
+"          seedDocumentCookies();",
+"          reportNav();",
+"          break;",
+"        case 'back': history.back(); break;",
+"        case 'forward': history.forward(); break;",
+"        case 'reload': location.reload(); break;",
+"        case 'navigate':",
+"          if (d.url) location.href = mapUrl(String(d.url));",
+"          break;",
+"        case 'getstate': reportNav(); break;",
+"      }",
+"    } catch (err) { /* ignore */ }",
+"  });",
+"",
+"  /* ---------- boot ---------- */",
+"  up({ type: 'hello', url: curUrl(), title: document.title || '' });",
+"  reportNav();",
+"})();",
+""
+].join("\n");
 
-function rowToJob(row) {
-  if (!row) return null;
-  let meta = {};
-  try { meta = row.meta ? JSON.parse(row.meta) : {}; } catch (_) {}
-  let req = null;
-  try { req = row.req ? JSON.parse(row.req) : null; } catch (_) {}
-  return {
-    id: row.id, kind: row.kind, status: row.status,
-    createdAt: Number(row.created_at), updatedAt: Number(row.updated_at),
-    heartbeat: Number(row.heartbeat), nextRetry: Number(row.next_retry),
-    attempts: Number(row.attempts), finish: !!Number(row.finish),
-    bytes: Number(row.bytes), contentText: row.content_text || "",
-    req, meta,
-  };
-}
-async function getJobRow(env, id) {
-  const r = await getSQL(env, `SELECT * FROM jobs WHERE id = ?`, [id]);
-  return r ? rowToJob(r) : null;
-}
-/* v8: WAIT vs WORK timing for any job, from its meta. waitedMs = how long
-   it took the model to GET IN (job created → first real content byte —
-   exactly the rate-limit queue the user waits through). While a job is
-   STILL waiting (no first byte yet, not terminal), waitedMs keeps growing
-   live (now - createdAt). workMs = first byte → terminal (or now). */
-function timingOf(job, nowMs) {
-  const now = nowMs || Date.now();
-  const meta = (job && job.meta) || {};
-  const first = Number(meta.firstByteAt) || 0;
-  const end = Number(meta.doneAt) || Number(meta.failedAt) || Number(meta.parkedAt) || 0;
-  const terminal = !!(end || ["done", "failed", "parked", "stopped"].includes(job && job.status));
-  const waited = first
-    ? Math.max(0, first - job.createdAt)
-    : (terminal ? Math.max(0, (end || now) - job.createdAt) : Math.max(0, now - job.createdAt));
-  const work = first ? Math.max(0, (end || now) - first) : 0;
-  return { waitedMs: waited, workMs: work, firstByteAt: first };
-}
-/* v8: timing + queue headers the app reads on every POST/tail connection */
-function nexusMetaHeaders(job) {
-  const t = timingOf(job);
-  return {
-    "X-Nexus-Status": String(job.status || ""),
-    "X-Nexus-Attempts": String(job.attempts || 0),
-    "X-Nexus-Age": String(Math.max(0, Date.now() - job.createdAt)),
-    "X-Nexus-Waited": String(t.waitedMs),
-    "X-Nexus-Work": String(t.workMs),
-  };
-}
+/* ============================================================ */
 
-/* lock-guarded write — fails (returns 0) once another driver took over */
-async function lockWrite(env, id, token, fields) {
-  const keys = Object.keys(fields);
-  if (!keys.length) return 1;
-  const sets = keys.map(k => k + " = ?").join(", ");
-  const params = keys.map(k => fields[k]);
-  params.push(id, token);
-  const sql = `UPDATE jobs SET ` + sets + ` WHERE id = ? AND lock_token = ?`;
+addEventListener('fetch', (event) => {
+  event.respondWith(handle(event.request, event));
+});
+
+async function handle(req, event) {
   try {
-    const r = await runSQL(env, sql, params);
-    return r && r.meta && Number(r.meta.changes) || 0;
-  } catch (_) { return 0; }
-}
+    const url = new URL(req.url);
+    const method = req.method.toUpperCase();
 
-/* v5: the pump heartbeat period — the liveness clock. A live pump's D1
-   heartbeat is never older than ~1 beat: the interval beats through
-   backoff sleeps and slow first tokens, and every flush refreshes it.
-   The beat rate is tied to the staleness threshold (STALE_LOCK/3, min
-   250ms) so a live pump is NEVER stealable mid-run. (v4's fixed 2s beat
-   lagged tuned staleness windows — the cron stole live jobs and the
-   loser's liveAbort then killed the winner's shared abort handle →
-   endless re-generation churn.) */
-function heartPeriodMs() {
-  return Math.max(250, Math.min(Math.floor(FLUSH_MS / 2), Math.floor(STALE_LOCK_MS / 3)));
-}
-
-/* the atomic claim — the heart of "no double generation" */
-async function claimJob(env, id) {
-  const token = crypto.randomUUID();
-  const now = Date.now();
-  const r = await runSQL(env,
-    `UPDATE jobs SET status = 'streaming', lock_token = ?, heartbeat = ?, updated_at = ? WHERE id = ? AND status IN ('queued','streaming') AND heartbeat < ? AND next_retry <= ?`,
-    [token, now, now, id, now - STALE_LOCK_MS, now]);
-  const changes = r && r.meta && Number(r.meta.changes) || 0;
-  return changes === 1 ? token : null;
-}
-
-async function deleteJobRows(env, id) {
-  await runSQL(env, `DELETE FROM chunks WHERE job = ?`, [id]);
-  await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
-  await runSQL(env, `DELETE FROM jobs WHERE id = ?`, [id]);
-}
-
-/* =====================================================================
-   SSE parser — stateless construction, so ANY event context can rebuild
-   the full job state by replaying the D1 chunk log (byte-exact).
-   ===================================================================== */
-function makeParser() {
-  return {
-    dec: new TextDecoder(),
-    pending: "",
-    chunkStartByte: 0,
-    contentText: "",
-    eventIndex: [],        // [{c: contentLen, b: byteOffAfterLine}]
-    sawToolCalls: false,
-    sawReasoning: false,    // v5: reasoning deltas are real data (the app accumulates them)
-    finishSeen: false,
-    feed(u8) {
-      const text = this.dec.decode(u8, { stream: true });
-      const nl = [];
-      for (let i = 0; i < u8.length; i++) if (u8[i] === 0x0A) nl.push(i);
-      const lines = text.split("\n"); // lines.length === nl.length + 1
-      let line = this.pending + lines[0];
-      for (let i = 0; i < nl.length; i++) {
-        const lineEndByte = this.chunkStartByte + nl[i] + 1;
-        this.line(line, lineEndByte);
-        line = lines[i + 1];
-      }
-      this.pending = line;
-      this.chunkStartByte += u8.length;
-    },
-    line(line, lineEndByte) {
-      if (!line) return;
-      const s = line.endsWith("\r") ? line.slice(0, -1) : line;
-      if (!s.startsWith("data:")) return;
-      const raw = s.slice(5).trim();
-      if (!raw) return;
-      if (raw === "[DONE]") { this.finishSeen = true; return; }
-      let obj = null;
-      try { obj = JSON.parse(raw); } catch (_) { return; }
-      const ch = obj && obj.choices && obj.choices[0];
-      if (ch && ch.finish_reason) this.finishSeen = true;
-      const d = ch && ch.delta;
-      if (d) {
-        if (typeof d.content === "string" && d.content.length) this.contentText += d.content;
-        if (typeof d.reasoning === "string" && d.reasoning.length) this.sawReasoning = true;
-        if (typeof d.reasoning_content === "string" && d.reasoning_content.length) this.sawReasoning = true;
-        if (Array.isArray(d.tool_calls) && d.tool_calls.length) this.sawToolCalls = true;
-      }
-      this.eventIndex.push({ c: this.contentText.length, b: lineEndByte });
-    },
-    /* claim-time: the buffer may end mid-line. If that trailing line is a
-       COMPLETE JSON event (the pump died right before its newline),
-       count it — the app-side parser does exactly that when its stream
-       ends. Both sides then agree on the partial text. */
-    flushPending() {
-      if (!this.pending) return;
-      const s = this.pending.endsWith("\r") ? this.pending.slice(0, -1) : this.pending;
-      this.pending = "";
-      if (!s.startsWith("data:")) return;
-      const raw = s.slice(5).trim();
-      if (!raw) return;
-      this.line("data: " + raw, this.chunkStartByte);
-    },
-    boundaryFor(contentLen) {
-      if (contentLen <= 0) return 0;
-      const idx = this.eventIndex;
-      for (let i = idx.length - 1; i >= 0; i--) if (idx[i].c === contentLen) return idx[i].b;
-      return -1;
-    },
-    totalBytes() { return this.chunkStartByte; },
-  };
-}
-
-/* rebuild a job's byte buffer from the D1 chunk log (byte-exact) */
-async function readAllChunkBytes(env, id) {
-  const rows = await allSQL(env, `SELECT data FROM chunks WHERE job = ? ORDER BY seq ASC`, [id]);
-  const enc = new TextEncoder();
-  const parts = [];
-  let total = 0;
-  for (const r of rows) { const u8 = enc.encode(r.data); parts.push(u8); total += u8.length; }
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) { out.set(p, off); off += p.length; }
-  return out;
-}
-
-/* =====================================================================
-   Live registry — in-isolate fan-out for the client that is watching
-   right now (zero D1 latency), plus the abort handle used by DELETE
-   and by the local harness to simulate Cloudflare's context teardown.
-   ===================================================================== */
-const liveMap = globalThis.__nexusLive || (globalThis.__nexusLive = new Map());
-function liveFor(id) {
-  let l = liveMap.get(id);
-  if (!l) {
-    l = { id, subs: new Set(), chunks: [], total: 0, done: false, hasPump: false, abortCtl: null };
-    liveMap.set(id, l);
-  }
-  return l;
-}
-function livePush(live, u8) {
-  if (live.total + u8.length <= MAX_JOB_BYTES) {
-    live.chunks.push(u8);
-    live.total += u8.length;
-  }
-  for (const c of [...live.subs]) {
-    try { c.enqueue(u8); } catch (_) { live.subs.delete(c); }
-  }
-}
-function liveClose(live) {
-  live.done = true;
-  for (const c of [...live.subs]) { try { c.close(); } catch (_) {} }
-  live.subs.clear();
-}
-/* simulate the runtime killing the pump: subscribers are closed, the D1
-   job is left stale (heartbeat frozen) so the next driver claims it */
-function liveAbort(live) {
-  try { live.abortCtl && live.abortCtl.abort(); } catch (_) {}
-  for (const c of [...live.subs]) { try { c.close(); } catch (_) {} }
-  live.subs.clear();
-  live.hasPump = false;
-}
-function bufferedFromLive(live, offset) {
-  if (offset >= live.total) return new Uint8Array(0);
-  const out = new Uint8Array(live.total - offset);
-  let pos = 0, written = 0;
-  for (const c of live.chunks) {
-    if (pos + c.length <= offset) { pos += c.length; continue; }
-    const skip = Math.max(0, offset - pos);
-    out.set(c.subarray(skip), written);
-    written += c.length - skip;
-    pos += c.length;
-  }
-  return out;
-}
-function liveSubscriber(live, startOffset) {
-  let ctl = null;
-  return new ReadableStream({
-    start(controller) {
-      ctl = controller;
-      const buffered = bufferedFromLive(live, startOffset);
-      if (buffered.length) { try { controller.enqueue(buffered); } catch (_) {} }
-      if (live.done) { try { controller.close(); } catch (_) {} return; }
-      live.subs.add(controller);
-    },
-    cancel() { live.subs.delete(ctl); }, // client left — the job keeps going in D1
-  });
-}
-
-/* =====================================================================
-   THE PUMP — one discrete attempt loop for one job.
-   Runs inside whatever event claimed the job (POST /chat, a reconnect
-   piggyback, or the cron tick). Every byte fans out to live subscribers
-   AND flushes to D1, so the next driver can always pick up exactly
-   where this one died.
-   ===================================================================== */
-async function driveJob(env, ctx, jobId, opts = {}) {
-  if (!hasDB(env)) return;
-  const live = liveFor(jobId);
-  const token = await claimJob(env, jobId);
-  if (!token) return; // another driver owns it — that's the whole race safety
-  live.hasPump = true;
-  if (opts.cron) live.__cron = true; // v5: cron-driven pumps are exempt from request-context teardown models
-  live.abortCtl = new AbortController();
-  const signal = live.abortCtl.signal;
-  try {
-    await pumpLoop(env, jobId, token, live, signal, opts);
-  } catch (_) { /* a dead pump must never throw into the event */ }
-  finally {
-    if (live.abortCtl && live.abortCtl.signal === signal) live.hasPump = false;
-  }
-}
-
-async function pumpLoop(env, jobId, token, live, signal, opts) {
-  let job = await getJobRow(env, jobId);
-  if (!job) return;
-
-  /* ---- rebuild parse state (byte-exact) ---- */
-  const parser = makeParser();
-  if (live.total >= job.bytes && (live.chunks.length || job.bytes === 0)) {
-    /* this isolate already saw every flushed byte (and maybe more) —
-       the in-memory log is a superset of D1 */
-    for (const c of live.chunks) parser.feed(c);
-    parser.flushPending();
-  } else {
-    const all = await readAllChunkBytes(env, jobId);
-    parser.feed(all);
-    parser.flushPending();
-  }
-  if (parser.finishSeen || job.finish) { await finalizeDone(env, jobId, token, live); return; }
-
-  let totalBytes = Math.max(parser.totalBytes(), 0);
-  let attempts = job.attempts;      // total across all drivers (persisted)
-  let inlineAttempts = 0;           // attempts driven by THIS event
-  const maxInline = opts.maxAttempts || 4;
-  const deadline = Date.now() + (opts.budgetMs || EVENT_BUDGET_MS);
-  let firstUpstream = opts.firstUpstream || null;
-
-  let seq = 0;
-  {
-    const r = await getSQL(env, `SELECT COALESCE(MAX(seq), -1) AS mx FROM chunks WHERE job = ?`, [jobId]);
-    seq = r ? Number(r.mx) + 1 : 0;
-  }
-
-  const flushDec = new TextDecoder();
-  let pendingFlush = "";
-  let pendingBytes = 0;
-  let lastFlushAt = Date.now();
-  let separatorNeeded = totalBytes > 0; // a continuation must start line-aligned
-  let lastByte = 0x0A;
-  { // probe the true last byte of the current buffer
-    if (live.chunks.length) {
-      const last = live.chunks[live.chunks.length - 1];
-      lastByte = last[last.length - 1];
-    } else if (totalBytes > 0) {
-      const all = await readAllChunkBytes(env, jobId);
-      if (all.length) lastByte = all[all.length - 1];
+    /* ---- CORS preflight ---- */
+    if (method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: corsHeaders(req, new Headers()) });
     }
-  }
 
-  const flush = async () => {
-    if (!pendingFlush) return true;
-    const text = pendingFlush;
-    pendingFlush = ""; pendingBytes = 0;
-    const byteLen = new TextEncoder().encode(text).length;
-    try {
-      await runSQL(env, `INSERT INTO chunks (job, seq, bytes, data) VALUES (?, ?, ?, ?)`, [jobId, seq, byteLen, text]);
-      seq++;
-      const w = await lockWrite(env, jobId, token, {
-        bytes: totalBytes, content_text: parser.contentText,
-        finish: parser.finishSeen ? 1 : 0,
-        heartbeat: Date.now(), updated_at: Date.now(),
+    /* ---- public endpoints ---- */
+    if (url.pathname === '/__status') {
+      const env = envOf(event);
+      const token = env.PROXY_TOKEN || '';
+      let tokenOk = null;
+      if (token) {
+        const supplied = url.searchParams.has('__t') || req.headers.get('x-proxy-token') != null;
+        if (supplied) tokenOk = (url.searchParams.get('__t') === token || req.headers.get('x-proxy-token') === token);
+      }
+      return json({ ok: true, name: VERSION, time: new Date().toISOString(), token_required: !!token, token_ok: tokenOk }, req);
+    }
+
+    /* ---- live upstream probe report (v3) ----
+     * Public like /__status: no secrets, and it must stay reachable
+     * in every cookie/token state — when the app "opens straight to
+     * a blocked page", this page tells the user WHY. */
+    if (url.pathname === '/__diag') {
+      return diagPage(req, event);
+    }
+    /* ---- app entry: "/" IS the app ----
+     * With a token required and not yet satisfied, / shows the setup
+     * page; otherwise it falls through and is proxied like any path. */
+    if (url.pathname === '/') {
+      const env = envOf(event);
+      const token = env.PROXY_TOKEN || '';
+      if (token && !(await checkToken(req, url, token))) {
+        /* a token was submitted but wrong → show the hint; fresh visit → plain form */
+        return landing(event, url.searchParams.has('__t'));
+      }
+    }
+
+    /* ---- token gate ---- */
+    const env = envOf(event);
+    const token = env.PROXY_TOKEN || '';
+    if (token && !(await checkToken(req, url, token))) {
+      const accept = req.headers.get('accept') || '';
+      if (method === 'GET' && accept.includes('text/html')) {
+        /* a human navigation with a wrong/missing token → the setup page */
+        return landing(event, true);
+      }
+      return json({ error: 'unauthorized', hint: 'set X-Proxy-Token header or __t query param' }, req, 401);
+    }
+
+    /* ---- token was supplied in the query: remember it, clean the URL ---- */
+    if (token && url.searchParams.has('__t')) {
+      const clean = new URL(req.url);
+      clean.searchParams.delete('__t');
+      const h = new Headers({ location: clean.pathname + (clean.search || ''), 'cache-control': 'no-store' });
+      h.append('set-cookie', tokenCookie(token));
+      return new Response(null, { status: 302, headers: corsHeaders(req, h) });
+    }
+
+    /* ---- session cookie clear ---- */
+    if (url.pathname === '/__clear') {
+      const h = new Headers({ location: '/', 'cache-control': 'no-store' });
+      /* expire every cookie the browser sent, plus the token cookie */
+      const ck = req.headers.get('cookie') || '';
+      const seen = new Set(['__zai_t']);
+      ck.split(';').forEach((kv) => {
+        const n = kv.split('=')[0].trim();
+        if (n) seen.add(n);
       });
-      if (w !== 1) return false; // lock lost — another driver took over
-    } catch (_) { return !signal.aborted; }
-    lastFlushAt = Date.now();
-    return true;
-  };
-
-  /* v5 — HONEST PROGRESS BYTES. Retry/deferral notices are SSE comments
-     (`: nexus ...`). They are REAL buffer bytes: livePush'd to attached
-     subscribers, parser-fed (skipped — only `data:` lines matter), and
-     flushed to D1 so every later driver/tail replays them byte-exactly. The
-     app counts them in its byte offset (kept consistent on both sides) but
-     its SSE parser skips comment lines — and its stall watchdog gets fed,
-     so a client watching a retry storm sees a live stream, never a silent
-     60-second freeze. NEVER injected into images bodies (pure JSON). */
-  const emitRaw = (text, immediate) => {
-    if (!text || totalBytes > MAX_JOB_BYTES) return true;
-    const pre = lastByte === 0x0A ? "" : "\n\n"; // line-align before appending
-    const full = pre + text;
-    const u8 = new TextEncoder().encode(full);
-    livePush(live, u8);
-    parser.feed(u8);
-    pendingFlush += full;
-    pendingBytes += u8.length;
-    totalBytes += u8.length;
-    lastByte = 0x0A;
-    if (immediate) return flush();
-    return true;
-  };
-  /* v8: STRUCTURED notices — `: nexus-notice {json} — human text`.
-     The app parses the JSON (kind/attempt/max/etaMs/waitedMs/reason) and
-     shows "waiting in line, attempt N, waited Xs" + the wait/work timers;
-     older apps and generic SSE readers just skip the comment. Still REAL
-     buffer bytes: livePush'd, parser-fed (skipped), D1-flushed — the
-     byte-offset math on both sides stays exact. */
-  const emitNotice = (kind, data, human) => {
-    let j = "";
-    try { j = JSON.stringify({ kind, ...data }); } catch (_) { j = "{\"kind\":\"" + kind + "\"}"; }
-    return emitRaw(": nexus-notice " + j + (human ? " — " + human : "") + "\n\n", true);
-  };
-  const emitNote = (text, immediate) => emitRaw(": nexus " + text + "\n\n", immediate);
-  /* v8: the moment the model actually GETS IN — first real content byte
-     (content / reasoning / tool delta, NOT comments). Stamps firstByteAt
-     into the job meta once; every wait/work number derives from it. */
-  let firstByteAt = Number(job.meta && job.meta.firstByteAt) || 0;
-  const checkFirstByte = () => {
-    if (firstByteAt || signal.aborted) return;
-    if (parser.contentText.length || parser.sawReasoning || parser.sawToolCalls) {
-      firstByteAt = Date.now();
-      try { stampMeta(env, jobId, token, { firstByteAt }); } catch (_) {}
+      seen.forEach((n) => h.append('set-cookie', n + '=; Path=/; Max-Age=0; Secure; SameSite=None; Partitioned'));
+      return new Response(null, { status: 302, headers: corsHeaders(req, h) });
     }
-  };
-  const waitedSoFar = () => Math.max(0, (firstByteAt || Date.now()) - job.createdAt);
 
-  /* heartbeat while a slow first token takes its time — keeps other
-     drivers from falsely claiming an alive-but-quiet pump.
-     v5: the beat rate is tied to the staleness threshold (STALE_LOCK/3,
-     min 250ms) so a live pump is NEVER stealable, even mid-backoff-sleep
-     or during a slow first token. (v4's fixed 2s beat lagged tuned
-     staleness windows — the cron stole live jobs and the loser's
-     liveAbort then killed the winner's shared abort handle → churn.) */
-  const heart = setInterval(() => {
-    if (signal.aborted) return;
-    lockWrite(env, jobId, token, { heartbeat: Date.now(), updated_at: Date.now() }).catch(() => {});
-  }, heartPeriodMs());
-
-  let gaveUp = false;
-  try {
-    while (true) {
-      if (signal.aborted) return; // killed like the runtime would — leave D1 stale on purpose
-      if (Date.now() > deadline) { gaveUp = true; break; }
-
-      /* park: tool-call cuts are never continued server-side (app protocol).
-         images never continue either — they re-issue from zero or park.
-         v8: a park NOTICE goes into the buffer first, so a client that
-         reconnects later learns WHY the stream ended (the app finishes
-         the tool call itself and keeps going). */
-      if (parser.sawToolCalls && !parser.finishSeen) {
-        if (job.kind === "chat") { try { await emitNotice("park", { waitedMs: waitedSoFar() }, "a tool call was cut — parked for the app to finish it"); } catch (_) {} }
-        await parkJob(env, jobId, token); liveClose(live); return;
-      }
-      if (job.kind !== "chat" && totalBytes > 0 && !parser.finishSeen) { await parkJob(env, jobId, token); liveClose(live); return; }
-      if (attempts >= MAX_ATTEMPTS) { await failJob(env, jobId, token, "retry budget used up"); liveClose(live); return; }
-
-      /* ---- build the upstream request ---- */
-      /* v5: continuation vs plain re-issue is decided by REAL DATA, not
-         bytes — a job whose buffer holds only retry comments must re-issue
-         the original prompt, not "continue" from an empty partial.
-         Reasoning deltas count as data: the app accumulates them, and a
-         continuation with a partial that has only reasoning is exactly
-         what the app itself sends in the same situation. */
-      const hasContent = job.kind === "chat"
-        ? (parser.contentText.length > 0 || parser.sawToolCalls || parser.sawReasoning)
-        : totalBytes > 0;
-      let body;
-      if (!hasContent) body = job.req; // plain re-issue
-      else body = {
-        ...job.req,
-        messages: (job.req.messages || []).concat([
-          { role: "assistant", content: parser.contentText },
-          { role: "user", content: CONTINUE_INSTRUCTION },
-        ]),
-        stream: true,
-      };
-
-      const authRow = await getSQL(env, `SELECT auth FROM secrets WHERE job = ?`, [jobId]);
-      const fwd = Object.assign({}, job.meta.fwd || {});
-      if (authRow && authRow.auth) fwd.authorization = authRow.auth;
-
-      const ac = new AbortController();
-      const onOuterAbort = () => { try { ac.abort(); } catch (_) {} };
-      signal.addEventListener("abort", onOuterAbort, { once: true });
-      let lastBeat = Date.now();
-      const wd = setInterval(() => { if (Date.now() - lastBeat > UPSTREAM_STALL_MS) { try { ac.abort(); } catch (_) {} } }, 5000);
-
-      let upstream = null, upstreamErr = null;
-      if (firstUpstream) { upstream = firstUpstream; firstUpstream = null; }
-      else {
-        try {
-          upstream = await fetch(upstreamBase(env) + (job.kind === "chat" ? "/chat/completions" : "/images"), {
-            method: "POST",
-            headers: headersFrom(fwd),
-            body: JSON.stringify(body),
-            signal: ac.signal,
-            // @ts-ignore runtime-specific
-            cf: { cacheTtl: 0 },
-          });
-        } catch (err) { upstreamErr = err; }
-      }
-
-      if (!upstreamErr && upstream && upstream.ok && upstream.body) {
-        /* ---- stream it: fan out + parse + flush ---- */
-        const reader = upstream.body.getReader();
-        let firstChunk = true;
-        let naturalEnd = false;
-        try {
-          while (true) {
-            const res = await reader.read();
-            if (signal.aborted) { try { reader.cancel(); } catch (_) {} return; }
-            if (res.done) { naturalEnd = true; break; }
-            const value = res.value;
-            if (value && value.length) {
-              lastBeat = Date.now();
-              if (firstChunk && separatorNeeded) {
-                if (lastByte !== 0x0A) {
-                  const sep = new Uint8Array([0x0A, 0x0A]); // line-align before a continuation
-                  livePush(live, sep);
-                  parser.feed(sep);
-                  pendingFlush += "\n\n"; pendingBytes += 2;
-                  totalBytes += 2;
-                  lastByte = 0x0A;
-                }
-                separatorNeeded = false;
-              }
-              firstChunk = false;
-              livePush(live, value);
-              parser.feed(value);
-              checkFirstByte();
-              totalBytes += value.length;
-              if (totalBytes <= MAX_JOB_BYTES) {
-                pendingFlush += flushDec.decode(value, { stream: true });
-                pendingBytes += value.length;
-              }
-              lastByte = value[value.length - 1];
-              if ((Date.now() - lastFlushAt > FLUSH_MS || pendingBytes > FLUSH_BYTES) && totalBytes <= MAX_JOB_BYTES) {
-                /* v5: lock lost = another driver owns this job now — stop
-                   SILENTLY. Never liveAbort here: live/abortCtl are SHARED
-                   with the new owner (same isolate) — aborting them kills
-                   the rightful pump and the client's stream with it. */
-                if (!(await flush())) { try { reader.cancel(); } catch (_) {} clearInterval(wd); signal.removeEventListener("abort", onOuterAbort); return; }
-              }
-            }
-          }
-          const tailText = flushDec.decode();
-          if (tailText) { pendingFlush += tailText; }
-        } catch (_) { /* aborted or the socket died mid-stream → truncated */ }
-        clearInterval(wd);
-        signal.removeEventListener("abort", onOuterAbort);
-        /* v5: lock lost → the new owner streams on; stop silently */
-        if (!(await flush())) { try { reader.cancel(); } catch (_) {} return; }
-        if (parser.finishSeen) { await finalizeDone(env, jobId, token, live); return; }
-        if (naturalEnd && job.kind !== "chat") { await finalizeDone(env, jobId, token, live); return; } // images: full body = done
-        if (signal.aborted) return;
-        /* truncated → persist the attempt count and try again inline
-           (the lock is NOT released: fresh heartbeats prove we're alive,
-           so no other driver can steal the job mid-run) */
-        attempts++; inlineAttempts++;
-        try { await lockWrite(env, jobId, token, { attempts, updated_at: Date.now() }); } catch (_) {}
-        if (job.kind === "chat") {
-          try { await emitNotice("cont", { attempt: attempts + 1, max: MAX_ATTEMPTS, waitedMs: waitedSoFar() }, "answer was truncated — seamlessly continuing (attempt " + (attempts + 1) + "/" + MAX_ATTEMPTS + ")"); } catch (_) {}
-        }
-        if (inlineAttempts >= maxInline) { gaveUp = true; break; }
-        await sleep(backoffFor(attempts));
-        separatorNeeded = totalBytes > 0;
-        continue;
-      }
-
-      clearInterval(wd);
-      signal.removeEventListener("abort", onOuterAbort);
-      /* ---- the attempt failed to start / was refused ---- */
-      let status = 0, message = "network error";
-      if (upstream) {
-        status = upstream.status;
-        try { const t = await upstream.text(); message = String(t).slice(0, 400); } catch (_) {}
-      } else if (upstreamErr) message = String((upstreamErr && upstreamErr.message) || upstreamErr);
-
-      const fatal = [400, 401, 403, 404, 422].includes(status);
-      /* "real data" = content the app can keep and continue from — retry
-         comments are bytes but NOT data, so they must never reroute a
-         fatal error into the park path (that was the v5.0 bug: a 429
-         comment made totalBytes > 0, so a 401 got parked silently). */
-      const hasRealData = job.kind === "chat"
-        ? (parser.contentText.length > 0 || parser.sawToolCalls)
-        : totalBytes > 0;
-      if (fatal && !hasRealData) {
-        /* v5: the provider's error becomes REAL buffer bytes (an SSE error
-           event / error JSON), so live subscribers AND every reconnecting
-           tail replay it — the app then surfaces the actual provider error
-           ("Your API key is invalid", 401, …) instead of a cryptic
-           "(status 0)". failJob below just flips the row to failed. */
-        let clean = String(message).slice(0, 400);
-        try { const o = JSON.parse(message); if (o && o.error && o.error.message) clean = String(o.error.message).slice(0, 400); } catch (_) {}
-        if (job.kind === "images") {
-          try { await emitRaw(JSON.stringify({ error: { message: clean, code: status } }), true); } catch (_) {}
-        } else {
-          try { await emitRaw("data: " + JSON.stringify({ error: { message: clean, code: status } }) + "\n\n", true); } catch (_) {}
-        }
-        await failJob(env, jobId, token, "upstream " + status + ": " + clean, { live });
-        return;
-      }
-      if (fatal) { await parkJob(env, jobId, token); liveClose(live); return; }
-      /* retryable: 429 / 408 / 5xx / network — re-request until it gets in.
-         v5: OpenRouter 429s carry retry_after — honor it (capped) so the
-         re-request cadence is exactly as fast as the provider asks for. */
-      attempts++; inlineAttempts++;
-      try { await lockWrite(env, jobId, token, { attempts, updated_at: Date.now() }); } catch (_) {}
-      let waitMs = backoffFor(attempts);
-      let raSec = 0;
-      try { const o = JSON.parse(message); raSec = Number((o && o.error && o.error.metadata && o.error.metadata.retry_after_seconds) || 0) || 0; } catch (_) {}
-      if (!raSec && upstream && upstream.headers) {
-        const h = Number(upstream.headers.get("retry-after") || 0) || 0;
-        if (h > 0) raSec = h;
-      }
-      if (status === 429 && raSec > 0) waitMs = Math.min(Math.max(raSec * 1000, 500), 30000);
-      if (job.kind === "chat") {
-        const why = upstream ? ("upstream " + status) : "upstream unreachable";
-        const reason = status === 429 ? "rate limited (waiting in line)" : (upstream ? ("upstream " + status) : "upstream unreachable");
-        try { await emitNotice("wait", { attempt: attempts + 1, max: MAX_ATTEMPTS, etaMs: Math.round(waitMs), waitedMs: waitedSoFar(), reason }, why + " — re-requesting until it gets in (attempt " + (attempts + 1) + "/" + MAX_ATTEMPTS + ") in ~" + Math.max(1, Math.round(waitMs / 1000)) + "s"); } catch (_) {}
-      }
-      if (inlineAttempts >= maxInline) { gaveUp = true; break; }
-      await sleep(waitMs);
+    /* ---- websocket upgrade ---- */
+    if (req.headers.get('upgrade') === 'websocket') {
+      return proxyWebsocket(req, url, event);
     }
-  } finally {
-    clearInterval(heart);
-    try { await flush(); } catch (_) {}
-    if (gaveUp) {
-      /* release for the next driver (cron / piggyback / app reconnect).
-         v5: emit an HONEST error event as real buffer bytes — the watching
-         client and every reconnecting tail see exactly what happened
-         ("provider still busy after N attempts — retrying continues in
-         the background"), then close cleanly. A silent zero-byte close
-         here is what produced the app's "(status 0)" dead end. */
-      const clean = "the provider is still busy after " + attempts + " attempts — the worker keeps retrying in the background; reopen the chat later for the answer";
-      try {
-        if (job.kind === "images") await emitRaw(JSON.stringify({ error: { message: clean, code: 429 } }), true);
-        else await emitRaw("data: " + JSON.stringify({ error: { message: clean, code: 429 } }) + "\n\n", true);
-      } catch (_) {}
-      await releaseJob(env, jobId, token, attempts);
-      liveClose(live);
-    }
-  }
-}
 
-async function releaseJob(env, id, token, attempts) {
-  const now = Date.now();
-  try {
-    await lockWrite(env, id, token, {
-      heartbeat: 0, next_retry: now + backoffFor(attempts), attempts, updated_at: now, lock_token: null,
-    });
-  } catch (_) {}
-}
-/* v6: terminal transitions stamp TIMING into the job's meta — startedAt /
-   doneAt / durationMs survive in D1 so "how long did this request work for"
-   is answerable server-side too (visible via /health's jobs list). */
-async function stampMeta(env, id, token, extra) {
-  try {
-    const row = await getJobRow(env, id);
-    if (!row) return;
-    const meta = Object.assign({}, row.meta || {}, extra);
-    await lockWrite(env, id, token, { meta: JSON.stringify(meta) });
-  } catch (_) {}
-}
-async function finalizeDone(env, id, token, live) {
-  const now = Date.now();
-  try {
-    const row = await getJobRow(env, id);
-    const startedAt = row?.createdAt || now;
-    /* v8: final WAIT/WORK split — "waited X to get in, worked Y on the
-       answer" is now permanently SAVED on the job (and shown in /health). */
-    const t = row ? timingOf(row, now) : { waitedMs: 0, workMs: 0 };
-    await stampMeta(env, id, token, { doneAt: now, durationMs: Math.max(0, now - startedAt), waitedMs: t.waitedMs, workMs: t.firstByteAt ? Math.max(0, now - t.firstByteAt) : 0, outcome: "done" });
-    await lockWrite(env, id, token, { status: "done", finish: 1, heartbeat: 0, updated_at: now, lock_token: null });
-    await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
-  } catch (_) {}
-  liveClose(live);
-}
-async function parkJob(env, id, token) {
-  const now = Date.now();
-  try {
-    const row = await getJobRow(env, id);
-    const startedAt = row?.createdAt || now;
-    const t = row ? timingOf(row, now) : { waitedMs: 0, workMs: 0, firstByteAt: 0 };
-    await stampMeta(env, id, token, { parkedAt: now, durationMs: Math.max(0, now - startedAt), waitedMs: t.waitedMs, workMs: t.firstByteAt ? Math.max(0, now - t.firstByteAt) : 0, outcome: "parked" });
-    await lockWrite(env, id, token, { status: "parked", heartbeat: 0, updated_at: now, lock_token: null });
-    await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
-  } catch (_) {}
-}
-async function failJob(env, id, token, reason, o = {}) {
-  const now = Date.now();
-  try {
-    const row = await getJobRow(env, id);
-    const startedAt = row?.createdAt || now;
-    const t = row ? timingOf(row, now) : { waitedMs: 0, workMs: 0, firstByteAt: 0 };
-    await stampMeta(env, id, token, { failedAt: now, durationMs: Math.max(0, now - startedAt), waitedMs: t.waitedMs, workMs: t.firstByteAt ? Math.max(0, now - t.firstByteAt) : 0, outcome: "failed", reason: String(reason || "").slice(0, 300) });
-    await lockWrite(env, id, token, { status: "failed", heartbeat: 0, updated_at: now, lock_token: null });
-    await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
-  } catch (_) {}
-  /* v5: the error payload itself is already in the job buffer (emitRaw'd
-     by the pump), so every subscriber and reconnecting tail replays it —
-     just close the live stream now. */
-  if (o.live) liveClose(o.live);
-}
+    /* ---- route resolution ---- */
+    let pfx = '';       // proxy prefix for this document ('' = transparent)
+    let upstream = null; // absolute upstream URL
+    let host = null;     // upstream host
 
-/* =====================================================================
-   ATTACH: the app's continue request meets a job we already hold
-   ===================================================================== */
-async function matchContinueJob(env, parsed) {
-  const msgs = parsed && parsed.messages;
-  if (!Array.isArray(msgs) || msgs.length < 3) return null;
-  const last = msgs[msgs.length - 1];
-  if (!last || last.role !== "user" || last.content !== CONTINUE_INSTRUCTION) return null;
-  const prev = msgs[msgs.length - 2];
-  if (!prev || prev.role !== "assistant" || typeof prev.content !== "string") return null;
-  const prefixKey = JSON.stringify(msgs.slice(0, -2));
-  const partial = prev.content;
-  const now = Date.now();
-  const rows = await allSQL(env,
-    `SELECT id, req, content_text FROM jobs WHERE kind = 'chat' AND status IN ('queued','streaming','done') AND updated_at > ? ORDER BY updated_at DESC LIMIT 12`,
-    [now - JOB_TTL_MS]);
-  let best = null, bestLen = -1;
-  const superseded = [];
-  for (const r of rows) {
-    let req = null;
-    try { req = JSON.parse(r.req); } catch (_) { continue; }
-    if (!req || !Array.isArray(req.messages)) continue;
-    if (JSON.stringify(req.messages) !== prefixKey) continue;
-    const ct = r.content_text || "";
-    if (!ct.startsWith(partial)) { superseded.push(r.id); continue; } // the app is ahead — retire it
-    if (ct.length > bestLen) { best = r; bestLen = ct.length; }
-  }
-  for (const id of superseded) {
-    try { await runSQL(env, `UPDATE jobs SET status = 'stopped', heartbeat = 0, updated_at = ? WHERE id = ? AND status IN ('queued','streaming')`, [now, id]); } catch (_) {}
-  }
-  if (!best) return null;
-  /* exact byte boundary for the app's partial (replay-parse the job) */
-  const all = await readAllChunkBytes(env, best.id);
-  const parser = makeParser();
-  parser.feed(all);
-  parser.flushPending();
-  const boundary = parser.boundaryFor(partial.length);
-  if (boundary < 0) return null;
-  return { id: best.id, boundary };
-}
-
-/* =====================================================================
-   TAIL: replay a job from byte N, then follow live progress (D1 poll).
-   NEVER inject heartbeat bytes — the app's byte-offset math counts every
-   byte we send, so the body must be pure buffer bytes.
-   ===================================================================== */
-function tailStream(env, ctx, jobId, startOffset) {
-  const enc = new TextEncoder();
-  let closed = false;
-  /* v5: a connected tail is a WATCHER of the job — it registers in the live
-     registry so liveness models (and any same-isolate pump driving this
-     job) know a client is attached. Harmless in production (a counter). */
-  const live = liveFor(jobId);
-  live.__watchers = (live.__watchers || 0) + 1;
-  return new ReadableStream({
-    start(controller) {
-      const unwatch = () => { live.__watchers = Math.max(0, (live.__watchers || 1) - 1); };
-      const push = u8 => { if (!closed) { try { controller.enqueue(u8); } catch (_) { closed = true; } } };
-      const close = () => { if (!closed) { closed = true; unwatch(); try { controller.close(); } catch (_) {} } };
-      /* v5: an internal tail failure (D1 hiccup etc.) must ERROR the stream,
-         never close it — a clean close at incomplete data reads as "response
-         ended" and dead-ends the app at "(status 0)"; an error makes the
-         app reconnect, which is exactly what a transient D1 blip needs. */
-      const fail = () => { if (!closed) { closed = true; unwatch(); try { controller.error(new Error("nexus tail: transient failure — reconnect")); } catch (_) {} } };
-      (async () => {
-        let pos = 0;           // cumulative byte position of the chunk cursor
-        let sent = startOffset; // the next byte the client needs
-        let lastSeq = -1;
-        let lastKick = 0;
-        let idlePolls = 0;
-        let lastTotal = -1;
-        const deliver = u8 => {
-          /* contiguous delivery: a chunk may start BEFORE the client's
-             offset (its tail was already seen live before the flush
-             landed) — skip exactly that part, never duplicate */
-          const skip = Math.max(0, sent - pos);
-          if (skip < u8.length) push(u8.subarray(skip));
-          pos += u8.length;
-          sent = Math.max(sent, pos);
-        };
-        try {
-          /* ---- replay phase ---- */
-          const rows = await allSQL(env, `SELECT seq, bytes, data FROM chunks WHERE job = ? ORDER BY seq ASC`, [jobId]);
-          for (const r of rows) {
-            deliver(enc.encode(r.data));
-            lastSeq = Number(r.seq);
-          }
-          /* ---- live phase ---- */
-          while (!closed) {
-            const r = await getSQL(env, `SELECT status, bytes, heartbeat, created_at FROM jobs WHERE id = ?`, [jobId]);
-            if (!r) { close(); return; }
-            const status = r.status;
-            const total = Number(r.bytes);
-            if (total > pos || status === "done") {
-              const rows2 = await allSQL(env, `SELECT seq, data FROM chunks WHERE job = ? AND seq > ? ORDER BY seq ASC`, [jobId, lastSeq]);
-              for (const c of rows2) {
-                deliver(enc.encode(c.data));
-                lastSeq = Number(c.seq);
-              }
-            }
-            if ((status === "done" || status === "failed" || status === "parked" || status === "stopped") && pos >= total) { close(); return; }
-            if (Date.now() - Number(r.created_at) > JOB_TTL_MS) { close(); return; }
-            /* the job looks stalled — kick a work pass in THIS event (a
-               fresh execution context = progress resumes immediately) */
-            if (status === "queued" || status === "streaming") {
-              const stale = Date.now() - Number(r.heartbeat) > STALE_LOCK_MS;
-              if (stale && Date.now() - lastKick > Math.max(3000, TAIL_POLL_SLOW)) {
-                lastKick = Date.now();
-                try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, jobId).catch(() => {})); } catch (_) {}
-              }
-            }
-            idlePolls = lastTotal === total ? idlePolls + 1 : 0;
-            lastTotal = total;
-            await sleep(idlePolls > 4 ? TAIL_POLL_SLOW : TAIL_POLL_FAST);
-          }
-        } catch (_) { fail(); }
-      })();
-    },
-    cancel() { closed = true; live.__watchers = Math.max(0, (live.__watchers || 1) - 1); },
-  });
-}
-
-/* ---------- routes ---------- */
-function relayHeaders(contentType, jobId, extra) {
-  const h = { "Content-Type": contentType || "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no" };
-  if (jobId) h["X-Nexus-Job"] = jobId;
-  for (const k in CORS) h[k] = CORS[k];
-  if (extra) for (const k in extra) h[k] = extra[k];
-  return h;
-}
-
-async function handleProxy(request, pathname, ctx, env) {
-  const rawBody = new Uint8Array(await request.arrayBuffer());
-  let parsed = null;
-  try { parsed = JSON.parse(new TextDecoder().decode(rawBody)); } catch (_) {}
-  const fwd = {};
-  for (const h of FWD_HEADERS) { const v = request.headers.get(h); if (v) fwd[h] = v; }
-
-  /* no D1 (or an unparseable body) → plain passthrough (graceful degrade) */
-  if (!hasDB(env) || !parsed) {
-    const upstream = await fetch(upstreamBase(env) + (pathname === "/chat" ? "/chat/completions" : "/images"), {
-      method: "POST", headers: headersFrom(fwd), body: rawBody,
-      // @ts-ignore runtime-specific
-      cf: { cacheTtl: 0 },
-    });
-    const hdrs = new Headers(upstream.headers);
-    for (const k in CORS) hdrs.set(k, CORS[k]);
-    return new Response(upstream.body, { status: upstream.status, headers: hdrs });
-  }
-
-  /* ATTACH: a continue request that matches a job we're already holding */
-  if (pathname === "/chat") {
-    const m = await matchContinueJob(env, parsed);
-    if (m) {
-      const job = await getJobRow(env, m.id);
-      const live = liveFor(m.id);
-      const kick = () => { try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, m.id).catch(() => {})); } catch (_) {} };
-      if (job && (job.status === "streaming" || job.status === "queued")) kick();
-      /* X-Nexus-Job is hidden when the boundary is > 0 — the app's
-         absolute-offset reconnect math must stay correct.
-         v8: queue/timing headers ride along on attach too */
-      const headers = relayHeaders((job && job.meta.contentType) || "text/event-stream", m.boundary > 0 ? null : m.id, job ? nexusMetaHeaders(job) : null);
-      if (live.hasPump && live.abortCtl && !live.abortCtl.signal.aborted) {
-        return new Response(liveSubscriber(live, m.boundary), { status: 200, headers });
+    if (url.pathname === '/chat' || url.pathname.startsWith('/chat/')) {
+      /* legacy v2 prefix — the SPA errors on /chat/; move to / */
+      const rest = url.pathname.slice('/chat'.length) || '/';
+      return redirect(req, rest + url.search);
+    } else if (url.pathname.startsWith('/p/')) {
+      const rest = url.pathname.slice(3); // "<host>/path..."
+      const slash = rest.indexOf('/');
+      host = slash < 0 ? rest : rest.slice(0, slash);
+      const path = slash < 0 ? '/' : rest.slice(slash);
+      if (!hostAllowed(host)) {
+        return json({ error: 'host not allowed', host: host, allowed_suffixes: allowList(event) }, req, 403);
       }
-      return new Response(tailStream(env, ctx, m.id, m.boundary), { status: 200, headers });
-    }
-  }
-
-  /* attempt 0 — fatal 4xx passes straight through (v2 behavior: the app
-     maps auth/path errors itself); retryable failures become a durable
-     queued job the pump keeps re-requesting "until it gets in".
-     v8: attempt 0 is TIMEOUT-BOUNDED (30s to response headers) — a
-     black-holed upstream connect used to hang the POST silently for the
-     app's full 120s request timeout before any honest notice could start;
-     now it degrades into the job path immediately and the notices begin. */
-  let upstream = null, upstreamErr = null;
-  {
-    const ac0 = new AbortController();
-    const t0 = setTimeout(() => { try { ac0.abort(); } catch (_) {} }, TUN("attempt0TimeoutMs", 30 * 1000));
-    try {
-      upstream = await fetch(upstreamBase(env) + (pathname === "/chat" ? "/chat/completions" : "/images"), {
-        method: "POST", headers: headersFrom(fwd), body: rawBody,
-        signal: ac0.signal,
-        // @ts-ignore runtime-specific
-        cf: { cacheTtl: 0 },
-      });
-    } catch (err) { upstreamErr = err; }
-    finally { clearTimeout(t0); }
-  }
-  const retryable = !!(upstreamErr || (upstream && !upstream.ok && [408, 429, 500, 502, 503, 504, 522, 524].includes(upstream.status)));
-  if (!retryable && upstream && (!upstream.ok || !upstream.body)) {
-    const hdrs = new Headers(upstream.headers);
-    for (const k in CORS) hdrs.set(k, CORS[k]);
-    return new Response(upstream.body, { status: upstream.status, headers: hdrs });
-  }
-
-  /* create the durable job */
-  const id = crypto.randomUUID();
-  const kind = pathname === "/images" ? "images" : "chat";
-  const now = Date.now();
-  const contentType = (upstream && upstream.headers.get("content-type")) || (kind === "images" ? "application/json" : "text/event-stream");
-  const metaFwd = Object.assign({}, fwd);
-  delete metaFwd.authorization;
-  const meta = { fwd: metaFwd, contentType };
-  /* v9: the app's client key — a deterministic per-(chat,message) handle the
-     NEXT app launch can use to find this job even when the page died before
-     the X-Nexus-Job response header ever arrived (fetch in flight at kill
-     time). Never forwarded upstream; only meaningful for job lookup. */
-  const clientKey = (request.headers.get("X-Nexus-Client") || "").slice(0, 200) || null;
-  const authHash = fwd.authorization ? await sha256Hex(fwd.authorization) : null;
-  await runSQL(env,
-    `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, client_key, auth_hash, lock_token) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, 0, '', ?, ?, ?, ?, NULL)`,
-    [id, kind, now, now, JSON.stringify(parsed), JSON.stringify(meta), clientKey, authHash]);
-  if (fwd.authorization) {
-    try { await runSQL(env, `INSERT INTO secrets (job, auth) VALUES (?, ?)`, [id, fwd.authorization]); } catch (_) {}
-  }
-  try { ctx && ctx.waitUntil && ctx.waitUntil(prune(env).catch(() => {})); } catch (_) {}
-
-  const live = liveFor(id);
-  const headers = relayHeaders(contentType, id, {
-    "X-Nexus-Status": "queued", "X-Nexus-Attempts": "0",
-    "X-Nexus-Age": "0", "X-Nexus-Waited": "0", "X-Nexus-Work": "0",
-  });
-  /* v5: the request context is alive as long as the client is connected —
-     give the pump the FULL retry budget in-context ("re-request until it
-     gets in", up to MAX_ATTEMPTS / the 10-minute event budget). The
-     runtime's ~30s post-disconnect teardown is the real give-up signal
-     for clients that leave; the cron/piggyback then carry the job. */
-  try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, id, { firstUpstream: upstream || null, maxAttempts: MAX_ATTEMPTS }).catch(() => {})); } catch (_) {}
-  return new Response(liveSubscriber(live, 0), { status: 200, headers });
-}
-
-async function handleJobGet(url, ctx, env) {
-  if (!hasDB(env)) return json({ error: "job not found (relay in passthrough mode)" }, 404);
-  const id = url.pathname.split("/")[2];
-  const offset = Math.max(0, Number(url.searchParams.get("offset") || 0) || 0);
-  const job = await getJobRow(env, id);
-  if (!job) return json({ error: "job not found (expired or relay restarted)" }, 404);
-  /* v5: a FAILED job no longer 410s blindly — its buffer carries the real
-     provider error (persisted error event), so serve it: the app's reader
-     parses the error and surfaces the actual message + status instead of
-     a generic "job ended". 'stopped' = superseded (the app moved on). */
-  if (job.status === "stopped") return json({ error: "job ended (" + job.status + ")" }, 410);
-  /* v5: reconnects ALWAYS get the D1 tail. workerd forbids cross-request
-     I/O: a stream created in THIS request's context cannot be driven by a
-     pump running in the original POST's context (workerd 500s the response
-     with "Cannot perform I/O on behalf of a different request"). The tail
-     is fully self-contained: byte-exact replay from the chunk log, live
-     D1 polling (every pump flushes every ~2s), stale-pump kicks, and it
-     closes only on done/failed/parked. It also registers as a WATCHER on
-     the job's live registry so liveness models see the attached client.
-     v6: X-Nexus-Age tells the app how long this job has been running
-     server-side ("the worker has been on this request for 47s").
-     v8: X-Nexus-Status / -Attempts / -Waited / -Work tell the app the
-     job's queue state and its WAIT/WORK split at the moment of attach —
-     the app shows "waiting in line, tried N times" instantly. */
-  return new Response(tailStream(env, ctx, id, offset), { status: 200, headers: relayHeaders(job.meta.contentType, id, Object.assign({ "X-Nexus-Offset": String(job.bytes) }, nexusMetaHeaders(job))) });
-}
-
-/* v8: STATUS PROBE — a cheap, honest, one-row JSON read the app polls
-   while its tail is quiet (or while it waits on a rate-limited job):
-     {status, attempts, bytes, ageMs, waitedMs, workMs}
-   It piggybacks a work pass too, so polling ALSO drives a due job (a
-   double win: the app learns the queue state and revives the pump). */
-/* v9: LOOKUP BY CLIENT KEY — the page died before the POST's response
-   headers arrived, so the app never learned its job id. It DID persist a
-   deterministic key (chatId|msgIndex) before the request fired; this route
-   maps that key back to the live/finished job so recovery can re-attach
-   instead of re-asking and double-spending. Auth-checked against the
-   job's stored secret — a wrong or missing key gets a plain 404. */
-async function handleJobByKey(request, url, ctx, env) {
-  if (!hasDB(env)) return json({ error: "job not found (relay in passthrough mode)", gone: true }, 404);
-  const key = decodeURIComponent(url.pathname.split("/")[3] || "");
-  if (!key) return json({ error: "missing client key", gone: true }, 404);
-  const auth = request.headers.get("authorization") || "";
-  const row = await getSQL(env,
-    `SELECT j.id, j.kind, j.status, j.created_at, j.updated_at, j.attempts, j.bytes, j.finish, j.meta, j.auth_hash, s.auth AS secret
-     FROM jobs j LEFT JOIN secrets s ON s.job = j.id
-     WHERE j.client_key = ? AND j.status != 'stopped' AND j.status != 'failed'
-     ORDER BY j.created_at DESC LIMIT 1`, [key]);
-  if (!row || !row.id) return json({ error: "no job for this key (expired or never created)", gone: true }, 404);
-  /* v9: auth survives completion as a SHA-256 hash on the row — the live
-     secret is checked while the job still runs, the hash forever after */
-  let authOk = true;
-  if (row.secret) authOk = row.secret === auth;
-  else if (row.auth_hash) authOk = (await sha256Hex(auth)) === row.auth_hash;
-  if (!authOk) return json({ error: "job not found", gone: true }, 404);
-  /* found and ours — drive it if it's due, then hand back the handle */
-  if (row.status === "queued" || row.status === "streaming") {
-    try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, row.id).catch(() => {})); } catch (_) {}
-  }
-  let meta = {};
-  try { meta = row.meta ? JSON.parse(row.meta) : {}; } catch (_) {}
-  const j = { createdAt: Number(row.created_at), status: row.status, attempts: Number(row.attempts), meta };
-  const t = timingOf(j);
-  return json({
-    ok: true, v: WORKER_VERSION, id: row.id, kind: row.kind, status: row.status,
-    attempts: Number(row.attempts), bytes: Number(row.bytes), finish: !!Number(row.finish),
-    ageMs: Math.max(0, Date.now() - Number(row.created_at)),
-    waitedMs: t.waitedMs, workMs: t.workMs, firstByte: !!t.firstByteAt,
-  });
-}
-
-async function handleJobStatus(url, ctx, env) {
-  if (!hasDB(env)) return json({ error: "job not found (relay in passthrough mode)" }, 404);
-  const id = url.pathname.split("/")[2];
-  const job = await getJobRow(env, id);
-  if (!job) return json({ error: "job not found (expired or relay restarted)", gone: true }, 404);
-  const t = timingOf(job);
-  return json({
-    ok: true, v: WORKER_VERSION, id, kind: job.kind, status: job.status,
-    attempts: job.attempts, bytes: job.bytes,
-    ageMs: Math.max(0, Date.now() - job.createdAt),
-    waitedMs: t.waitedMs, workMs: t.workMs,
-    firstByte: !!t.firstByteAt,
-    finish: !!job.finish,
-  });
-}
-
-async function handleDelete(url, env) {
-  const id = url.pathname.split("/")[2];
-  const live = liveMap.get(id);
-  if (live) { liveAbort(live); liveMap.delete(id); }
-  if (hasDB(env)) { try { await deleteJobRows(env, id); } catch (_) {} }
-  return json({ ok: true });
-}
-
-/* ---------- maintenance ---------- */
-async function prune(env) {
-  if (!hasDB(env)) return;
-  const now = Date.now();
-  try {
-    /* v6: PARKED jobs (agent tool-cuts, waiting for the app) get their own
-       longer TTL — a mid-agent run stays recoverable for 30 minutes. */
-    const dead = await allSQL(env,
-      `SELECT id FROM jobs WHERE ((status IN ('done','failed','stopped') AND updated_at < ?) OR (status = 'parked' AND updated_at < ?) OR (created_at < ?))`,
-      [now - DONE_TTL_MS, now - PARK_TTL_MS, now - JOB_TTL_MS - DONE_TTL_MS]);
-    for (const r of dead) await deleteJobRows(env, r.id);
-    await runSQL(env,
-      `UPDATE jobs SET status = 'failed', heartbeat = 0, lock_token = NULL, updated_at = ? WHERE status IN ('queued','streaming') AND created_at < ?`,
-      [now, now - JOB_TTL_MS]);
-    await runSQL(env, `DELETE FROM secrets WHERE job NOT IN (SELECT id FROM jobs)`);
-    const n = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','streaming')`);
-    if (n && Number(n.n) > MAX_ACTIVE_JOBS) {
-      const old = await allSQL(env, `SELECT id FROM jobs WHERE status IN ('done','stopped') ORDER BY updated_at ASC LIMIT ?`, [Number(n.n) - MAX_ACTIVE_JOBS]);
-      for (const r of old) await deleteJobRows(env, r.id);
-    }
-  } catch (_) {}
-}
-
-/* piggyback work: any incoming request can drive due jobs in its own
-   fresh execution context — this is what makes progress resume the
-   instant the app reconnects, without waiting for the cron tick.
-   v6: two jobs per request (concurrent chats revive together). */
-async function maybeWorkAny(env, ctx) {
-  if (!hasDB(env)) return;
-  try {
-    const now = Date.now();
-    const rows = await allSQL(env,
-      `SELECT id FROM jobs WHERE status IN ('queued','streaming') AND next_retry <= ? AND heartbeat < ? ORDER BY next_retry ASC LIMIT 2`,
-      [now, now - STALE_LOCK_MS]);
-    for (const r of rows) {
-      try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, r.id, { maxAttempts: 6, budgetMs: 90000 }).catch(() => {})); } catch (_) {}
-    }
-  } catch (_) {}
-}
-
-/* the real router — wrapped by the default export's catch-all */
-async function handleFetch(request, env, ctx) {
-  const url = new URL(request.url);
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-  if (hasDB(env)) { try { await ensureSchema(env); } catch (_) {} }
-  /* v5: ANY request piggybacks one due job into its own fresh context —
-     previously only /health did, so a stuck job only revived on a health
-     poll. Fire-and-forget (waitUntil'd) — zero added latency. */
-  const piggyback = () => { try { ctx && ctx.waitUntil && ctx.waitUntil(maybeWorkAny(env, ctx).catch(() => {})); } catch (_) {} };
-
-  if (url.pathname === "/health") {
-    let out;
-    if (hasDB(env)) {
-      let cronAge = -1, active = 0;
-      try { cronAge = Date.now() - (await wstateGet(env, "cron_beat") || 0); } catch (_) {}
-      try { const n = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','streaming')`); active = n ? Number(n.n) : 0; } catch (_) {}
-      out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: true, mode: "job engine", clientKey: true, cronOk: cronAge >= 0 && cronAge < 3 * 60 * 1000, cronAgeMs: cronAge, active, time: Date.now() };
-      /* v6: a live jobs digest — every active job's age, size, and attempt
-         count ("what is the worker working on and for how long"), plus the
-         last few finished ones with their SAVED durations. */
-      try {
-        const rows = await allSQL(env, `SELECT id, kind, status, created_at, updated_at, attempts, bytes, meta FROM jobs ORDER BY updated_at DESC LIMIT 8`);
-        const now = Date.now();
-        out.jobs = rows.map(r => {
-          let meta = {}; try { meta = r.meta ? JSON.parse(r.meta) : {}; } catch (_) {}
-          const j = { createdAt: Number(r.created_at), status: r.status, attempts: Number(r.attempts), meta };
-          const t = timingOf(j, now);
-          return {
-            id: String(r.id).slice(0, 8), kind: r.kind, status: r.status,
-            ageMs: Math.max(0, now - Number(r.created_at)),
-            bytes: Number(r.bytes), attempts: Number(r.attempts),
-            waitedMs: t.waitedMs, workMs: t.workMs,
-            ...(meta.durationMs != null ? { durationMs: meta.durationMs } : {}),
-          };
-        });
-      } catch (_) {}
-      if (!out.cronOk) out.setup = "add a Cron Trigger with schedule * * * * * (Settings → Triggers & Events) so jobs finish while your phone is off";
+      pfx = '/p/' + host;
+      upstream = 'https://' + host + path + url.search;
     } else {
-      out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: false, mode: "passthrough (bind D1 as DB for the background job engine)", time: Date.now(), setup: "create a D1 database and bind it with variable name DB (Settings → Bindings)" };
+      /* transparent catch-all: the whole worker mirrors chat.z.ai.
+       * Runtime-built root-absolute URLs (/static/logo.png, /user.png …)
+       * and SPA routes (/auth, /#…) behave exactly like the real site. */
+      host = chatHost(event);
+      upstream = chatUpstream(event) + url.pathname + url.search;
     }
-    maybeWorkAny(env, ctx);
-    return json(out);
-  }
 
-  if (request.method === "POST" && (url.pathname === "/chat" || url.pathname === "/images")) {
-    piggyback();
-    try {
-      return await handleProxy(request, url.pathname, ctx, env);
-    } catch (err) {
-      return json({ error: { message: "relay upstream failed: " + (err && err.message || String(err)), code: 502 } }, 502);
+    /* ---- strip proxy token from query ---- */
+    const upUrl = new URL(upstream);
+    if (upUrl.searchParams.has('__t')) upUrl.searchParams.delete('__t');
+
+    /* ---- build upstream request ---- */
+    const h = new Headers();
+    const skipReq = new Set(['host', 'origin', 'referer', 'cookie', 'connection', 'keep-alive', 'upgrade',
+      'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'content-length', 'accept-encoding',
+      'x-cookie', 'x-proxy-token', 'x-set-cookie']);
+    /* v3: Cloudflare's edge injects its own connection headers
+     * (cf-connecting-ip, cf-ipcountry, cf-ray, cf-visitor,
+     * x-forwarded-for, cdn-loop, true-client-ip, ...) into every
+     * request that reaches this worker. Forwarding them to
+     * chat.z.ai — which runs behind Cloudflare itself — sends
+     * forged edge headers into another zone's WAF. They are
+     * dropped here, always. */
+    const dropExact = new Set(['cdn-loop', 'true-client-ip', 'x-real-ip']);
+    const dropPrefix = ['cf-', 'x-forwarded'];
+    for (const [k, v] of req.headers) {
+      const lk = k.toLowerCase();
+      if (skipReq.has(lk)) continue;
+      if (dropExact.has(lk)) continue;
+      let drop = false;
+      for (let i = 0; i < dropPrefix.length; i++) { if (lk.startsWith(dropPrefix[i])) { drop = true; break; } }
+      if (drop) continue;
+      h.set(k, v);
     }
+    h.set('accept-encoding', 'gzip, deflate, br');
+    h.set('cookie', mergeCookies(req.headers.get('cookie') || '', req.headers.get('x-cookie') || ''));
+    h.set('origin', 'https://' + host);
+    h.set('referer', 'https://' + host + '/');
+
+    let body = undefined;
+    let needDuplex = false;
+    if (method !== 'GET' && method !== 'HEAD') {
+      const cl = parseInt(req.headers.get('content-length') || '0', 10);
+      if (cl > 0 && cl < 32 * 1024 * 1024) {
+        body = await req.arrayBuffer(); // keeps Content-Length intact (important for OSS uploads)
+        h.set('content-length', String(body.byteLength));
+      } else {
+        body = req.body; // stream big/unknown-size uploads
+        needDuplex = true;
+      }
+    }
+
+    let res;
+    let retried = false;
+    try {
+      const fetchInit = { method: method, headers: h, redirect: 'manual' };
+      if (body !== undefined) fetchInit.body = body;
+      if (needDuplex) fetchInit.duplex = 'half';
+      res = await fetch(upUrl.toString(), fetchInit);
+      /* ---- v3: a 403/429 on a safe GET can be a WAF trip-wire fed
+       * by leftover request headers — retry ONCE with a minimal,
+       * clean header set before relaying the block page. ---- */
+      if ((res.status === 403 || res.status === 429) && (method === 'GET' || method === 'HEAD')) {
+        try {
+          const res2 = await fetch(upUrl.toString(), { method: method, headers: minimalHeaders(req, host), redirect: 'manual' });
+          retried = true; /* a retry attempt happened — tagged either way */
+          if (res2.status !== res.status) {
+            try { if (res.body && res.body.cancel) res.body.cancel(); } catch (e) { /* ignore */ }
+            res = res2;
+            retried = true;
+          } else {
+            try { if (res2.body && res2.body.cancel) res2.body.cancel(); } catch (e) { /* ignore */ }
+          }
+        } catch (e2) { /* keep the original response */ }
+      }
+    } catch (err) {
+      return json({ error: 'upstream fetch failed', detail: String(err && err.message || err) }, req, 502);
+    }
+
+    /* ---- redirect handling: rewrite Location and let the browser follow inside the worker ---- */
+    const loc = res.headers.get('location');
+    if (loc && res.status >= 300 && res.status < 400 && res.status !== 304) {
+      const mapped = mapLocation(loc, upUrl, event);
+      const rh = scrubHeaders(res.headers);
+      reissueCookies(res, rh, event);
+      rh.set('location', mapped);
+      maybeSetTokenCookie(req, rh, event);
+      return new Response(null, { status: res.status, headers: corsHeaders(req, rh) });
+    }
+
+    /* ---- normal responses ---- */
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    const outHeaders = scrubHeaders(res.headers);
+    reissueCookies(res, outHeaders, event);
+    maybeSetTokenCookie(req, outHeaders, event);
+    outHeaders.set('x-final-url', res.url || upUrl.toString());
+    if (retried) outHeaders.set('x-zp-retry', '1');
+    const outCt = corsHeaders(req, outHeaders);
+
+    if (ct.includes('text/html')) {
+      const text = await res.text();
+      const html = rewriteHtml(text, pfx, host, new URL(req.url).origin, token, allowList(event));
+      return new Response(html, { status: res.status, headers: outCt });
+    }
+    if (ct.includes('text/css')) {
+      const text = await res.text();
+      const css = rewriteCss(text, pfx, host, allowList(event));
+      return new Response(css, { status: res.status, headers: outCt });
+    }
+
+    return new Response(res.body, { status: res.status, headers: outCt });
+  } catch (err) {
+    return json({ error: 'proxy error', detail: String(err && err.message || err) }, req, 500);
   }
-  if (request.method === "GET" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
-    piggyback();
-    return handleJobGet(url, ctx, env);
-  }
-  /* v8: the status probe — cheap JSON the app polls while its tail is
-     quiet; polling piggybacks a work pass, so it also drives due jobs */
-  if (request.method === "GET" && /^\/job\/[A-Za-z0-9-]+\/status$/.test(url.pathname)) {
-    piggyback();
-    return handleJobStatus(url, ctx, env);
-  }
-  /* v9: client-key lookup — recovery for pages killed before the job id
-     header arrived */
-  if (request.method === "GET" && /^\/job\/by-key\/.+$/.test(url.pathname)) {
-    piggyback();
-    return handleJobByKey(request, url, ctx, env);
-  }
-  if (request.method === "DELETE" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
-    piggyback();
-    return handleDelete(url, env);
-  }
-  return json({ error: "not found", hint: "use /chat, /images, /job/:id?offset=N, /job/:id/status, /job/by-key/:key, /health" }, 404);
 }
 
-export default {
-  async fetch(request, env, ctx) {
-    try {
-      return await handleFetch(request, env, ctx);
-    } catch (err) {
-      /* v5: nothing 500s opaquely — a CORS'd JSON error the app can read,
-         instead of a bare runtime 500 the browser blocks as a network
-         failure ("status 0"). */
-      return json({ error: { message: "relay internal error: " + (err && err.message || String(err)), code: 500 } }, 500);
-    }
-  },
+/* ============================================================ helpers */
 
-  /* cron tick: heartbeat + prune + up to CRON_JOBS_PER_TICK jobs of real work.
-     v6: four jobs per tick — several chats generating with the phone off all
-     advance instead of finishing two-per-minute. */
-  async scheduled(_event, env, ctx) {
-    if (!hasDB(env)) return;
-    try { await ensureSchema(env); } catch (_) { return; }
-    try { await wstateSet(env, "cron_beat", Date.now()); } catch (_) {}
-    try { await prune(env); } catch (_) {}
-    const deadline = Date.now() + TICK_BUDGET_MS;
-    for (let i = 0; i < CRON_JOBS_PER_TICK; i++) {
-      if (Date.now() > deadline - 15000) break;
-      try {
-        const now = Date.now();
-        const r = await getSQL(env,
-          `SELECT id FROM jobs WHERE status IN ('queued','streaming') AND next_retry <= ? AND heartbeat < ? ORDER BY next_retry ASC LIMIT 1`,
-          [now, now - STALE_LOCK_MS]);
-        if (!r || !r.id) break;
-        await driveJob(env, ctx, r.id, { maxAttempts: 8, cron: true, budgetMs: Math.max(30000, Math.floor((deadline - Date.now()) / Math.max(1, CRON_JOBS_PER_TICK - i)) - 10000) });
-      } catch (_) {}
+function envOf(event) {
+  return (event && event.env) || globalThis.__ZAI_ENV || {};
+}
+function allowList(event) {
+  const extra = envOf(event).EXTRA_HOSTS || '';
+  const arr = ALLOW.slice();
+  String(extra).split(',').forEach((h) => {
+    h = h.trim().toLowerCase();
+    if (h && arr.indexOf(h) < 0) arr.push(h);
+  });
+  return arr;
+}
+function hostAllowed(host, event) {
+  host = String(host || '').toLowerCase();
+  const list = allowList(event);
+  for (const a of list) {
+    if (host === a || host.endsWith('.' + a)) return true;
+  }
+  return false;
+}
+async function checkToken(req, url, token) {
+  if (req.headers.get('x-proxy-token') === token) return true;
+  if (url.searchParams.get('__t') === token) return true;
+  const ck = req.headers.get('cookie') || '';
+  const m = ck.match(/(?:^|;\s*)__zai_t=([^;]+)/);
+  if (m && decodeURIComponent(m[1]) === token) return true;
+  return false;
+}
+function tokenCookie(token) {
+  return '__zai_t=' + encodeURIComponent(token) + '; Path=/; Max-Age=31536000; Secure; SameSite=None; Partitioned';
+}
+function redirect(req, to) {
+  const h = new Headers({ location: to, 'cache-control': 'no-store' });
+  return new Response(null, { status: 302, headers: corsHeaders(req, h) });
+}
+function maybeSetTokenCookie(req, h, event) {
+  const token = envOf(event).PROXY_TOKEN || '';
+  if (!token) return;
+  const ck = req.headers.get('cookie') || '';
+  if (ck.indexOf('__zai_t=') >= 0) return;
+  h.append('set-cookie', tokenCookie(token));
+}
+
+function mergeCookies(a, b) {
+  const seen = new Map();
+  const add = (str) => {
+    if (!str) return;
+    str.split(';').forEach((kv) => {
+      kv = kv.trim();
+      if (!kv) return;
+      const name = kv.split('=')[0];
+      if (!seen.has(name)) seen.set(name, kv);
+    });
+  };
+  add(a); // browser-native cookies win
+  add(b); // patch-supplied fallback cookies fill gaps
+  return Array.from(seen.values()).join('; ');
+}
+
+/* response headers we must not forward */
+const SCRUB = new Set(['content-security-policy', 'content-security-policy-report-only', 'x-frame-options',
+  'strict-transport-security', 'cross-origin-opener-policy', 'cross-origin-embedder-policy',
+  'cross-origin-resource-policy', 'content-encoding', 'content-length', 'transfer-encoding',
+  'connection', 'keep-alive', 'upgrade', 'set-cookie', 'report-to', 'nel', 'vary']);
+
+function scrubHeaders(headers) {
+  const h = new Headers();
+  for (const [k, v] of headers) {
+    if (!SCRUB.has(k.toLowerCase())) h.set(k, v);
+  }
+  return h;
+}
+
+/* re-issue upstream cookies for this worker's domain (CHIPS-partitioned so they work in the app iframe) */
+function reissueCookies(res, h, event) {
+  try {
+    let raw = [];
+    if (typeof res.headers.getSetCookie === 'function') raw = res.headers.getSetCookie();
+    else {
+      const single = res.headers.get('set-cookie');
+      if (single) raw = [single];
     }
-    try { await wstateSet(env, "last_work", Date.now()); } catch (_) {}
-  },
-};
+    if (!raw.length) return;
+    raw.forEach((sc) => {
+      const parts = String(sc).split(';');
+      const nv = parts[0].trim();
+      if (!nv) return;
+      let expires = null, maxAge = null, httpOnly = false;
+      for (let i = 1; i < parts.length; i++) {
+        const p = parts[i].trim();
+        const k = p.split('=')[0].toLowerCase();
+        if (k === 'expires') expires = p.slice(8).trim();
+        else if (k === 'max-age') maxAge = p.slice(8).trim();
+        else if (k === 'httponly') httpOnly = true;
+      }
+      let out = nv + '; Path=/; Secure; SameSite=None; Partitioned';
+      if (expires) out += '; Expires=' + expires;
+      if (maxAge !== null && maxAge !== undefined && maxAge !== '') out += '; Max-Age=' + maxAge;
+      if (httpOnly) out += '; HttpOnly';
+      h.append('set-cookie', out);
+    });
+    /* expose the raw cookies so the patch/shell can mirror them */
+    h.set('x-set-cookie', encodeURIComponent(JSON.stringify(raw)));
+  } catch (e) { /* ignore */ }
+}
+
+function corsHeaders(req, h) {
+  h.set('access-control-allow-origin', '*');
+  h.set('access-control-allow-methods', 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS');
+  const reqH = req.headers.get('access-control-request-headers');
+  h.set('access-control-allow-headers', reqH || '*');
+  h.set('access-control-expose-headers', 'content-disposition, content-type, x-set-cookie, x-final-url, filename, x-zp-retry');
+  h.set('access-control-max-age', '86400');
+  return h;
+}
+
+function json(obj, req, status) {
+  const h = new Headers({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  return new Response(JSON.stringify(obj), { status: status || 200, headers: corsHeaders(req, h) });
+}
+
+/* ---- v3: the minimal clean header set used by the 403/429 retry ---- */
+function minimalHeaders(req, host) {
+  const h = new Headers();
+  const ua = req.headers.get('user-agent');
+  if (ua) h.set('user-agent', ua);
+  const al = req.headers.get('accept-language');
+  if (al) h.set('accept-language', al);
+  h.set('accept', req.headers.get('accept') || '*/*');
+  h.set('accept-encoding', 'gzip, deflate, br');
+  const ck = mergeCookies(req.headers.get('cookie') || '', req.headers.get('x-cookie') || '');
+  if (ck) h.set('cookie', ck);
+  h.set('origin', 'https://' + host);
+  h.set('referer', 'https://' + host + '/');
+  return h;
+}
+
+/* ---- v3: /__diag — live upstream probes ------------------------------
+ *
+ * Three GETs against the chat upstream, each shaped like a
+ * different worker generation, so the page shows exactly WHICH
+ * request style z.ai blocks (if any) from this worker's egress:
+ *   1. "app"     — what v3 forwards for the app document
+ *                  (browser-like, CF edge headers stripped)
+ *   2. "minimal" — accept + user-agent + origin/referer only
+ *   3. "forged"  — what v2 ACTUALLY forwarded: browser-like plus
+ *                  the Cloudflare edge headers that ride along on
+ *                  every request hitting the worker
+ */
+function esc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+async function diagProbe(event, kind) {
+  const host = chatHost(event);
+  const up = chatUpstream(event) + '/';
+  const h = new Headers();
+  h.set('accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8');
+  h.set('accept-encoding', 'gzip, deflate, br');
+  h.set('accept-language', 'en-US,en;q=0.9');
+  h.set('user-agent', 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36');
+  h.set('origin', 'https://' + host);
+  h.set('referer', 'https://' + host + '/');
+  if (kind === 'minimal') {
+    h.delete('accept-language');
+  }
+  if (kind === 'forged') {
+    h.set('cf-connecting-ip', '198.51.100.7');
+    h.set('cf-ipcountry', 'US');
+    h.set('cf-ray', 'diag-probe');
+    h.set('x-forwarded-for', '198.51.100.7');
+    h.set('cdn-loop', 'cloudflare');
+  }
+  try {
+    const res = await fetch(up, { method: 'GET', headers: h, redirect: 'manual' });
+    let snippet = '';
+    try { snippet = (await res.text()).slice(0, 240); } catch (e) { snippet = '(body unreadable)'; }
+    return {
+      error: false,
+      status: res.status,
+      type: (res.headers.get('content-type') || '').split(';')[0] || '(none)',
+      server: res.headers.get('server') || '(none)',
+      ray: res.headers.get('cf-ray') || '(no cf-ray — upstream not on Cloudflare)',
+      mitigated: res.headers.get('cf-mitigated') || '',
+      location: res.headers.get('location') || '',
+      snippet: snippet.trim().replace(/\s+/g, ' ')
+    };
+  } catch (err) {
+    return { error: true, status: 0, detail: String((err && err.message) || err) };
+  }
+}
+
+async function diagPage(req, event) {
+  /* what the phone's own request arrived with (added by Cloudflare's
+   * edge on the way in) — the v3 worker no longer forwards these */
+  const incoming = [];
+  for (const [k, v] of req.headers) {
+    const lk = k.toLowerCase();
+    if (lk.startsWith('cf-') || lk.startsWith('x-forwarded') || lk === 'cdn-loop' || lk === 'true-client-ip' || lk === 'x-real-ip') {
+      incoming.push(k + ': ' + v);
+    }
+  }
+  const p = await Promise.all([diagProbe(event, 'app'), diagProbe(event, 'minimal'), diagProbe(event, 'forged')]);
+  const app = p[0], mini = p[1], forged = p[2];
+
+  const verdictOf = (pr) => pr.error ? 'fetch failed' : (pr.status === 200 ? 'answered normally (200)' :
+    (pr.status === 403 || pr.status === 429 ? 'BLOCKED (' + pr.status + ')' : 'HTTP ' + pr.status));
+
+  let verdict, verdictColor;
+  if (app.error || app.status !== 200) {
+    if (!app.error && (app.status === 403 || app.status === 429)) {
+      verdict = 'z.ai is BLOCKING this worker\u2019s requests (HTTP ' + app.status + '). That block page is what the app shows. Send this whole page to whoever helps you.';
+      verdictColor = '#F87171';
+    } else {
+      verdict = 'The worker could not fetch the app page from ' + esc(chatHost(event)) + ' (' + esc(app.error ? app.detail : 'HTTP ' + app.status) + '). The app cannot work until this is fixed.';
+      verdictColor = '#F87171';
+    }
+  } else if (!forged.error && (forged.status === 403 || forged.status === 429)) {
+    verdict = 'z.ai answers normally, but blocks the OLD v2-style request (with forwarded Cloudflare headers). Your v3 fix is exactly right \u2014 keep it deployed.';
+    verdictColor = '#FBBF24';
+  } else {
+    verdict = 'z.ai answers this worker normally. If the app still shows a block page, the block is NOT between this worker and z.ai \u2014 it is between your phone and this worker (network filter / browser). Try this page from a different network (Wi-Fi vs mobile data) to compare.';
+    verdictColor = '#4ADE80';
+  }
+
+  const probeRow = (name, desc, pr) =>
+    '<div class="probe"><div class="ph"><b>' + name + '</b><span class="code">' + esc(desc) + '</span></div>' +
+    '<div class="line">status: <b class="' + (pr.error ? 'bad' : (pr.status === 200 ? 'ok' : (pr.status === 403 || pr.status === 429 ? 'bad' : 'warn'))) + '">' + esc(verdictOf(pr)) + '</b></div>' +
+    (pr.error ? '<div class="line">error: ' + esc(pr.detail) + '</div>' :
+      '<div class="line meta">type ' + esc(pr.type) + ' \u00b7 server ' + esc(pr.server) + ' \u00b7 cf-ray ' + esc(pr.ray) +
+      (pr.mitigated ? ' \u00b7 cf-mitigated ' + esc(pr.mitigated) : '') +
+      (pr.location ? ' \u00b7 location ' + esc(pr.location) : '') + '</div>' +
+      '<div class="snip">' + esc(pr.snippet) + '</div>') +
+    '</div>';
+
+  const html = '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">' +
+    '<title>z.ai pocket \u2014 worker diagnostics</title>' +
+    '<style>' +
+    ':root{--bg:#0B0D12;--panel:#14161F;--panel2:#1A1D28;--line:rgba(255,255,255,.08);--txt:#E7E9EE;--sub:#9AA1AD}' +
+    '*{box-sizing:border-box}body{margin:0;padding:18px 14px 40px;background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,system-ui,"Segoe UI",Roboto,sans-serif;font-size:14px;line-height:1.55}' +
+    'h1{font-size:18px;margin:0 0 2px}.tag{color:var(--sub);font-size:12.5px;margin-bottom:14px}' +
+    '.verdict{padding:12px 14px;border-radius:12px;background:rgba(255,255,255,.05);border-left:3px solid ' + verdictColor + ';margin-bottom:14px;font-size:13.5px}' +
+    '.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:13px 14px;margin-bottom:12px}' +
+    '.card b{font-size:13px}.card .code,.snip{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:#B9B6FB;word-break:break-all}' +
+    '.probe{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:13px 14px;margin-bottom:12px}' +
+    '.ph{display:flex;justify-content:space-between;gap:10px;align-items:baseline;margin-bottom:6px}' +
+    '.ph .code{color:var(--sub);font-size:10.5px}' +
+    '.line{font-size:12.5px;color:#C4C9D4;margin:2px 0}.line b{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}' +
+    '.ok{color:#4ADE80}.bad{color:#F87171}.warn{color:#FBBF24}' +
+    '.meta{color:var(--sub)}.snip{margin-top:7px;padding:9px 10px;border-radius:9px;background:var(--panel2);border:1px solid var(--line);max-height:110px;overflow:hidden}' +
+    'ul{margin:6px 0 0;padding-left:18px}li{font-size:12px;color:var(--sub);margin:3px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}' +
+    '.foot{color:var(--sub);font-size:11.5px;line-height:1.6}' +
+    '</style></head><body>' +
+    '<h1>z.ai pocket \u2014 worker diagnostics</h1>' +
+    '<div class="tag">' + esc(VERSION) + ' \u00b7 ' + esc(new Date().toISOString()) + '</div>' +
+    '<div class="verdict">' + esc(verdict) + '</div>' +
+    probeRow('Probe 1 \u00b7 as the app (v3 style)', 'browser-like, CF headers stripped', app) +
+    probeRow('Probe 2 \u00b7 minimal', 'accept + user-agent + origin only', mini) +
+    probeRow('Probe 3 \u00b7 old v2 style', 'browser-like + forwarded CF headers', forged) +
+    '<div class="card"><b>What your request arrived with</b>' +
+    (incoming.length ? '<ul>' + incoming.map((l) => '<li>' + esc(l) + '</li>').join('') + '</ul>' :
+      '<ul><li>(no Cloudflare edge headers seen \u2014 this request did not come through a Cloudflare edge)</li></ul>') +
+    '<div class="foot">These headers were what v2 wrongly forwarded to z.ai. v3 strips them; Probe 3 shows what z.ai thinks of them.</div></div>' +
+    '<div class="foot">This page made three live calls to ' + esc(chatUpstream(event)) + '/ from inside the worker. It works with or without the PROXY_TOKEN, in any cookie state.</div>' +
+    '</body></html>';
+
+  return new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
+}
+
+/* map a Location header value into proxy space */
+function mapLocation(loc, upUrl, event) {
+  try {
+    const abs = new URL(loc, upUrl);
+    if (abs.protocol !== 'https:' && abs.protocol !== 'http:') return loc;
+    if (!hostAllowed(abs.host, event)) return loc; // external redirect — pass through untouched
+    if (abs.host === upUrl.host) {
+      const pfx = prefixForHost(upUrl.host, event);
+      return pfx + abs.pathname + abs.search;
+    }
+    return '/p/' + abs.host + abs.pathname + abs.search;
+  } catch (e) {
+    return loc;
+  }
+}
+function prefixForHost(host, event) {
+  if (host === chatHost(event)) return ''; // transparent: the app lives at /
+  return '/p/' + host;
+}
+
+/* ---------------- HTML rewriting ---------------- */
+function mapAttr(v, pfx, host, allow) {
+  try {
+    const s = String(v || '').trim();
+    if (!s) return v;
+    if (/^(data|blob|about|javascript|mailto|tel|sms|intent|ms-|chrome|file|#)/i.test(s)) return v;
+    let m;
+    if ((m = s.match(/^https?:\/\/([^\/?#]+)/i))) {
+      const h = m[1].toLowerCase();
+      const ok = allow.some((a) => h === a || h.endsWith('.' + a));
+      if (!ok) return v;
+      const rest = s.slice(m[0].length) || '/';
+      return (h === host ? pfx : '/p/' + h) + rest;
+    }
+    if ((m = s.match(/^\/\/([^\/?#]+)/))) {
+      const h = m[1].toLowerCase();
+      const ok = allow.some((a) => h === a || h.endsWith('.' + a));
+      if (!ok) return v;
+      const rest = s.slice(m[0].length) || '/';
+      return (h === host ? pfx : '/p/' + h) + rest;
+    }
+    if (s.charAt(0) === '/' && s.charAt(1) !== '/') return pfx + s;
+    return v;
+  } catch (e) {
+    return v;
+  }
+}
+
+const ATTR_NAMES = 'href|src|action|formaction|poster|data-src|data-href|data-url|data-background';
+
+function rewriteHtml(text, pfx, host, workerOrigin, token, allow) {
+  try {
+    /* strip CSP meta tags and base targets */
+    text = text.replace(/<meta[^>]+http-equiv\s*=\s*["']?content-security-policy["']?[^>]*>/gi, '');
+    text = text.replace(/<base\b([^>]*?)\s+target\s*=\s*["'][^"']*["']/gi, '<base$1');
+
+    /* rewrite URL attributes */
+    const attrRe = new RegExp('(\\s(?:' + ATTR_NAMES + ')\\s*=\\s*)("([^"]*)"|\'([^\']*)\')', 'gi');
+    text = text.replace(attrRe, (whole, pre, quoted, dq, sq) => {
+      const v = dq !== undefined ? dq : sq;
+      const nv = mapAttr(v, pfx, host, allow);
+      if (nv === v) return whole;
+      return pre + '"' + String(nv).replace(/"/g, '%22') + '"';
+    });
+
+    /* srcset lists */
+    const ssRe = /(\ssrcset\s*=\s*)("([^"]*)"|'([^']*)')/gi;
+    text = text.replace(ssRe, (whole, pre, quoted, dq, sq) => {
+      const v = dq !== undefined ? dq : sq;
+      const nv = v.split(',').map((cand) => {
+        const t = cand.trim();
+        if (!t) return '';
+        const sp = t.indexOf(' ');
+        const u = sp < 0 ? t : t.slice(0, sp);
+        const rest = sp < 0 ? '' : t.slice(sp);
+        const nu = mapAttr(u, pfx, host, allow);
+        return nu === u ? t : nu + rest;
+      }).filter(Boolean).join(', ');
+      if (nv === v) return whole;
+      return pre + '"' + nv + '"';
+    });
+
+    /* url() inside style="..." attributes only (inline JS safety) */
+    const styleRe = /(\sstyle\s*=\s*)("([^"]*)"|'([^']*)')/gi;
+    text = text.replace(styleRe, (whole, pre, quoted, dq, sq) => {
+      const v = dq !== undefined ? dq : sq;
+      const nv = v.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (w, q, u) => {
+        const nu = mapAttr(u, pfx, host, allow);
+        return nu === u ? w : "url('" + nu + "')";
+      });
+      if (nv === v) return whole;
+      return pre + '"' + nv.replace(/"/g, '&quot;') + '"';
+    });
+
+    /* inject config + runtime patch as the first script */
+    const cfg = { pfx: pfx, host: host, worker: workerOrigin, token: token || '', allow: allow };
+    const inject = '<scr' + 'ipt>window.__ZAI__=' + JSON.stringify(cfg) + ';' + PATCH_JS + '</scr' + 'ipt>';
+    if (/<head[^>]*>/i.test(text)) text = text.replace(/<head[^>]*>/i, (m) => m + inject);
+    else if (/<html[^>]*>/i.test(text)) text = text.replace(/<html[^>]*>/i, (m) => m + inject);
+    else text = inject + text;
+    return text;
+  } catch (e) {
+    return text;
+  }
+}
+
+function rewriteCss(text, pfx, host, allow) {
+  try {
+    text = text.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (w, q, u) => {
+      const nu = mapAttr(u, pfx, host, allow);
+      return nu === u ? w : 'url("' + nu + '")';
+    });
+    text = text.replace(/@import\s+(['"])([^'"]+)\1/gi, (w, q, u) => {
+      const nu = mapAttr(u, pfx, host, allow);
+      return nu === u ? w : '@import "' + nu + '"';
+    });
+    return text;
+  } catch (e) {
+    return text;
+  }
+}
+
+/* ---------------- websocket proxy ---------------- */
+async function proxyWebsocket(req, url, event) {
+  try {
+    /* resolve upstream ws url — the whole worker mirrors chat.z.ai */
+    let target;
+    if (url.pathname.startsWith('/p/')) {
+      const rest = url.pathname.slice(3);
+      const slash = rest.indexOf('/');
+      const host = slash < 0 ? rest : rest.slice(0, slash);
+      const path = slash < 0 ? '/' : rest.slice(slash);
+      if (!hostAllowed(host, event)) return json({ error: 'host not allowed' }, req, 403);
+      target = 'wss://' + host + path + url.search;
+    } else {
+      target = chatUpstream(event).replace(/^http/, 'ws') + url.pathname + url.search;
+    }
+    const t = new URL(target);
+    if (t.searchParams.has('__t')) t.searchParams.delete('__t');
+
+    const upHeaders = new Headers({ 'Upgrade': 'websocket' });
+    const ck = mergeCookies(req.headers.get('cookie') || '', req.headers.get('x-cookie') || '');
+    if (ck) upHeaders.set('cookie', ck);
+    upHeaders.set('origin', 'https://' + t.host);
+
+    const upRes = await fetch(t.toString(), { headers: upHeaders });
+    const upWs = upRes.webSocket;
+    if (!upWs) return json({ error: 'upstream refused websocket' }, req, 502);
+    upWs.accept();
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    client.accept();
+
+    upWs.addEventListener('message', (e) => { try { client.send(e.data); } catch (err) { /* ignore */ } });
+    client.addEventListener('message', (e) => { try { upWs.send(e.data); } catch (err) { /* ignore */ } });
+    upWs.addEventListener('close', (e) => { try { client.close(e.code || 1000, e.reason || ''); } catch (err) { /* ignore */ } });
+    client.addEventListener('close', (e) => { try { upWs.close(e.code || 1000, e.reason || ''); } catch (err) { /* ignore */ } });
+    upWs.addEventListener('error', () => { try { client.close(); } catch (err) { /* ignore */ } });
+
+    return new Response(null, { status: 101, webSocket: client });
+  } catch (err) {
+    return json({ error: 'websocket proxy failed', detail: String(err && err.message || err) }, req, 500);
+  }
+}
+
+/* ---------------- landing / token setup page ---------------- */
+const FAVICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#171A23"/><path d="M18 20h28v7H33.5L46 44h-8.5L27 30.5V44h-9z" fill="#7C6CF0"/></svg>';
+
+function landing(event, bad) {
+  const html = '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">' +
+    '<meta name="theme-color" content="#0B0D12">' +
+    '<title>z.ai pocket — setup</title>' +
+    '<link rel="icon" href="data:image/svg+xml,' + encodeURIComponent(FAVICON_SVG) + '">' +
+    '<style>' +
+    ':root{--bg:#0B0D12;--panel:#14161F;--panel2:#1A1D28;--line:rgba(255,255,255,.08);--txt:#E7E9EE;--sub:#9AA1AD;--acc:#6E6AF8;--bad:#F87171}' +
+    '*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}' +
+    'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background:radial-gradient(1100px 500px at 50% -12%,rgba(110,106,248,.14),transparent 60%),var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,system-ui,"Segoe UI",Roboto,sans-serif;font-size:15px;line-height:1.5}' +
+    '.card{width:100%;max-width:400px;background:var(--panel);border:1px solid var(--line);border-radius:22px;padding:28px 22px;box-shadow:0 24px 60px rgba(0,0,0,.5)}' +
+    '.logoRow{display:flex;align-items:center;gap:12px;margin-bottom:18px}' +
+    '.logo{width:46px;height:46px;border-radius:13px;background:linear-gradient(135deg,#6E6AF8,#4E4AC8);display:flex;align-items:center;justify-content:center;flex:none;box-shadow:0 8px 24px rgba(110,106,248,.35)}' +
+    '.logo svg{width:26px;height:26px}' +
+    'h1{margin:0;font-size:21px;letter-spacing:.2px}' +
+    '.tag{color:var(--sub);font-size:13px;margin-top:2px}' +
+    'label{display:block;font-size:12.5px;color:var(--sub);margin:14px 0 7px;font-weight:600;letter-spacing:.3px}' +
+    '.inWrap{display:flex;align-items:center;background:var(--panel2);border:1px solid var(--line);border-radius:13px;padding:0 12px;transition:border-color .15s}' +
+    '.inWrap:focus-within{border-color:var(--acc)}' +
+    'input{flex:1;background:none;border:none;outline:none;padding:13px 0;font-size:15px;color:var(--txt);min-width:0}' +
+    'input::placeholder{color:#5b6270}' +
+    '.btn{display:flex;align-items:center;justify-content:center;width:100%;margin-top:16px;padding:14px;border:none;border-radius:14px;font:inherit;font-weight:650;font-size:15px;background:var(--acc);color:#fff;cursor:pointer}' +
+    '.btn:active{transform:scale(.985)}' +
+    '.err{margin-top:12px;padding:10px 12px;border-radius:10px;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.35);color:#FDA4AF;font-size:13px;line-height:1.5}' +
+    '.hint{margin-top:14px;color:var(--sub);font-size:12.5px;line-height:1.6}' +
+    '.hint b{color:var(--txt)}' +
+    '</style></head><body><div class="card">' +
+    '<div class="logoRow"><div class="logo"><svg viewBox="0 0 64 64"><path d="M18 20h28v7H33.5L46 44h-8.5L27 30.5V44h-9z" fill="#fff"/></svg></div>' +
+    '<div><h1>z.ai pocket</h1><div class="tag">This worker is protected by a proxy token.</div></div></div>' +
+    (bad ? '<div class="err">That token was not accepted — check it and try again.</div>' : '') +
+    '<form method="GET" action="/">' +
+    '<label for="t">PROXY TOKEN</label>' +
+    '<div class="inWrap"><input id="t" name="__t" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="paste your PROXY_TOKEN" autofocus></div>' +
+    '<button class="btn" type="submit">Enter Z.ai&nbsp;&rarr;</button></form>' +
+    '<div class="hint">The token lives in your worker\u2019s <b>Settings &rarr; Variables &rarr; PROXY_TOKEN</b> on dash.cloudflare.com. ' +
+    'It is stored in a cookie on this device, so you only enter it once.</div>' +
+    '</div></body></html>';
+  return new Response(html, { status: bad ? 401 : 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
+}
