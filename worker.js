@@ -1,20 +1,28 @@
 /* =====================================================================
-   NEXUS BACKGROUND RELAY v11 — Cloudflare Worker
+   NEXUS BACKGROUND RELAY v12 — Cloudflare Worker
    THE WORKER OWNS THE REQUEST.
    =====================================================================
-   v11 — SELF-HEALING SCHEMA (fixes "status 502 / The provider had a
-   server error" on workers whose D1 was created by an older version):
-   v10's migration created an INDEX on a new column BEFORE adding that
-   column to databases that already had an older `jobs` table — the
-   index statement threw, the ALTERs that followed never ran, and every
-   submit failed with "D1_ERROR: table jobs has no column named
-   chat_key" (surfaced as 502). v11 runs the migration in the only sane
-   order (tables → columns → indexes), then WRITE-PROBES every table
-   with the exact statements the engine uses, REBUILDS the tables if a
-   probe still fails (jobs are transient — always safe), and if the
-   database is beyond repair it degrades to clean PASSTHROUGH so chat
-   keeps working no matter what D1 does. A broken database can never
-   take the relay down again.
+   v12 — NO MORE INSTANT "Connection failed" (fixes the post-deploy
+   regression where the app's live-cast attach died instantly with a
+   status-0 "Connection failed" error card, no retries):
+   1. COLD-ISOLATE COST: v11 re-ran the whole ~50-statement migration
+      (26 ALTERs + CREATEs + write-probes) on EVERY fresh worker
+      isolate — measured 10–11 SECONDS per request. Requests scattered
+      across cold isolates looked randomly dead-slow, breached the
+      app's 8s health probe, and racing rebuilds tripped D1 busy
+      errors. v12 stores a `schema_v` flag IN the database, written
+      only after migration + write-probes succeed: a cold isolate now
+      pays ONE cheap SELECT (~0.3s), not 50 statements.
+   2. 404 LIES: while an isolate was in its 15s "schema bad →
+      passthrough" window, GET /job/:id answered 404 "job not found"
+      for jobs that EXISTED. The app reads 404 as "job gone → give up
+      instantly" — that was the instant status-0 error. v12 job/status
+      endpoints try the read anyway and answer 503 (retryable) on a
+      D1 failure; 404 is reserved for "the row is genuinely gone".
+   3. An insert failure now INVALIDATES the schema flag so the next
+      request re-runs the full self-heal (the flag can never lie
+      forever).
+   (v11's self-healing schema fix for the v10 502 is preserved below.)
 
    THE MISSION: submit → the worker takes ownership of the generation the
    instant your prompt arrives (a durable D1 job exists BEFORE any upstream
@@ -84,7 +92,7 @@
         variable name EXACTLY: DB
      3. Settings → Triggers & Events → Cron Trigger → schedule EXACTLY:
         * * * * *
-     4. Open https://<your-worker>/health → must say "v":11, "d1":true,
+     4. Open https://<your-worker>/health → must say "v":12, "d1":true,
         "schemaOk":true, "cronOk":true. The health output tells you which
         step is missing.
 
@@ -99,7 +107,7 @@
    subrequest budgets degrade gracefully (fresh drivers resume the work).
    ===================================================================== */
 
-const WORKER_VERSION = 11;
+const WORKER_VERSION = 12;
 
 /* test tunables — production reads defaults; the local harness overrides
    via globalThis.__nexusTun to run E2E in seconds. */
@@ -304,12 +312,33 @@ async function rebuildTables(env) {
 
 /* schema creation is tracked PER DATABASE (not per module instance): a
    worker process can serve several D1 bindings (the local harness runs the
-   real + legacy-sim instances from one module) — each must get its tables */
+   real + legacy-sim instances from one module) — each must get its tables.
+   v12: the expensive ladder (tables → 26 ALTERs → indexes → write-probes)
+   runs ONCE PER DATABASE LIFETIME, not once per cold isolate — a
+   `schema_v` row in wstate, written only after the ladder + probes
+   succeed, lets every other isolate converge with ONE cheap SELECT
+   (measured: 10–11s → ~0.3s). The flag is invalidated (deleted) the
+   moment any engine INSERT fails, so it can never lie forever. */
+const SCHEMA_V_KEY = "schema_v";
+async function schemaFlagOk(env) {
+  try {
+    const r = await getSQL(env, `SELECT v FROM wstate WHERE k = ?`, [SCHEMA_V_KEY]);
+    return !!(r && Number(r.v) === WORKER_VERSION);
+  } catch (_) { return false; }
+}
+/* called when a real engine INSERT failed despite the flag: forget the
+   module flag AND the durable flag so the next request re-runs the full
+   self-heal ladder (other isolates included) */
+async function invalidateSchema(env) {
+  try { if (env && env.DB) { env.DB.__nexusSchemaDone = false; env.DB.__nexusSchemaBad = 0; } } catch (_) {}
+  try { if (hasDB(env)) await runSQL(env, `DELETE FROM wstate WHERE k = ?`, [SCHEMA_V_KEY]); } catch (_) {}
+}
 async function ensureSchema(env) {
   if (!hasDB(env)) return;
   const db = env.DB;
   if (db.__nexusSchemaDone) return;
   if (db.__nexusSchemaBad && Date.now() - db.__nexusSchemaBad < SCHEMA_RETRY_MS) return;
+  if (await schemaFlagOk(env)) { db.__nexusSchemaBad = 0; db.__nexusSchemaDone = true; return; }
   for (const s of SCHEMA_TABLES) await trySQL(env, s);
   for (const a of SCHEMA_ALTERS) await trySQL(env, a);
   for (const ix of SCHEMA_INDEXES) await trySQL(env, ix);
@@ -323,6 +352,7 @@ async function ensureSchema(env) {
   }
   db.__nexusSchemaBad = 0;
   db.__nexusSchemaDone = true;
+  try { await wstateSet(env, SCHEMA_V_KEY, WORKER_VERSION); } catch (_) {}
 }
 
 async function runSQL(env, sql, params) {
@@ -1082,7 +1112,7 @@ async function handleProxy(request, pathname, ctx, env) {
   if (submitMode) {
     try { return await handleSubmit(request, pathname, ctx, env, parsed, fwd); }
     catch (err) {
-      try { if (env && env.DB) env.DB.__nexusSchemaDone = false; } catch (_) {}
+      try { await invalidateSchema(env); } catch (_) {}
       try {
         const up = await fetch(upstreamBase(env) + (pathname === "/chat" ? "/chat/completions" : "/images"), {
           method: "POST", headers: headersFrom(fwd), body: rawBody,
@@ -1149,7 +1179,7 @@ async function handleProxy(request, pathname, ctx, env) {
       `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token, chat_key, req_key, parent, first_byte) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, 0, '', ?, ?, NULL, NULL, NULL, NULL, 0)`,
       [id, kind, now, now, JSON.stringify(parsed), JSON.stringify(meta)]);
   } catch (_) {
-    try { if (env && env.DB) env.DB.__nexusSchemaDone = false; } catch (_) {}
+    try { await invalidateSchema(env); } catch (_) {}
     const hdrs2 = new Headers(upstream.headers);
     for (const k in CORS) hdrs2.set(k, CORS[k]);
     return new Response(upstream.body, { status: upstream.status, headers: hdrs2 });
@@ -1166,10 +1196,19 @@ async function handleProxy(request, pathname, ctx, env) {
 }
 
 async function handleJobGet(url, ctx, env) {
-  if (!jobEngineOk(env)) return json({ error: "job not found (relay in passthrough mode)" }, 404);
   const id = url.pathname.split("/")[2];
   const offset = Math.max(0, Number(url.searchParams.get("offset") || 0) || 0);
-  const job = await getJobRow(env, id);
+  /* v12: NEVER answer 404 just because this isolate's schema view is bad —
+     the job EXISTS on the other side of a D1 hiccup, and the app reads 404
+     as "job gone → give up instantly" (the instant "Connection failed").
+     Try the self-heal, try the read, and answer 503 (retryable) when D1
+     itself fails. 404 is reserved for a row that is genuinely absent. */
+  let job = null, sqlErr = null;
+  if (hasDB(env)) {
+    try { await ensureSchema(env); } catch (_) {}
+    try { job = await getJobRow(env, id); } catch (err) { sqlErr = err; }
+  }
+  if (sqlErr) return json({ error: "job lookup failed on the database (the job keeps running — retry is safe)", retry: true }, 503);
   if (!job) return json({ error: "job not found (expired or relay restarted)" }, 404);
   maybeWorkAny(env, ctx); // a live-cast reader just attached — drive due work now
   const live = liveFor(id);
@@ -1182,9 +1221,15 @@ async function handleJobGet(url, ctx, env) {
 
 /* honest job status — the app's wait monitor + timing chips read this */
 async function handleJobStatus(url, ctx, env) {
-  if (!jobEngineOk(env)) return json({ error: "job not found (relay in passthrough mode)" }, 404);
   const id = url.pathname.split("/")[2];
-  const job = await getJobRow(env, id);
+  /* v12: same rule as /job/:id — a D1 failure answers 503 (the app's poll
+     falls back to local elapsed), never a lying 404 */
+  let job = null, sqlErr = null;
+  if (hasDB(env)) {
+    try { await ensureSchema(env); } catch (_) {}
+    try { job = await getJobRow(env, id); } catch (err) { sqlErr = err; }
+  }
+  if (sqlErr) return json({ error: "status lookup failed on the database", retry: true }, 503);
   if (!job) return json({ error: "job not found (expired or relay restarted)", gone: true }, 404);
   maybeWorkAny(env, ctx); // the app polls this while waiting — progress resumes NOW
   const now = Date.now();
@@ -1209,14 +1254,19 @@ async function handleJobStatus(url, ctx, env) {
 
 /* rediscovery: the newest job for a chat key (X-Nexus-Chat on submit) */
 async function handleJobByKey(url, ctx, env) {
-  if (!jobEngineOk(env)) return json({ error: "no job for this key (passthrough mode)" }, 404);
   const key = sanitizeKey(decodeURIComponent(url.pathname.split("/")[3] || ""));
   if (!key) return json({ error: "missing key" }, 400);
+  /* v12: D1 failure → 503 (the app retries rediscovery), never a lying 404 */
+  let rows = null;
+  if (hasDB(env)) {
+    try { await ensureSchema(env); } catch (_) {}
+    try {
+      rows = await allSQL(env, `SELECT id, kind, status, bytes, created_at FROM jobs WHERE chat_key = ? ORDER BY created_at DESC LIMIT 8`, [key]);
+    } catch (err) { return json({ error: "key lookup failed on the database", retry: true }, 503); }
+  } else {
+    return json({ error: "no job for this key (passthrough mode)" }, 404);
+  }
   maybeWorkAny(env, ctx); // a returning app just asked — drive due work now
-  let rows = [];
-  try {
-    rows = await allSQL(env, `SELECT id, kind, status, bytes, created_at FROM jobs WHERE chat_key = ? ORDER BY created_at DESC LIMIT 8`, [key]);
-  } catch (_) {}
   const now = Date.now();
   for (const r of rows) {
     const age = now - Number(r.created_at);
