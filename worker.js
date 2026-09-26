@@ -1,7 +1,21 @@
 /* =====================================================================
-   NEXUS BACKGROUND RELAY v10 — Cloudflare Worker
+   NEXUS BACKGROUND RELAY v11 — Cloudflare Worker
    THE WORKER OWNS THE REQUEST.
    =====================================================================
+   v11 — SELF-HEALING SCHEMA (fixes "status 502 / The provider had a
+   server error" on workers whose D1 was created by an older version):
+   v10's migration created an INDEX on a new column BEFORE adding that
+   column to databases that already had an older `jobs` table — the
+   index statement threw, the ALTERs that followed never ran, and every
+   submit failed with "D1_ERROR: table jobs has no column named
+   chat_key" (surfaced as 502). v11 runs the migration in the only sane
+   order (tables → columns → indexes), then WRITE-PROBES every table
+   with the exact statements the engine uses, REBUILDS the tables if a
+   probe still fails (jobs are transient — always safe), and if the
+   database is beyond repair it degrades to clean PASSTHROUGH so chat
+   keeps working no matter what D1 does. A broken database can never
+   take the relay down again.
+
    THE MISSION: submit → the worker takes ownership of the generation the
    instant your prompt arrives (a durable D1 job exists BEFORE any upstream
    request is even opened), drives it to completion server-side (re-requesting
@@ -70,8 +84,9 @@
         variable name EXACTLY: DB
      3. Settings → Triggers & Events → Cron Trigger → schedule EXACTLY:
         * * * * *
-     4. Open https://<your-worker>/health → must say "v":10, "d1":true,
-        "cronOk":true. The health output tells you which step is missing.
+     4. Open https://<your-worker>/health → must say "v":11, "d1":true,
+        "schemaOk":true, "cronOk":true. The health output tells you which
+        step is missing.
 
    AUTH NOTE (honest, unchanged): the OpenRouter Bearer key is needed to
    re-request the model while you are away, so it is stored in YOUR OWN D1
@@ -84,7 +99,7 @@
    subrequest budgets degrade gracefully (fresh drivers resume the work).
    ===================================================================== */
 
-const WORKER_VERSION = 10;
+const WORKER_VERSION = 11;
 
 /* test tunables — production reads defaults; the local harness overrides
    via globalThis.__nexusTun to run E2E in seconds. */
@@ -154,7 +169,11 @@ function sanitizeKey(v) {
    the exact same worker file runs under the local Bun test harness with a
    bun:sqlite shim, and under real Cloudflare with real D1.
    ===================================================================== */
-const SCHEMA_SQL = [
+/* ---- v11 schema layout, split so it can be applied in the ONLY sane
+   order: tables first, then missing columns, then indexes. (v10 created
+   idx_jobs_chat on chat_key BEFORE adding chat_key to legacy databases —
+   the throw aborted the whole migration and every submit 502ed.) ---- */
+const SCHEMA_TABLES = [
   `CREATE TABLE IF NOT EXISTS jobs (
      id TEXT PRIMARY KEY,
      kind TEXT NOT NULL DEFAULT 'chat',
@@ -190,20 +209,98 @@ const SCHEMA_SQL = [
      k TEXT PRIMARY KEY,
      v TEXT NOT NULL
      )`,
+];
+const SCHEMA_INDEXES = [
   `CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status, next_retry)`,
   `CREATE INDEX IF NOT EXISTS idx_jobs_chat ON jobs (chat_key, created_at)`,
 ];
 
-/* column adds for D1 databases created by older worker versions — each
-   statement fails silently when the column already exists */
+/* EVERY column the engine writes, for EVERY table — so a database from
+   ANY older worker shape converges. Each statement fails silently when
+   the column already exists. NOT NULL entries carry a DEFAULT (SQLite
+   requires one for ADD COLUMN). */
 const SCHEMA_ALTERS = [
+  `ALTER TABLE jobs ADD COLUMN id TEXT`,
+  `ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat'`,
+  `ALTER TABLE jobs ADD COLUMN status TEXT NOT NULL DEFAULT 'queued'`,
+  `ALTER TABLE jobs ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE jobs ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE jobs ADD COLUMN heartbeat INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE jobs ADD COLUMN next_retry INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE jobs ADD COLUMN finish INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE jobs ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE jobs ADD COLUMN content_text TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE jobs ADD COLUMN req TEXT`,
+  `ALTER TABLE jobs ADD COLUMN meta TEXT`,
+  `ALTER TABLE jobs ADD COLUMN lock_token TEXT`,
   `ALTER TABLE jobs ADD COLUMN chat_key TEXT`,
   `ALTER TABLE jobs ADD COLUMN req_key TEXT`,
   `ALTER TABLE jobs ADD COLUMN parent TEXT`,
   `ALTER TABLE jobs ADD COLUMN first_byte INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE chunks ADD COLUMN job TEXT`,
+  `ALTER TABLE chunks ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE chunks ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE chunks ADD COLUMN data TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE secrets ADD COLUMN job TEXT`,
+  `ALTER TABLE secrets ADD COLUMN auth TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE wstate ADD COLUMN k TEXT`,
+  `ALTER TABLE wstate ADD COLUMN v TEXT NOT NULL DEFAULT ''`,
 ];
 
 function hasDB(env) { return !!(env && env.DB); }
+/* a database that failed migration even after a rebuild — the relay
+   degrades to passthrough (chat keeps working) and retries the schema
+   check every SCHEMA_RETRY_MS in case D1 recovers */
+function schemaBad(env) {
+  const t = env && env.DB && env.DB.__nexusSchemaBad;
+  return !!(t && Date.now() - t < SCHEMA_RETRY_MS);
+}
+function jobEngineOk(env) { return hasDB(env) && !schemaBad(env); }
+const SCHEMA_RETRY_MS = 15000;
+
+async function trySQL(env, sql) {
+  try { await runSQL(env, sql, []); return true; } catch (_) { return false; }
+}
+
+/* WRITE-PROBE: run the exact INSERT shapes the engine uses, then clean
+   up. Reading the schema is not enough — a legacy table can ACCEPT our
+   SELECTs yet reject our INSERTs (e.g. an unknown NOT NULL column with
+   no default from an older worker). Probe rows use status 'probe', a
+   status no scanner ever looks at, so a concurrent reader can never
+   pick one up; if the cleanup DELETE itself fails, TTL pruning removes
+   the row (created_at = 0). Random ids keep concurrent boots from
+   colliding. One retry absorbs a transient D1 blip so we never rebuild
+   on a hiccup. */
+async function probeTables(env) {
+  const pid = "probe-" + crypto.randomUUID().slice(0, 12);
+  const tests = [
+    { ins: `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token, chat_key, req_key, parent, first_byte) VALUES (?, 'chat', 'probe', 0, 0, 0, 0, 0, 0, 0, '', '{}', '{}', NULL, '', '', '', 0)`, del: `DELETE FROM jobs WHERE id = ?`, params: [pid] },
+    { ins: `INSERT INTO chunks (job, seq, bytes, data) VALUES (?, 0, 0, '')`, del: `DELETE FROM chunks WHERE job = ?`, params: [pid] },
+    { ins: `INSERT INTO secrets (job, auth) VALUES (?, 'probe')`, del: `DELETE FROM secrets WHERE job = ?`, params: [pid] },
+    { ins: `INSERT INTO wstate (k, v) VALUES (?, '0')`, del: `DELETE FROM wstate WHERE k = ?`, params: [pid] },
+  ];
+  let allOk = true;
+  for (const t of tests) {
+    let ok = false;
+    for (let i = 0; i < 2 && !ok; i++) {
+      try { await runSQL(env, t.ins, t.params); ok = true; }
+      catch (_) { if (i === 0) await sleep(300); }
+    }
+    if (!ok) allOk = false;
+    try { await runSQL(env, t.del, t.params); } catch (_) {}
+  }
+  return allOk;
+}
+
+/* last resort for a legacy shape the ALTERs cannot fix — jobs are
+   transient by design (TTL minutes-to-hours), so rebuilding the tables
+   is ALWAYS safe and always converges to the exact v11 layout */
+async function rebuildTables(env) {
+  for (const t of ["jobs", "chunks", "secrets", "wstate"]) await trySQL(env, `DROP TABLE IF EXISTS ` + t);
+  for (const s of SCHEMA_TABLES) await trySQL(env, s);
+  for (const ix of SCHEMA_INDEXES) await trySQL(env, ix);
+}
 
 /* schema creation is tracked PER DATABASE (not per module instance): a
    worker process can serve several D1 bindings (the local harness runs the
@@ -212,8 +309,19 @@ async function ensureSchema(env) {
   if (!hasDB(env)) return;
   const db = env.DB;
   if (db.__nexusSchemaDone) return;
-  for (const s of SCHEMA_SQL) await runSQL(env, s, []);
-  for (const a of SCHEMA_ALTERS) { try { await runSQL(env, a, []); } catch (_) {} }
+  if (db.__nexusSchemaBad && Date.now() - db.__nexusSchemaBad < SCHEMA_RETRY_MS) return;
+  for (const s of SCHEMA_TABLES) await trySQL(env, s);
+  for (const a of SCHEMA_ALTERS) await trySQL(env, a);
+  for (const ix of SCHEMA_INDEXES) await trySQL(env, ix);
+  if (!(await probeTables(env))) {
+    await rebuildTables(env);
+    if (!(await probeTables(env))) {
+      /* beyond repair → passthrough (chat still works); re-probe later */
+      db.__nexusSchemaBad = Date.now();
+      return;
+    }
+  }
+  db.__nexusSchemaBad = 0;
   db.__nexusSchemaDone = true;
 }
 
@@ -469,7 +577,7 @@ function liveSubscriber(live, startOffset) {
    ANY reconnect at ANY offset is always byte-exact.
    ===================================================================== */
 async function driveJob(env, ctx, jobId, opts = {}) {
-  if (!hasDB(env)) return;
+  if (!jobEngineOk(env)) return;
   const live = liveFor(jobId);
   const token = await claimJob(env, jobId);
   if (!token) return; // another driver owns it — that's the whole race safety
@@ -951,10 +1059,11 @@ async function handleProxy(request, pathname, ctx, env) {
   for (const h of FWD_HEADERS) { const v = request.headers.get(h); if (v) fwd[h] = v; }
   const submitMode = request.headers.get("X-Nexus-Submit") === "1";
 
-  /* no D1 (or an unparseable body) → plain passthrough (graceful degrade —
-     a submit-mode app sees the streaming response and falls back to the
-     legacy protocol automatically) */
-  if (!hasDB(env) || !parsed) {
+  /* no usable D1 (or an unparseable body) → plain passthrough (graceful
+     degrade — a submit-mode app sees the streaming response and falls back
+     to the legacy protocol automatically). A BROKEN database takes the
+     same path: chat must keep working no matter what D1 does. */
+  if (!jobEngineOk(env) || !parsed) {
     const upstream = await fetch(upstreamBase(env) + (pathname === "/chat" ? "/chat/completions" : "/images"), {
       method: "POST", headers: headersFrom(fwd), body: rawBody,
       // @ts-ignore runtime-specific
@@ -965,11 +1074,27 @@ async function handleProxy(request, pathname, ctx, env) {
     return new Response(upstream.body, { status: upstream.status, headers: hdrs });
   }
 
-  /* ---- v10 SUBMIT: the job exists before the upstream does ---- */
+  /* ---- v10 SUBMIT: the job exists before the upstream does ----
+     If D1 hiccups at the exact moment of the INSERT (verified schema, but
+     a transient outage), we degrade THIS request to a clean passthrough —
+     the user gets their answer instead of an error card, and the schema
+     re-verifies on the next request. */
   if (submitMode) {
     try { return await handleSubmit(request, pathname, ctx, env, parsed, fwd); }
     catch (err) {
-      return json({ error: { message: "submit failed: " + ((err && err.message) || String(err)), code: 502 } }, 502);
+      try { if (env && env.DB) env.DB.__nexusSchemaDone = false; } catch (_) {}
+      try {
+        const up = await fetch(upstreamBase(env) + (pathname === "/chat" ? "/chat/completions" : "/images"), {
+          method: "POST", headers: headersFrom(fwd), body: rawBody,
+          // @ts-ignore runtime-specific
+          cf: { cacheTtl: 0 },
+        });
+        const hdrs = new Headers(up.headers);
+        for (const k in CORS) hdrs.set(k, CORS[k]);
+        return new Response(up.body, { status: up.status, headers: hdrs });
+      } catch (_) {
+        return json({ error: { message: "submit failed: " + ((err && err.message) || String(err)), code: 502 } }, 502);
+      }
     }
   }
 
@@ -1009,7 +1134,9 @@ async function handleProxy(request, pathname, ctx, env) {
     return new Response(upstream.body, { status: upstream.status, headers: hdrs });
   }
 
-  /* create the durable job */
+  /* create the durable job — a D1 hiccup here degrades to streaming the
+     attempt-0 response straight to the client (no durability for THIS
+     response, but never an error card) */
   const id = crypto.randomUUID();
   const kind = pathname === "/images" ? "images" : "chat";
   const now = Date.now();
@@ -1017,9 +1144,16 @@ async function handleProxy(request, pathname, ctx, env) {
   const metaFwd = Object.assign({}, fwd);
   delete metaFwd.authorization;
   const meta = { fwd: metaFwd, contentType };
-  await runSQL(env,
-    `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token, chat_key, req_key, parent, first_byte) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, 0, '', ?, ?, NULL, NULL, NULL, NULL, 0)`,
-    [id, kind, now, now, JSON.stringify(parsed), JSON.stringify(meta)]);
+  try {
+    await runSQL(env,
+      `INSERT INTO jobs (id, kind, status, created_at, updated_at, heartbeat, next_retry, attempts, finish, bytes, content_text, req, meta, lock_token, chat_key, req_key, parent, first_byte) VALUES (?, ?, 'queued', ?, ?, 0, 0, 0, 0, 0, '', ?, ?, NULL, NULL, NULL, NULL, 0)`,
+      [id, kind, now, now, JSON.stringify(parsed), JSON.stringify(meta)]);
+  } catch (_) {
+    try { if (env && env.DB) env.DB.__nexusSchemaDone = false; } catch (_) {}
+    const hdrs2 = new Headers(upstream.headers);
+    for (const k in CORS) hdrs2.set(k, CORS[k]);
+    return new Response(upstream.body, { status: upstream.status, headers: hdrs2 });
+  }
   if (fwd.authorization) {
     try { await runSQL(env, `INSERT INTO secrets (job, auth) VALUES (?, ?)`, [id, fwd.authorization]); } catch (_) {}
   }
@@ -1032,7 +1166,7 @@ async function handleProxy(request, pathname, ctx, env) {
 }
 
 async function handleJobGet(url, ctx, env) {
-  if (!hasDB(env)) return json({ error: "job not found (relay in passthrough mode)" }, 404);
+  if (!jobEngineOk(env)) return json({ error: "job not found (relay in passthrough mode)" }, 404);
   const id = url.pathname.split("/")[2];
   const offset = Math.max(0, Number(url.searchParams.get("offset") || 0) || 0);
   const job = await getJobRow(env, id);
@@ -1048,7 +1182,7 @@ async function handleJobGet(url, ctx, env) {
 
 /* honest job status — the app's wait monitor + timing chips read this */
 async function handleJobStatus(url, ctx, env) {
-  if (!hasDB(env)) return json({ error: "job not found (relay in passthrough mode)" }, 404);
+  if (!jobEngineOk(env)) return json({ error: "job not found (relay in passthrough mode)" }, 404);
   const id = url.pathname.split("/")[2];
   const job = await getJobRow(env, id);
   if (!job) return json({ error: "job not found (expired or relay restarted)", gone: true }, 404);
@@ -1075,7 +1209,7 @@ async function handleJobStatus(url, ctx, env) {
 
 /* rediscovery: the newest job for a chat key (X-Nexus-Chat on submit) */
 async function handleJobByKey(url, ctx, env) {
-  if (!hasDB(env)) return json({ error: "no job for this key (passthrough mode)" }, 404);
+  if (!jobEngineOk(env)) return json({ error: "no job for this key (passthrough mode)" }, 404);
   const key = sanitizeKey(decodeURIComponent(url.pathname.split("/")[3] || ""));
   if (!key) return json({ error: "missing key" }, 400);
   maybeWorkAny(env, ctx); // a returning app just asked — drive due work now
@@ -1104,7 +1238,7 @@ async function handleDelete(url, env) {
   const id = url.pathname.split("/")[2];
   const live = liveMap.get(id);
   if (live) liveAbort(live);
-  if (hasDB(env)) {
+  if (jobEngineOk(env)) {
     /* stop the spend: mark cancelled (running pumps lose their lock on the
        next flush and self-terminate); rows are pruned by TTL shortly after */
     try { await runSQL(env, `UPDATE jobs SET status = 'stopped', heartbeat = 0, lock_token = NULL, updated_at = ? WHERE id = ?`, [Date.now(), id]); } catch (_) {}
@@ -1115,7 +1249,7 @@ async function handleDelete(url, env) {
 
 /* ---------- maintenance ---------- */
 async function prune(env) {
-  if (!hasDB(env)) return;
+  if (!jobEngineOk(env)) return;
   const now = Date.now();
   try {
     const dead = await allSQL(env,
@@ -1143,7 +1277,7 @@ async function prune(env) {
    fresh execution context — this is what makes progress resume the
    instant the app reconnects, without waiting for the cron tick */
 async function maybeWorkAny(env, ctx) {
-  if (!hasDB(env)) return;
+  if (!jobEngineOk(env)) return;
   try {
     const now = Date.now();
     const r = await getSQL(env,
@@ -1163,12 +1297,16 @@ export default {
 
     if (url.pathname === "/health") {
       let out;
-      if (hasDB(env)) {
+      if (jobEngineOk(env)) {
         let cronAge = -1, active = 0;
         try { cronAge = Date.now() - (await wstateGet(env, "cron_beat") || 0); } catch (_) {}
         try { const n = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','streaming')`); active = n ? Number(n.n) : 0; } catch (_) {}
-        out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: true, mode: "job engine (worker owns the request)", cronOk: cronAge >= 0 && cronAge < 3 * 60 * 1000, cronAgeMs: cronAge, active, time: Date.now() };
+        out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: true, schemaOk: true, mode: "job engine (worker owns the request)", cronOk: cronAge >= 0 && cronAge < 3 * 60 * 1000, cronAgeMs: cronAge, active, time: Date.now() };
         if (!out.cronOk) out.setup = "add a Cron Trigger with schedule * * * * * (Settings → Triggers & Events) so jobs finish while your phone is off";
+      } else if (hasDB(env)) {
+        /* the D1 is bound but unusable — the relay is keeping chat alive in
+           passthrough mode and keeps retrying the schema every 15s */
+        out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: true, schemaOk: false, mode: "passthrough (D1 schema problem — chat still works; try Deploy again, or unbind and rebind the DB)", time: Date.now() };
       } else {
         out = { ok: true, relay: "nexus", v: WORKER_VERSION, d1: false, mode: "passthrough (bind D1 as DB for the background job engine)", time: Date.now(), setup: "create a D1 database and bind it with variable name DB (Settings → Bindings)" };
       }
@@ -1202,6 +1340,7 @@ export default {
   async scheduled(_event, env, ctx) {
     if (!hasDB(env)) return;
     try { await ensureSchema(env); } catch (_) { return; }
+    if (!jobEngineOk(env)) return;
     try { await wstateSet(env, "cron_beat", Date.now()); } catch (_) {}
     try { await prune(env); } catch (_) {}
     const deadline = Date.now() + TICK_BUDGET_MS;
