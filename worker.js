@@ -180,7 +180,7 @@
    subrequest budgets degrade gracefully (fresh drivers resume the work).
    ===================================================================== */
 
-const WORKER_VERSION = 15;
+const WORKER_VERSION = 16;
 
 /* test tunables — production reads defaults; the local harness overrides
    via globalThis.__nexusTun to run E2E in seconds. */
@@ -976,6 +976,7 @@ function makeParser() {
     serverRounds: 0,
     roundBase: 0,
     roundSawData: false,
+    sawDeltaContent: false, // v16: round-scoped guard — message.content skips when delta text already streamed
     feed(u8) {
       const text = this.dec.decode(u8, { stream: true });
       const nl = [];
@@ -1015,6 +1016,7 @@ function makeParser() {
           this.sawToolCalls = false;
           this.toolAcc = {};
           this.roundSawData = false;
+          this.sawDeltaContent = false; // a new round may legitimately deliver text as message.content
         } else {
           this.toolAcc = {};
           this.sawToolCalls = false;
@@ -1027,7 +1029,7 @@ function makeParser() {
       if (ch && ch.finish_reason) this.finishSeen = true;
       const d = ch && ch.delta;
       if (d) {
-        if (typeof d.content === "string" && d.content.length) this.contentText += d.content;
+        if (typeof d.content === "string" && d.content.length) { this.contentText += d.content; this.sawDeltaContent = true; }
         if (typeof d.reasoning === "string" && d.reasoning.length) this.sawReasoning = true;
         if (typeof d.reasoning_content === "string" && d.reasoning_content.length) this.sawReasoning = true;
         if (Array.isArray(d.tool_calls) && d.tool_calls.length) {
@@ -1043,6 +1045,33 @@ function makeParser() {
         }
         if (typeof d.content === "string" && d.content.length) this.roundSawData = true;
         if ((typeof d.reasoning === "string" && d.reasoning.length) || (typeof d.reasoning_content === "string" && d.reasoning_content.length)) this.roundSawData = true;
+      }
+      /* v16: MESSAGE-shaped events — providers without delta-style streaming
+         deliver the whole round as one choices[0].message event (content,
+         reasoning, COMPLETE tool_calls, finish_reason on the same choice).
+         Without this the round parsed as silence: the job "finished" with no
+         text and the tool round never executed. Guards mirror the app's
+         parser: message.content only counts when no delta text preceded it
+         (round-scoped), message.tool_calls are the complete authoritative
+         form and REPLACE any fragments. */
+      const m = ch && ch.message;
+      if (ch && m && typeof m === "object") {
+        if (typeof m.content === "string" && m.content.length && !this.sawDeltaContent) {
+          this.contentText += m.content;
+          this.roundSawData = true;
+        }
+        if ((typeof m.reasoning === "string" && m.reasoning.length) || (typeof m.reasoning_content === "string" && m.reasoning_content.length)) this.sawReasoning = true;
+        if (Array.isArray(m.tool_calls) && m.tool_calls.length && !(d && Array.isArray(d.tool_calls))) {
+          this.sawToolCalls = true;
+          this.roundSawData = true;
+          m.tool_calls.forEach((tc, i) => {
+            const idx = tc.index ?? i;
+            if (!this.toolAcc[idx]) this.toolAcc[idx] = { id: "", name: "", args: "" };
+            if (tc.id) this.toolAcc[idx].id = tc.id;
+            if (tc.function && tc.function.name) this.toolAcc[idx].name = tc.function.name;
+            if (tc.function && tc.function.arguments) this.toolAcc[idx].args = tc.function.arguments;
+          });
+        }
       }
       if (obj && (obj.usage || (!ch && !obj.error && !obj.choices))) this.roundSawData = true;
       this.eventIndex.push({ c: this.contentText.length, b: lineEndByte });
