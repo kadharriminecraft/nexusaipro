@@ -1,7 +1,36 @@
 /* =====================================================================
-   NEXUS BACKGROUND RELAY v15 — Cloudflare Worker
-   THE WORKER OWNS THE REQUEST — AND NOW YOUR FILES.
+   NEXUS BACKGROUND RELAY v17 — Cloudflare Worker
+   THE WORKER OWNS THE REQUEST — AND YOUR FILES — AND YOUR TOOLS.
    =====================================================================
+
+   v17 — "THE AI AND THE WORKER ARE INDEPENDENT": every tool the agent
+   can call now runs ON THE WORKER too — the phone is a pure observer.
+   v15 made the FILE tools server-side; v17 finishes the job:
+     - run_javascript — a real sandbox (fresh scope per run, console
+       capture, require('file.js') pre-loading .js files from the
+       mirror, 10s async timeout, loop-guard injection so sync infinite
+       loops die too — the exact app result strings). If the runtime
+       forbids string->code (eval/new Function), the round hands back.
+     - web tools — web_search / fetch_url / http_request /
+       get_weather / get_time / currency_convert / define_word, the
+       app's implementations ported line-for-line (a Worker fetches
+       with no CORS constraints — the proxies become pure fallbacks).
+     - GitHub tools — gh_list_repos / gh_list_files / gh_read_file /
+       gh_write_file / gh_delete_file against the CONNECTED repos.
+       The app now rides its GitHub settings (PAT + repo list + the
+       chat's resolved repos) on every /ws sync POST; the worker keeps
+       them in ws_meta.gh and commits while the phone is gone. No PAT
+       synced (or repo disconnected) -> the round hands back, exactly
+       as before — the phone is only needed for what only it can do.
+   The user's own words for the architecture this completes: "the Ai
+   and worker are independent with each other, I just happen to be an
+   observer and sync in, but if I turn off the worker then I take over,
+   and when the worker is back on I sync to it." Round classification
+   (roundAllServerExecutable) now asks, per call: is THIS tool
+   executable HERE? (file tools always; run_javascript if eval works;
+   web always; gh_* only with a synced PAT). One non-executable call
+   still hands the whole round back — pre-v17 apps keep working.
+
    v15 — "CLOUDFLARE IS THE BACKUP": the workspace file mirror + the
    server-side agent loop.
    The v14-and-earlier design executed EVERY agentic tool round on the
@@ -180,7 +209,7 @@
    subrequest budgets degrade gracefully (fresh drivers resume the work).
    ===================================================================== */
 
-const WORKER_VERSION = 16;
+const WORKER_VERSION = 17;
 
 /* test tunables — production reads defaults; the local harness overrides
    via globalThis.__nexusTun to run E2E in seconds. */
@@ -448,6 +477,7 @@ const SCHEMA_ALTERS = [
   `ALTER TABLE ws_meta ADD COLUMN chat_key TEXT`,
   `ALTER TABLE ws_meta ADD COLUMN rev INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE ws_meta ADD COLUMN synced_at INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE ws_meta ADD COLUMN gh TEXT`,
 ];
 
 function hasDB(env) { return !!(env && env.DB); }
@@ -692,25 +722,631 @@ function fsBuildDiffLines(oldText, newText, max = 60) {
   if (lines.length > max) return lines.slice(0, max).concat(["… (" + (lines.length - max) + " more changed lines)"]);
   return lines;
 }
-/* does a request's tools array declare any file tool? (submit-time check) */
-function requestHasFileTools(parsed) {
+/* =====================================================================
+   v17: THE REST OF THE TOOLBOX, SERVER-SIDE
+   run_javascript (sandboxed eval, mirror-backed require), the web
+   tools, and the GitHub tools — ported from the app so a run needs
+   NOTHING from the phone. Same aliases, same result strings, so the
+   model cannot tell where its code ran.
+   ===================================================================== */
+const JS_TOOLS = ["run_javascript"];
+const WEB_TOOLS = ["web_search", "fetch_url", "http_request", "get_weather", "get_time", "currency_convert", "define_word"];
+const GH_TOOLS = ["gh_list_repos", "gh_list_files", "gh_read_file", "gh_write_file", "gh_delete_file"];
+const SERVER_TOOL_ALIASES = {
+  ...FS_TOOL_ALIASES,
+  run_command: "run_javascript", execute_code: "run_javascript", run_code: "run_javascript", eval: "run_javascript", execute: "run_javascript", run: "run_javascript", bash: "run_javascript", shell: "run_javascript", run_python: "run_javascript",
+  search_web: "web_search", websearch: "web_search",
+  fetch: "fetch_url", open_url: "fetch_url", url_fetch: "fetch_url", browse: "fetch_url", get_url: "fetch_url",
+  http: "http_request", request: "http_request", api_request: "http_request",
+  time: "get_time", get_date: "get_time", datetime: "get_time",
+  weather: "get_weather",
+  convert_currency: "currency_convert", exchange_rates: "currency_convert",
+  define: "define_word", dictionary: "define_word", lookup_word: "define_word",
+  gh_list_repositories: "gh_list_repos", gh_repos: "gh_list_repos", list_repos: "gh_list_repos", list_github_repos: "gh_list_repos", github_list_repos: "gh_list_repos", github_repos: "gh_list_repos", repos: "gh_list_repos",
+  github_list_files: "gh_list_files", gh_list: "gh_list_files", list_github_files: "gh_list_files", gh_files: "gh_list_files", github_files: "gh_list_files", repo_files: "gh_list_files", list_repo_files: "gh_list_files",
+  github_read_file: "gh_read_file", read_github_file: "gh_read_file", read_repo_file: "gh_read_file", gh_file: "gh_read_file", get_file: "gh_read_file", github_get_file: "gh_read_file",
+  github_write_file: "gh_write_file", write_github_file: "gh_write_file", write_repo_file: "gh_write_file", gh_create_file: "gh_write_file", create_github_file: "gh_write_file", github_create_file: "gh_write_file", gh_commit: "gh_write_file", github_commit_file: "gh_write_file", commit_file: "gh_write_file", push_file: "gh_write_file", gh_push: "gh_write_file", github_push: "gh_write_file", push_to_repo: "gh_write_file", gh_update_file: "gh_write_file", update_github_file: "gh_write_file", update_repo_file: "gh_write_file", gh_edit_file: "gh_write_file", edit_github_file: "gh_write_file", edit_repo_file: "gh_write_file",
+  github_delete_file: "gh_delete_file", delete_github_file: "gh_delete_file", delete_repo_file: "gh_delete_file", remove_github_file: "gh_delete_file",
+};
+/* the web tools' shared arg normalizer (the app's normalizeToolArgs subset) */
+function webNormalizeArgs(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return args;
+  const out = { ...args };
+  const map = { query: ["q", "search", "search_query", "keywords"], url: ["link", "uri", "page", "address"], max_chars: ["max_chars", "limit", "max_length"], method: ["verb"], from: ["base", "source_currency"], to: ["target", "quote", "target_currency"], amount: ["value", "qty"], word: ["term"], timezone: ["tz", "zone"], days: ["forecast_days"], location: ["place", "city"], headers: ["http_headers", "request_headers"], body: ["data", "payload", "json"] };
+  for (const [canon, aliases] of Object.entries(map)) {
+    for (const a of aliases) if (a in out && !(canon in out)) { out[canon] = out[a]; delete out[a]; }
+  }
+  return out;
+}
+function webTruncateOut(text, max) {
+  text = String(text ?? "");
+  if (text.length <= max) return text;
+  return text.slice(0, max) + "\n…[output truncated, " + (text.length - max) + " more chars]";
+}
+function webHtmlToText(html) {
+  return String(html)
+    .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript\b[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<(?:br|\/p|\/div|\/li|\/h[1-6]|\/tr|\/section|\/article)\b[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&quot;/gi, '"').replace(/&#0?39;/g, "'")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+function webSafeHttpUrl(raw) {
+  try {
+    const u = new URL(String(raw || ""));
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    const h = u.hostname;
+    if (/^(localhost|127\.|0\.0\.0\.0|10\.|192\.168\.|169\.254\.)/.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h)) {
+      /* the app blocks private ranges; the local test harness points tools
+         at 127.0.0.1 mocks on purpose — allow them only under the tun */
+      if (!(globalThis.__nexusTun && globalThis.__nexusTun.allowLocalFetch)) return null;
+    }
+    return u;
+  } catch (_) { return null; }
+}
+function webShortUrl(raw) { try { const u = new URL(String(raw)); return u.host + (u.pathname.length > 1 ? u.pathname.slice(0, 24) : ""); } catch (_) { return String(raw || "").slice(0, 30); } }
+/* one fetch with a timeout — the app's toolFetch, ported. A Worker has
+   no CORS constraints; the browser proxies are kept purely as fallbacks
+   for sites that block bots. */
+async function webFetch(url, opts = {}, ms = 12000) {
+  const c = new AbortController();
+  const t = setTimeout(() => { try { c.abort(); } catch (_) {} }, ms);
+  try {
+    return await fetch(url, { method: opts.method || "GET", headers: opts.headers || {}, body: opts.body, redirect: opts.redirect || "follow", signal: c.signal, cf: { cacheTtl: 0 } });
+  } finally { clearTimeout(t); }
+}
+const WMO_CODES = { 0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast", 45: "fog", 48: "rime fog", 51: "light drizzle", 53: "drizzle", 55: "heavy drizzle", 56: "freezing drizzle", 57: "freezing drizzle", 61: "light rain", 63: "rain", 65: "heavy rain", 66: "freezing rain", 67: "freezing rain", 71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains", 80: "rain showers", 81: "rain showers", 82: "violent rain showers", 85: "snow showers", 86: "snow showers", 95: "thunderstorm", 96: "thunderstorm with hail", 99: "severe thunderstorm with hail" };
+/* the local harness can pin canned answers so e2e never depends on the
+   live internet: __nexusTun.webToolText = { web_search: "…" } */
+function webToolOverride(name) {
+  const t = globalThis.__nexusTun && globalThis.__nexusTun.webToolText;
+  return t && typeof t === "object" ? String(t[name] || "") : "";
+}
+async function webSearchImpl(args) {
+  const query = String(args.query || "").trim();
+  if (!query) return { text: "A search query is required.", label: "Searched the web", sub: "", icon: "search", failed: true };
+  const canned = webToolOverride("web_search");
+  if (canned) return { text: "Live web results for \"" + query + "\":\n\n" + canned, label: "Searched the web", sub: "“" + (query.length > 44 ? query.slice(0, 44) + "…" : query) + "”", icon: "search" };
+  try {
+    const r = await webFetch("https://s.jina.ai/" + encodeURIComponent(query), { headers: { Accept: "text/plain" } }, 10000);
+    if (r.ok) {
+      const text = (await r.text()).trim();
+      if (text.length > 60 && !/^\s*</.test(text)) return { text: "Live web results for \"" + query + "\":\n\n" + webTruncateOut(text, 6000), label: "Searched the web", sub: "“" + (query.length > 44 ? query.slice(0, 44) + "…" : query) + "”", icon: "search" };
+    }
+  } catch (_) {}
+  try {
+    const r = await webFetch("https://html.duckduckgo.com/html/?q=" + encodeURIComponent(query), {}, 10000);
+    if (r.ok) {
+      const html = await r.text();
+      const picks = [...html.matchAll(/class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)].slice(0, 5).map(m => {
+        let u = m[1];
+        const um = u.match(/[?&]uddg=([^&]+)/);
+        if (um) { try { u = decodeURIComponent(um[1]); } catch (_) {} }
+        return { url: u, title: webHtmlToText(m[2]) };
+      }).filter(p => p.title);
+      if (picks.length) return { text: "Web results (DuckDuckGo) for \"" + query + "\":\n\n" + picks.map((p, i) => (i + 1) + ". " + p.title + "\n   " + p.url).join("\n"), label: "Searched the web", sub: "“" + (query.length > 44 ? query.slice(0, 44) + "…" : query) + "”", icon: "search" };
+    }
+  } catch (_) {}
+  const r = await webFetch("https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*&list=search&srsearch=" + encodeURIComponent(query) + "&srlimit=5", {}, 10000);
+  if (!r.ok) return { text: "Search failed (HTTP " + r.status + ").", label: "Searched the web", sub: "", icon: "search", failed: true };
+  const j = await r.json().catch(() => null);
+  const hits = (j && j.query && j.query.search) || [];
+  if (!hits.length) return { text: "No results found for \"" + query + "\". Tell the user and answer from your own knowledge with a caveat.", label: "Searched the web", sub: "no results", icon: "search" };
+  return {
+    text: "Wikipedia results for \"" + query + "\":\n\n" + hits.map((h, i) => (i + 1) + ". " + h.title + "\n   https://en.wikipedia.org/wiki/" + encodeURIComponent(h.title.replace(/ /g, "_")) + "\n   " + webHtmlToText(h.snippet)).join("\n\n") + "\n\n(Live web search was unavailable — these are Wikipedia results.)",
+    label: "Searched the web", sub: "“" + (query.length > 44 ? query.slice(0, 44) + "…" : query) + "”", icon: "search",
+  };
+}
+async function webFetchUrlImpl(args) {
+  const canned = webToolOverride("fetch_url");
+  if (canned) return { text: "Fetched (canned):\n\n" + canned, label: "Read " + webShortUrl(args.url), sub: "", icon: "globe" };
+  const url = webSafeHttpUrl(args.url);
+  if (!url) return { text: "Provide a full public http(s) URL.", label: "Read page", sub: "", icon: "globe", failed: true };
+  const maxChars = Math.min(Math.max(1000, Number(args.max_chars) || 12000), 20000);
+  let text, how;
+  try {
+    const r = await webFetch(url.href, { headers: { Accept: "text/html,application/xhtml+xml,application/json;q=0.9,text/plain;q=0.8,*/*;q=0.5" } }, 10000);
+    if (!r.ok) return { text: "Couldn't fetch the page (HTTP " + r.status + ") — the site may block bots.", label: "Read " + url.host, sub: "", icon: "globe", failed: true };
+    const ct = r.headers.get("content-type") || "";
+    const body = await r.text();
+    text = /html|xml/i.test(ct) || /^\s*<(!doctype|html|\?xml)/i.test(body) ? webHtmlToText(body) : body;
+    how = "direct";
+  } catch (_) {
+    const r2 = await webFetch("https://r.jina.ai/" + url.href, { headers: { Accept: "text/plain" } }, 15000);
+    if (!r2.ok) return { text: "Couldn't fetch the page — the site may block bots.", label: "Read " + url.host, sub: "", icon: "globe", failed: true };
+    text = (await r2.text()).trim();
+    how = "reader proxy";
+  }
+  return { text: "Fetched " + url.host + url.pathname + " (" + how + ", " + fsFormatBytes(text.length) + " of text):\n\n" + webTruncateOut(text, maxChars), label: "Read " + webShortUrl(url.href), sub: "", icon: "globe" };
+}
+async function webHttpRequestImpl(args) {
+  const url = webSafeHttpUrl(args.url);
+  if (!url) return { text: "Provide a full public http(s) URL (private addresses are blocked).", label: "Called API", sub: "", icon: "transfer", failed: true };
+  const method = String(args.method || "GET").toUpperCase();
+  if (!["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"].includes(method)) return { text: "Unsupported method: " + method, label: "Called API", sub: "", icon: "transfer", failed: true };
+  const headers = {};
+  if (args.headers && typeof args.headers === "object" && !Array.isArray(args.headers)) {
+    for (const [k, v] of Object.entries(args.headers).slice(0, 25)) headers[String(k).slice(0, 80)] = String(v).slice(0, 4000);
+  }
+  const hasBody = args.body != null && String(args.body).length > 0 && method !== "GET" && method !== "HEAD";
+  if (hasBody && headers["Content-Type"] == null && headers["content-type"] == null) headers["Content-Type"] = "application/json";
+  let resp;
+  try {
+    resp = await webFetch(url.href, { method, headers, body: hasBody ? String(args.body).slice(0, 64000) : undefined }, 15000);
+  } catch (_) {
+    return { text: "The request timed out or was blocked by the network.", label: "Called API", sub: webShortUrl(url.href), icon: "transfer", failed: true };
+  }
+  const text = await resp.text().catch(() => "");
+  return { text: "HTTP " + resp.status + (resp.statusText ? " " + resp.statusText : "") + " · worker\nContent-Type: " + (resp.headers && resp.headers.get && resp.headers.get("content-type") || "unknown") + "\n\n" + webTruncateOut(text, 8000), label: "Called API" + (method !== "GET" ? " · " + method : ""), sub: webShortUrl(url.href), icon: "transfer" };
+}
+async function webWeatherImpl(args) {
+  const canned = webToolOverride("get_weather");
+  if (canned) return { text: canned, label: "Weather · " + (args.location || "?"), sub: "", icon: "cloud" };
+  const loc = String(args.location || "").trim();
+  if (!loc) return { text: "Which place?", label: "Weather", sub: "", icon: "cloud", failed: true };
+  const days = Math.min(Math.max(1, Math.round(Number(args.days) || 3)), 7);
+  const gr = await webFetch("https://geocoding-api.open-meteo.com/v1/search?name=" + encodeURIComponent(loc) + "&count=1&language=en&format=json", {}, 9000);
+  const gj = await gr.json().catch(() => null);
+  const g = gj && gj.results && gj.results[0];
+  if (!g) return { text: "Couldn't find a place called \"" + loc + "\".", label: "Weather", sub: "", icon: "cloud", failed: true };
+  const wr = await webFetch("https://api.open-meteo.com/v1/forecast?latitude=" + g.latitude + "&longitude=" + g.longitude + "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=" + days + "&timezone=auto", {}, 10000);
+  if (!wr.ok) return { text: "Weather service failed (HTTP " + wr.status + ").", label: "Weather", sub: "", icon: "cloud", failed: true };
+  const w = await wr.json();
+  const c = w.current || {};
+  const lines = ["Weather for " + g.name + (g.admin1 ? ", " + g.admin1 : "") + (g.country ? ", " + g.country : "") + " (" + (w.timezone || "?") + ")", "",
+    "Now: " + (c.temperature_2m ?? "?") + "°C (feels like " + (c.apparent_temperature ?? "?") + "°C), " + (WMO_CODES[c.weather_code] || "weather code " + c.weather_code) + ", humidity " + (c.relative_humidity_2m ?? "?") + "%, wind " + (c.wind_speed_10m ?? "?") + " km/h", ""];
+  const d = w.daily || {};
+  (d.time || []).forEach((day, i) => {
+    lines.push(day + ": " + (d.temperature_2m_min && d.temperature_2m_min[i] !== undefined ? d.temperature_2m_min[i] : "?") + "–" + (d.temperature_2m_max && d.temperature_2m_max[i] !== undefined ? d.temperature_2m_max[i] : "?") + "°C · " + (WMO_CODES[d.weather_code && d.weather_code[i]] || "?") + " · " + (d.precipitation_probability_max && d.precipitation_probability_max[i] !== undefined ? d.precipitation_probability_max[i] : "?") + "% rain");
+  });
+  return { text: lines.join("\n"), label: "Weather · " + (args.location || "?"), sub: "", icon: "cloud" };
+}
+function webTimeImpl(args) {
+  const raw = args.timezone ? String(args.timezone).trim() : "";
+  let zone = raw;
+  if (zone) {
+    try { new Intl.DateTimeFormat("en-US", { timeZone: zone }).format(new Date()); }
+    catch (_) { return { text: 'Unknown timezone "' + zone + '" — use IANA names like America/Chicago or Asia/Tokyo.', label: "Checked the time", sub: "", icon: "clock", failed: true }; }
+  } else {
+    zone = "UTC";
+  }
+  const now = new Date();
+  const fmt = new Intl.DateTimeFormat("en-US", { timeZone: zone, weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short" }).format(now);
+  return { text: "Current time in " + zone + ": " + fmt + "\nUTC reference: " + now.toUTCString(), label: "Checked the time", sub: zone, icon: "clock" };
+}
+async function webCurrencyImpl(args) {
+  const canned = webToolOverride("currency_convert");
+  if (canned) return { text: canned, label: "Rates " + String(args.from || "?").toUpperCase() + " → " + String(args.to || "?").toUpperCase(), sub: "", icon: "coins" };
+  const from = String(args.from || "").trim().toUpperCase();
+  const to = String(args.to || "").trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(from) || !/^[A-Z]{3}$/.test(to)) return { text: "Use 3-letter currency codes, e.g. USD, EUR, JPY.", label: "Rates", sub: "", icon: "coins", failed: true };
+  const r = await webFetch("https://open.er-api.com/v6/latest/" + from, {}, 10000);
+  if (!r.ok) return { text: "Rate service failed (HTTP " + r.status + ").", label: "Rates", sub: "", icon: "coins", failed: true };
+  const j = await r.json().catch(() => null);
+  const rate = j && j.rates && j.rates[to];
+  if (!rate) return { text: "No rate found for " + from + " → " + to + ".", label: "Rates", sub: "", icon: "coins", failed: true };
+  const amount = Number(args.amount) || 1;
+  const out = amount * rate;
+  return { text: amount + " " + from + " = " + (Math.abs(out) >= 1 ? out.toFixed(2) : out.toPrecision(4)) + " " + to + "\nRate: 1 " + from + " = " + rate + " " + to + "\nUpdated: " + (j.time_last_update_utc || j.time_last_update_date || "recently"), label: "Rates " + from + " → " + to, sub: "", icon: "coins" };
+}
+async function webDefineImpl(args) {
+  const canned = webToolOverride("define_word");
+  if (canned) return { text: canned, label: "Defined “" + String(args.word || "").slice(0, 24) + "”", sub: "", icon: "book" };
+  const word = String(args.word || "").trim().split(/\s+/)[0].toLowerCase();
+  if (!word) return { text: "Which word?", label: "Dictionary", sub: "", icon: "book", failed: true };
+  const r = await webFetch("https://api.dictionaryapi.dev/api/v2/entries/en/" + encodeURIComponent(word), {}, 9000);
+  if (r.status === 404) return { text: "No dictionary entry for \"" + word + "\" — it may be a proper noun, brand, or very new word.", label: "Dictionary", sub: "", icon: "book", failed: true };
+  if (!r.ok) return { text: "Dictionary service failed (HTTP " + r.status + ").", label: "Dictionary", sub: "", icon: "book", failed: true };
+  const j = await r.json().catch(() => null);
+  const entry = Array.isArray(j) ? j[0] : null;
+  if (!entry) return { text: "Unexpected dictionary response.", label: "Dictionary", sub: "", icon: "book", failed: true };
+  const out = [word + (entry.phonetic ? " · " + entry.phonetic : "")];
+  let n = 0;
+  for (const m of entry.meanings || []) {
+    for (const df of m.definitions || []) {
+      if (n >= 5) break;
+      n++;
+      out.push(n + ". (" + m.partOfSpeech + ") " + df.definition + (df.example ? "\n   e.g. " + df.example : ""));
+    }
+    if (n >= 5) break;
+  }
+  return { text: out.join("\n"), label: "Defined “" + String(args.word || "").slice(0, 24) + "”", sub: "", icon: "book" };
+}
+
+/* ---------- GitHub tools (the connected repos ride the ws sync) ---------- */
+const GH_TIMEOUT = 30000;
+function ghApiBase(env) { return ((env && env.NEXUS_GH_API) || "https://api.github.com").replace(/\/+$/, ""); }
+function ghRepoKeyOf(r) { return String(r.owner || "") + "/" + String(r.repo || ""); }
+async function wsGetGh(env, chatKey) {
+  try {
+    const r = await getSQL(env, `SELECT gh FROM ws_meta WHERE chat_key = ?`, [chatKey]);
+    if (!r || !r.gh) return null;
+    const g = JSON.parse(r.gh);
+    if (!g || typeof g !== "object") return null;
+    const repos = Array.isArray(g.repos) ? g.repos.slice(0, 20).map(x => ({
+      owner: String(x.owner || "").slice(0, 80), repo: String(x.repo || "").slice(0, 100),
+      fullName: String(x.fullName || (x.owner + "/" + x.repo)).slice(0, 200),
+      branch: String(x.branch || "main").slice(0, 100), allowEdit: !!x.allowEdit,
+    })).filter(x => x.owner && x.repo) : [];
+    return { pat: String(g.pat || "").slice(0, 200), repos };
+  } catch (_) { return null; }
+}
+function ghErrText(status, msg, hint) {
+  if (status === 401) return "GitHub rejected the token (401) — it is invalid, expired, or was revoked. Reconnect it with a fresh classic token that has the repo scope (Settings → GitHub).";
+  if (status === 403) return "GitHub refused (403) — " + (msg || "access denied") + ". Usually the token lacks the repo scope, the rate limit is hit, or the repo is private and the token can't see it.";
+  if (status === 404) return "GitHub returned 404 — " + (msg || "not found") + (hint ? ". " + hint : ". The repo, branch, or file path doesn't exist (or the token has no access to the private repo).");
+  if (status === 409 || status === 422) return "GitHub rejected the write (" + status + ") — " + (msg || "conflict") + ". The file changed since it was read (sha mismatch); it was re-read and retried automatically once.";
+  if (status >= 500) return "GitHub server error (" + status + ") — " + (msg || "try again in a moment") + ".";
+  return "GitHub error (" + status + "): " + (msg || "request failed") + ".";
+}
+async function ghApi(env, pat, path, { method = "GET", body, expect = "json", retry = true } = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, GH_TIMEOUT);
+  let resp;
+  try {
+    resp = await fetch(ghApiBase(env) + path, {
+      method,
+      headers: {
+        "Authorization": "Bearer " + pat,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "nexus-ai-pro",
+        ...(body != null ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body != null ? JSON.stringify(body) : undefined,
+      signal: ctrl.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (retry && err && err.name !== "AbortError") return ghApi(env, pat, path, { method, body, expect, retry: false });
+    if (err && err.name === "AbortError") throw new Error("GitHub didn't respond within " + Math.round(GH_TIMEOUT / 1000) + "s (timeout) — the tool call was not left hanging.");
+    throw new Error("GitHub request failed: " + (err && err.message || String(err)));
+  }
+  clearTimeout(timer);
+  if (resp.status >= 500 && retry) return ghApi(env, pat, path, { method, body, expect, retry: false });
+  if (!resp.ok) {
+    let msg = "";
+    try { const j = await resp.json(); msg = (j && j.message) || ""; } catch (_) {}
+    const e = new Error(ghErrText(resp.status, msg, resp.status === 404 && method !== "GET" ? "Verify the repo name and that the token has repo scope for it." : ""));
+    e.status = resp.status;
+    throw e;
+  }
+  if (resp.status === 204 || expect === "none") return null;
+  if (expect === "text") return await resp.text();
+  return await resp.json();
+}
+function ghResolveRepoSynced(gh, args) {
+  const list = (gh && gh.repos) || [];
+  if (!list.length) throw new Error("No GitHub repositories are connected to this app yet. The user connects them once with the ＋ button → GitHub repo — after that every chat can see them.");
+  const want = String((args && args.repo) ?? "").trim().toLowerCase();
+  if (want) {
+    let hit = list.find(r => ghRepoKeyOf(r).toLowerCase() === want) ||
+      list.find(r => String(r.repo || "").toLowerCase() === want) ||
+      list.find(r => String(r.fullName || "").toLowerCase() === want);
+    if (!hit) throw new Error("The repo \"" + (args && args.repo) + "\" is not connected. Connected: " + list.map(ghRepoKeyOf).join(", ") + ".");
+    return hit;
+  }
+  if (list.length === 1) return list[0];
+  throw new Error("Several GitHub repos are connected — pass the \"repo\" argument (owner/name) to pick one: " + list.map(ghRepoKeyOf).join(", ") + ". (Check them with gh_list_repos.)");
+}
+function ghSplitPathForUrl(p) { return p.split("/").map(encodeURIComponent).join("/"); }
+async function ghListReposImpl(gh) {
+  const list = (gh && gh.repos) || [];
+  if (!list.length) return { text: "No GitHub repositories are connected to this app yet. The user can add them with the ＋ button → GitHub repo.", label: "Checked GitHub repos", sub: "none connected", icon: "github" };
+  return {
+    text: "Connected GitHub repositories (pass repo=\"owner/name\" on gh_* tool calls when several are listed):\n" +
+      list.map(r => "- " + ghRepoKeyOf(r) + " · branch " + (r.branch || "main") + (r.allowEdit ? " · read+write (commits allowed)" : " · read-only")).join("\n"),
+    label: "Checked GitHub repos", sub: list.length + " connected", icon: "github",
+  };
+}
+async function ghListFilesImpl(env, gh, args) {
+  const b = ghResolveRepoSynced(gh, args);
+  const path = String(args.path || "").replace(/^\/+/, "").replace(/\/+$/, "");
+  const tree = await ghApi(env, gh.pat, "/repos/" + b.owner + "/" + b.repo + "/git/trees/" + encodeURIComponent(b.branch || "main") + "?recursive=1");
+  const all = ((tree && tree.tree) || []).filter(t => t.type === "blob" && (!path || String(t.path || "").startsWith(path + "/")));
+  if (!all.length) return { text: path ? "No files under \"" + path + "\" in " + b.fullName + " — the folder may be empty or missing (it must exist)." : "The repository " + b.fullName + " is empty — no files yet on branch " + (b.branch || "main") + ". Use gh_write_file to create the first file.", label: "Checked " + b.fullName, sub: "0 files", icon: "github" };
+  const rows = all.slice(0, 300).map(t => t.path + "  (" + fsFormatBytes(t.size || 0) + ")");
+  const truncated = all.length > 300 ? "\n…[first 300 of " + all.length + " files — narrow with a subfolder path]" : "";
+  return { text: "Files in " + b.fullName + " (branch " + (b.branch || "main") + ")" + (path ? " under " + path + "/" : "") + ":\n" + rows.join("\n") + truncated, label: "Checked " + b.fullName, sub: all.length + " files", icon: "github" };
+}
+async function ghReadFileImpl(env, gh, args) {
+  const b = ghResolveRepoSynced(gh, args);
+  const p = String(args.path || "").replace(/^\/+/, "");
+  if (!p) throw new Error("A file path is required, e.g. index.html — get exact paths from gh_list_files.");
+  const data = await ghApi(env, gh.pat, "/repos/" + b.owner + "/" + b.repo + "/contents/" + ghSplitPathForUrl(p) + "?ref=" + encodeURIComponent(b.branch || "main"));
+  if (data && data.type === "dir") throw new Error("\"" + p + "\" is a folder, not a file — list its files with gh_list_files path=\"" + p + "\".");
+  if (typeof (data && data.content) !== "string") throw new Error("No readable content came back for " + p + " (it may be a symlink or over 1MB — GitHub blocks raw reads above 1MB).");
+  const bin = atob(data.content.replace(/\s/g, ""));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const content = new TextDecoder("utf-8").decode(bytes);
+  const allLines = content.split("\n");
+  const total = allLines.length;
+  const totalBytes = data.size || content.length;
+  if (content.length <= 16000 && args.offset == null && args.limit == null) {
+    return { text: content, label: "Read " + p, sub: fsFormatBytes(totalBytes) + " · " + total + " lines", icon: "github", file: p };
+  }
+  const offset = Math.max(1, Math.floor(Number(args.offset) || 1));
+  const limit = Math.min(600, Math.max(1, Math.floor(Number(args.limit) || 400)));
+  if (offset > total) throw new Error("offset " + offset + " is past the end of the file (" + total + " lines).");
+  const end = Math.min(total, offset - 1 + limit);
+  const bodyText = allLines.slice(offset - 1, end).map((l, i) => String(offset + i).padStart(5) + "| " + l).join("\n");
+  const footer = end < total
+    ? "\n…[lines " + offset + "–" + end + " of " + total + " — call gh_read_file with offset " + (end + 1) + " for the next chunk]"
+    : "\n[End of file — " + total + " lines total]";
+  return { text: bodyText + footer, label: "Read " + p, sub: "lines " + offset + "–" + end + " of " + total, icon: "github", file: p };
+}
+async function ghWriteFileImpl(env, gh, args) {
+  const b = ghResolveRepoSynced(gh, args);
+  if (!b.allowEdit) throw new Error("The repo " + ghRepoKeyOf(b) + " is read-only — its \"Allow AI to edit & push\" switch is off (＋ button → GitHub repo). The user must enable it before the AI can write, commit, or push to that repo.");
+  const p = String(args.path || "").replace(/^\/+/, "");
+  if (!p) throw new Error("A file path is required, e.g. index.html.");
+  const content = String(args.content ?? "");
+  if (!content.length) throw new Error("The file content is empty — pass the complete file content in the content argument (a 0-byte write was refused on purpose).");
+  const message = String(args.message || "").trim() || "AI: create/update " + p + " via Nexus AI Pro";
+  const base = "/repos/" + b.owner + "/" + b.repo;
+  let sha = null, existed = false, prevSize = 0;
+  try {
+    const cur = await ghApi(env, gh.pat, base + "/contents/" + ghSplitPathForUrl(p) + "?ref=" + encodeURIComponent(b.branch || "main"));
+    if (typeof (cur && cur.content) === "string") { sha = cur.sha; existed = true; prevSize = cur.size || 0; }
+    else if (cur && cur.sha) { sha = cur.sha; existed = true; }
+  } catch (err) {
+    if (!err || err.status !== 404) throw err; // 404 = file doesn't exist yet = create
+  }
+  const bytes = new TextEncoder().encode(content);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  const payload = { message, content: btoa(bin), branch: b.branch || "main" };
+  if (sha) payload.sha = sha;
+  let commit;
+  try {
+    commit = await ghApi(env, gh.pat, base + "/contents/" + ghSplitPathForUrl(p), { method: "PUT", body: payload });
+  } catch (err) {
+    if (err && (err.status === 409 || err.status === 422) && sha) {
+      const fresh = await ghApi(env, gh.pat, base + "/contents/" + ghSplitPathForUrl(p) + "?ref=" + encodeURIComponent(b.branch || "main"));
+      payload.sha = (fresh && fresh.sha) || sha;
+      commit = await ghApi(env, gh.pat, base + "/contents/" + ghSplitPathForUrl(p), { method: "PUT", body: payload });
+    } else throw err;
+  }
+  const sha7 = String((commit && commit.commit && commit.commit.sha) || "").slice(0, 7);
+  const url = "https://github.com/" + b.owner + "/" + b.repo + "/blob/" + (b.branch || "main") + "/" + p;
+  return {
+    text: "Committed " + p + " to " + b.fullName + " (" + (existed ? "updated, was " + fsFormatBytes(prevSize) : "new file") + ", now " + fsFormatBytes(content.length) + ", " + content.split("\n").length + " lines). Commit " + sha7 + " — " + url + ". The change is LIVE on GitHub now.",
+    label: (existed ? "Updated " : "Created ") + p + " on GitHub",
+    sub: fsFormatBytes(content.length) + " · commit " + (sha7 || "ok"),
+    icon: "github", file: p,
+  };
+}
+async function ghDeleteFileImpl(env, gh, args) {
+  const b = ghResolveRepoSynced(gh, args);
+  if (!b.allowEdit) throw new Error("The repo " + ghRepoKeyOf(b) + " is read-only — its \"Allow AI to edit & push\" switch is off, so deletes are refused.");
+  const p = String(args.path || "").replace(/^\/+/, "");
+  if (!p) throw new Error("A file path is required.");
+  const base = "/repos/" + b.owner + "/" + b.repo;
+  const cur = await ghApi(env, gh.pat, base + "/contents/" + ghSplitPathForUrl(p) + "?ref=" + encodeURIComponent(b.branch || "main"));
+  if (typeof (cur && cur.content) !== "string" && !(cur && cur.sha)) throw new Error("File not found: " + p + " — use gh_list_files for exact paths.");
+  const commit = await ghApi(env, gh.pat, base + "/contents/" + ghSplitPathForUrl(p), {
+    method: "DELETE",
+    body: { message: String(args.message || "").trim() || "AI: delete " + p + " via Nexus AI Pro", sha: cur.sha, branch: b.branch || "main" },
+  });
+  const sha7 = String((commit && commit.commit && commit.commit.sha) || "").slice(0, 7);
+  return {
+    text: "Deleted " + p + " from " + b.fullName + " (commit " + sha7 + "). The file is gone from branch " + (b.branch || "main") + " — gh_list_files will no longer show it.",
+    label: "Deleted " + p, sub: "commit " + (sha7 || "ok"), icon: "github", file: p,
+  };
+}
+
+/* ---------- run_javascript: the sandbox --------------------------------
+   The app runs code in a throwaway Web Worker: fresh scope, captured
+   console, require() over the workspace .js files, 10s hard terminate.
+   The worker's isolate cannot be terminated — so the sandbox gets:
+     - a FRESH FUNCTION SCOPE per run (new Function + direct eval → no
+       cross-run leakage, eval semantics for the completion value),
+     - a LOCAL console/require shadowing the globals (zero global
+       mutation — concurrent jobs stay isolated),
+     - pre-loaded mirror .js files for require() (the file write_file
+       created seconds ago in the SAME run is right there — the user's
+       "it can't run commands and find it immediately after creating a
+       file" bug, dead at the root),
+     - Promise.race timeouts for async hangs,
+     - LOOP-GUARD INJECTION: string/comment-masked scan finds loop
+       heads, injects a Date.now() deadline check into the body — a
+       sync infinite loop dies in ~10s instead of burning the isolate
+       (and a parse-check: if the guarded code doesn't compile, the
+       unguarded original runs — injection can never break valid code).
+   If the runtime forbids string->code entirely (some sandboxes do),
+   run_javascript hands back to the phone — same as v16. */
+let EVAL_PROBE = null, EVAL_FORCED = null;
+function evalAvailable() {
+  const forced = !!(globalThis.__nexusTun && globalThis.__nexusTun.noEval);
+  if (EVAL_PROBE === null || EVAL_FORCED !== forced) {
+    EVAL_FORCED = forced;
+    try { EVAL_PROBE = forced ? false : (new Function("return 1")() === 1); } catch (_) { EVAL_PROBE = false; }
+  }
+  return EVAL_PROBE;
+}
+/* mask string/template/comment CONTENT (not structure) with spaces —
+   same length, so positions map 1:1 onto the original */
+function sandboxMaskLiterals(code) {
+  let out = "";
+  let i = 0;
+  const n = code.length;
+  let mode = 0; // 0 code, 1 ', 2 ", 3 `, 4 //, 5 /* */
+  while (i < n) {
+    const c = code[i];
+    if (mode === 0) {
+      if (c === "'") { mode = 1; out += " "; i++; }
+      else if (c === '"') { mode = 2; out += " "; i++; }
+      else if (c === "`") { mode = 3; out += " "; i++; }
+      else if (c === "/" && code[i + 1] === "/") { mode = 4; out += "  "; i += 2; }
+      else if (c === "/" && code[i + 1] === "*") { mode = 5; out += "  "; i += 2; }
+      else { out += c; i++; }
+    } else if (mode === 1 || mode === 2) {
+      const q = mode === 1 ? "'" : '"';
+      if (c === "\\") { out += "  "; i += 2; }
+      else if (c === q) { out += " "; i++; mode = 0; }
+      else { out += (c === "\n" ? "\n" : " "); i++; }
+    } else if (mode === 3) {
+      if (c === "\\") { out += "  "; i += 2; }
+      else if (c === "`") { out += " "; i++; mode = 0; }
+      else { out += (c === "\n" ? "\n" : " "); i++; }
+    } else if (mode === 4) {
+      if (c === "\n") { out += "\n"; i++; mode = 0; }
+      else { out += " "; i++; }
+    } else {
+      if (c === "*" && code[i + 1] === "/") { out += "  "; i += 2; mode = 0; }
+      else { out += (c === "\n" ? "\n" : " "); i++; }
+    }
+  }
+  return out;
+}
+const SANDBOX_LIMIT_MS = 9500;
+function sandboxInjectGuards(code) {
+  const masked = sandboxMaskLiterals(code);
+  const guard = 'if(Date.now()-__nxT0>' + SANDBOX_LIMIT_MS + ')throw new Error("Execution timed out (10s limit) — possible infinite loop.");';
+  const points = [];
+  const kw = /\b(while|for)\b/g;
+  let m;
+  while ((m = kw.exec(masked))) {
+    let i = m.index + m[0].length;
+    while (i < masked.length && /\s/.test(masked[i])) i++;
+    if (masked[i] !== "(") continue;
+    let depth = 0, j = i;
+    for (; j < masked.length; j++) {
+      if (masked[j] === "(") depth++;
+      else if (masked[j] === ")") { depth--; if (!depth) break; }
+    }
+    if (depth) continue;
+    let k = j + 1;
+    while (k < masked.length && /\s/.test(masked[k])) k++;
+    if (masked[k] !== "{") continue; // no-brace body — rare; fail open
+    points.push(k + 1);
+  }
+  const doKw = /\bdo\b/g;
+  while ((m = doKw.exec(masked))) {
+    let i = m.index + 2;
+    while (i < masked.length && /\s/.test(masked[i])) i++;
+    if (masked[i] !== "{") continue;
+    points.push(i + 1);
+  }
+  if (!points.length) return code;
+  points.sort((a, b) => b - a);
+  let out = code;
+  for (const p of points) out = out.slice(0, p) + guard + out.slice(p);
+  return out;
+}
+/* the runner: fresh scope, local console + require, direct eval for the
+   app's exact completion-value semantics, async-aware */
+const SANDBOX_WRAPPER_SRC =
+  'const __nxLogs = [];\n' +
+  'const __nxFmt = v => { try {' +
+  '  if (typeof v === "string") return v;' +
+  '  if (v instanceof Error) return v.name + ": " + v.message;' +
+  '  const s = JSON.stringify(v, null, 1); return s === undefined ? String(v) : s;' +
+  ' } catch (e) { try { return String(v); } catch (_) { return "[unserializable]"; } } };\n' +
+  'const console = { log: (...a) => __nxLogs.push({ level: "log", text: a.map(__nxFmt).join(" ") }), warn: (...a) => __nxLogs.push({ level: "warn", text: a.map(__nxFmt).join(" ") }), error: (...a) => __nxLogs.push({ level: "error", text: a.map(__nxFmt).join(" ") }), info: (...a) => __nxLogs.push({ level: "info", text: a.map(__nxFmt).join(" ") }) };\n' +
+  'const require = p => {' +
+  '  p = String(p).replace(/^\\.\\//, "");' +
+  '  if (!(p in __nxFiles)) { const alt = Object.keys(__nxFiles).find(k => k.endsWith("/" + p) || k.endsWith(p)); if (!alt) throw new Error("File not found: " + p + " (available: " + Object.keys(__nxFiles).join(", ") + ")"); p = alt; }' +
+  '  return (0, eval)(__nxFiles[p]);' +
+  '};\n' +
+  'const __nxT0 = Date.now();\n' +
+  'try {\n' +
+  '  let __nxR = eval(__nxCode);\n' +
+  '  if (__nxR && typeof __nxR.then === "function") {\n' +
+  '    __nxR = await Promise.race([__nxR, new Promise((_, rej) => setTimeout(() => rej(new Error("Execution timed out (10s limit) — possible infinite loop.")), 10000))]);\n' +
+  '  }\n' +
+  '  return { logs: __nxLogs, result: __nxFmt(__nxR), ms: Date.now() - __nxT0 };\n' +
+  '} catch (e) { return { logs: __nxLogs, error: __nxFmt(e), ms: Date.now() - __nxT0 }; }';
+let SANDBOX_MAKER = null;
+function sandboxRunner() {
+  if (!SANDBOX_MAKER) SANDBOX_MAKER = new Function('return (async function(__nxFiles, __nxCode){\n' + SANDBOX_WRAPPER_SRC + '\n});');
+  return SANDBOX_MAKER(); // the async runner itself — call it with (files, code)
+}
+async function runServerJavascript(env, chatKey, code) {
+  const src = String(code ?? "");
+  if (!src.trim()) return { text: "No code was provided.", label: "Ran code", sub: "empty", icon: "terminal", failed: true };
+  /* pre-load the mirror's .js/.mjs/.cjs files — require() sees exactly
+     what the model's earlier write_file rounds created */
+  const files = {};
+  let loaded = 0;
+  try {
+    const rows = await allSQL(env, `SELECT path, bytes FROM ws_files WHERE chat_key = ? ORDER BY path ASC`, [chatKey]);
+    for (const r of rows) {
+      const p = String(r.path || "");
+      if (!(p.endsWith(".js") || p.endsWith(".mjs") || p.endsWith(".cjs"))) continue;
+      if (loaded > 60 || (Number(r.bytes) || 0) > 256 * 1024) continue;
+      const row = await wsGetFile(env, chatKey, p);
+      if (row) { files[p] = row.content; loaded++; }
+    }
+  } catch (_) {}
+  /* loop guards + the parse-check safety net: if the guarded version
+     doesn't compile, run the original unguarded (injection can never
+     break valid code — and if the original is broken too, the eval
+     reports the syntax error exactly like the app's sandbox would) */
+  let guarded = sandboxInjectGuards(src);
+  if (guarded !== src) {
+    try { new Function(guarded); } catch (_) { guarded = src; }
+  }
+  const run = sandboxRunner()(files, guarded);
+  const result = await Promise.race([
+    run,
+    new Promise(r => setTimeout(() => r({ logs: [], error: "Execution timed out (10s limit) — possible infinite loop.", ms: 10000 }), 10500)),
+  ]);
+  const parts = [];
+  if (result && result.logs && result.logs.length) parts.push("Console:\n" + result.logs.map(l => "[" + l.level + "] " + l.text).join("\n"));
+  if (result && result.error) parts.push("Error: " + result.error);
+  else parts.push("Result: " + ((result && result.result) ?? "undefined"));
+  parts.push("(" + ((result && result.ms) || 0) + "ms)");
+  return {
+    text: webTruncateOut(parts.join("\n\n"), 6000),
+    label: "Ran code",
+    sub: (result && result.error ? "error" : ((result && result.ms) || 0) + "ms · " + ((result && result.logs && result.logs.length) || 0) + " logs"),
+    icon: "terminal",
+  };
+}
+
+/* does a request's tools array declare anything the worker can run?
+   (submit-time check — v17 widens file tools to the full toolbox) */
+function requestHasServerTools(parsed) {
   try {
     const tools = parsed && parsed.tools;
     if (!Array.isArray(tools)) return false;
     for (const t of tools) {
       const n = t && t.function && t.function.name;
-      if (FS_TOOLS.includes(n) || FS_TOOL_ALIASES[n]) return true;
+      if (n && (FS_TOOLS.includes(n) || JS_TOOLS.includes(n) || WEB_TOOLS.includes(n) || GH_TOOLS.includes(n) || SERVER_TOOL_ALIASES[n])) return true;
     }
   } catch (_) {}
   return false;
 }
 /* can EVERY call in this round run on the worker? (round-time check —
-   one gh_* call hands the whole round back to the phone) */
-function roundAllServerExecutable(calls) {
-  if (!calls.length) return false;
+   the answer is per-call and per-capability: gh_* needs a synced PAT,
+   run_javascript needs a runtime that allows string->code. One
+   non-executable call hands the whole round back to the phone, exactly
+   like v15 — pre-v17 apps keep working.) */
+async function roundAllServerExecutable(env, chatKey, calls) {
+  if (!calls || !calls.length) return false;
+  let gh = null, ghChecked = false;
   for (const c of calls) {
-    const resolved = FS_TOOL_ALIASES[c.name] || c.name;
-    if (!FS_TOOLS.includes(resolved)) return false;
+    const resolved = SERVER_TOOL_ALIASES[c.name] || c.name;
+    if (FS_TOOLS.includes(resolved)) continue;
+    if (WEB_TOOLS.includes(resolved)) continue;
+    if (JS_TOOLS.includes(resolved)) {
+      if (evalAvailable()) continue;
+      return false;
+    }
+    if (GH_TOOLS.includes(resolved)) {
+      if (!ghChecked) { gh = await wsGetGh(env, chatKey); ghChecked = true; }
+      if (gh && gh.pat && gh.repos.length) continue;
+      return false;
+    }
+    return false;
   }
   return true;
 }
@@ -718,9 +1354,73 @@ function roundAllServerExecutable(calls) {
    {text, label, sub, icon, file, failed}. Throws become failed results —
    the model gets the same honest guidance the app gives it. */
 async function runServerTool(env, chatKey, rawName, args) {
-  const name = FS_TOOL_ALIASES[rawName] || rawName;
+  const name = SERVER_TOOL_ALIASES[rawName] || rawName;
   try {
     switch (name) {
+      /* ---- v17: run_javascript — the sandbox, mirror-backed ---- */
+      case "run_javascript": {
+        return await runServerJavascript(env, chatKey, String((args && args.code) || ""));
+      }
+      /* ---- v17: the web tools, worker-side ---- */
+      case "web_search": {
+        const a = webNormalizeArgs(args);
+        const q = String((a && a.query) || "").trim();
+        if (!q) throw new Error("A search query is required.");
+        return await webSearchImpl(a);
+      }
+      case "fetch_url": {
+        const a = webNormalizeArgs(args);
+        if (!a || !String(a.url || "").trim()) throw new Error("Provide a full public http(s) URL.");
+        return await webFetchUrlImpl(a);
+      }
+      case "http_request": {
+        const a = webNormalizeArgs(args);
+        if (!a || !String(a.url || "").trim()) throw new Error("Provide a full public http(s) URL (private addresses are blocked).");
+        return await webHttpRequestImpl(a);
+      }
+      case "get_weather": {
+        const a = webNormalizeArgs(args);
+        if (!a || !String(a.location || "").trim()) throw new Error("Which place?");
+        return await webWeatherImpl(a);
+      }
+      case "get_time": {
+        return webTimeImpl(webNormalizeArgs(args) || {});
+      }
+      case "currency_convert": {
+        const a = webNormalizeArgs(args);
+        if (!a || !String(a.from || "").trim() || !String(a.to || "").trim()) throw new Error("Use 3-letter currency codes, e.g. USD, EUR, JPY.");
+        return await webCurrencyImpl(a);
+      }
+      case "define_word": {
+        const a = webNormalizeArgs(args);
+        if (!a || !String(a.word || "").trim()) throw new Error("Which word?");
+        return await webDefineImpl(a);
+      }
+      /* ---- v17: the GitHub tools, synced-settings-backed ---- */
+      case "gh_list_repos": {
+        const gh = await wsGetGh(env, chatKey);
+        return await ghListReposImpl(gh);
+      }
+      case "gh_list_files": {
+        const gh = await wsGetGh(env, chatKey);
+        if (!gh || !gh.pat) throw new Error("No GitHub token connected — open the + button → GitHub repo to connect one.");
+        return await ghListFilesImpl(env, gh, webNormalizeArgs(args) || {});
+      }
+      case "gh_read_file": {
+        const gh = await wsGetGh(env, chatKey);
+        if (!gh || !gh.pat) throw new Error("No GitHub token connected — open the + button → GitHub repo to connect one.");
+        return await ghReadFileImpl(env, gh, webNormalizeArgs(args) || {});
+      }
+      case "gh_write_file": {
+        const gh = await wsGetGh(env, chatKey);
+        if (!gh || !gh.pat) throw new Error("No GitHub token connected — open the + button → GitHub repo to connect one.");
+        return await ghWriteFileImpl(env, gh, webNormalizeArgs(args) || {});
+      }
+      case "gh_delete_file": {
+        const gh = await wsGetGh(env, chatKey);
+        if (!gh || !gh.pat) throw new Error("No GitHub token connected — open the + button → GitHub repo to connect one.");
+        return await ghDeleteFileImpl(env, gh, webNormalizeArgs(args) || {});
+      }
       case "list_files": {
         const rows = await allSQL(env, `SELECT path, bytes FROM ws_files WHERE chat_key = ? ORDER BY path ASC`, [chatKey]);
         if (!rows.length) return { text: "The workspace is empty — no files yet.", label: "Checked files", sub: "0 files", icon: "folder" };
@@ -1317,13 +2017,17 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
       let args = {};
       let parseOk = true;
       try { args = JSON.parse(c.args || "{}"); } catch (_) { parseOk = false; }
-      if (parseOk && args && typeof args === "object" && !Array.isArray(args)) args = fsNormalizeArgs(args);
+      if (parseOk && args && typeof args === "object" && !Array.isArray(args)) {
+        const resolvedProbe = SERVER_TOOL_ALIASES[c.name] || c.name;
+        if (WEB_TOOLS.includes(resolvedProbe)) args = webNormalizeArgs(args);
+        else args = fsNormalizeArgs(args);
+      }
       let res;
       if (!parseOk) {
         res = { text: "The arguments for " + c.name + " were not valid JSON (truncated or malformed) and the call was NOT executed. Retry with complete, valid JSON — if you keep hitting the length limit, work in smaller pieces (e.g. write_file with less content, or several edit_file calls).", label: "Malformed call · " + c.name, sub: "invalid arguments", icon: "alert", failed: true };
       } else {
         res = await runServerTool(env, job.chatKey, c.name, args || {});
-        const resolved = FS_TOOL_ALIASES[c.name] || c.name;
+        const resolved = SERVER_TOOL_ALIASES[c.name] || c.name;
         if (resolved !== c.name) {
           res = { ...res, text: res.text + "\n\n(Note: \"" + c.name + "\" is not an available tool — this ran as " + resolved + ". Call " + resolved + " directly next time.)" };
         }
@@ -1374,7 +2078,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
      server_round marker for those calls). Execute it now, then run on. */
   if (serverRoundsOn() && !job.finish && parser.finishSeen && parser.sawToolCalls) {
     const calls = parser.toolCalls();
-    if (roundAllServerExecutable(calls)) {
+    if (await roundAllServerExecutable(env, job.chatKey, calls)) {
       const ok = await execServerRound();
       if (!ok) { await finalizeDone(env, jobId, token, live, tsettle); return; }
     }
@@ -1584,7 +2288,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
              the pre-v15 protocol. */
           if (serverRoundsOn() && parser.sawToolCalls) {
             const calls = parser.toolCalls();
-            if (roundAllServerExecutable(calls)) {
+            if (await roundAllServerExecutable(env, job.chatKey, calls)) {
               const ok = await execServerRound();
               if (!ok) { liveAbort(live); return; }
               /* a server round is not a failed attempt — the retry budget
@@ -1731,11 +2435,11 @@ async function handleSubmit(request, pathname, ctx, env, parsed, fwd) {
   /* v14: the starting retry pace rides the submit (the app's pace row) */
   const retryMode = sanitizeKey(request.headers.get("X-Nexus-Retry"));
   /* v15: the submit declares a SYNCED workspace mirror — the worker may
-     execute this chat's file-tool rounds server-side (X-Nexus-WS: 1 after
-     a successful syncWorkspace). Only honored when the request actually
-     declares file tools; old apps never send the header. */
+     execute this chat's tool rounds server-side (X-Nexus-WS: 1 after
+     a successful syncWorkspace — v17: ANY worker-executable tool counts,
+     not just file tools). Old apps never send the header. */
   const wsSync = request.headers.get("X-Nexus-WS") === "1";
-  const serverTools = !!(wsSync && chatKey && pathname === "/chat" && requestHasFileTools(parsed));
+  const serverTools = !!(wsSync && chatKey && pathname === "/chat" && requestHasServerTools(parsed));
 
   /* idempotency: a network retry of the same submission must not
      double-spend — hand back the job we already created */
@@ -1839,6 +2543,27 @@ async function handleWsSync(request, env) {
     }
     if (adopted || deleted.length) { try { await wsBumpRev(env, chatKey); } catch (_) {} }
     try { await runSQL(env, `INSERT INTO ws_meta (chat_key, rev, synced_at) VALUES (?, 0, ?) ON CONFLICT(chat_key) DO UPDATE SET synced_at = excluded.synced_at`, [chatKey, Date.now()]); } catch (_) {}
+    /* v17: the app rides its GitHub connection (PAT + the chat's resolved
+       repos) so gh_* rounds can commit while the phone is gone. Sanitized
+       hard, stored with the mirror (same trust level as the job's own
+       Authorization key in `secrets`), refreshed on every sync. An empty
+       pat CLEARS it — a disconnected GitHub disconnects the worker too.
+       AFTER the ws_meta upsert above so the row always exists. */
+    if (body.gh !== undefined) {
+      let ghOut = null;
+      try {
+        const g = (body.gh && typeof body.gh === "object" && !Array.isArray(body.gh)) ? body.gh : {};
+        const pat = String(g.pat || "").trim().slice(0, 200);
+        const repos = Array.isArray(g.repos) ? g.repos.slice(0, 20).map(x => {
+          if (!x || typeof x !== "object") return null;
+          const owner = String(x.owner || "").slice(0, 80), repo = String(x.repo || "").slice(0, 100);
+          if (!owner || !repo) return null;
+          return { owner, repo, fullName: String(x.fullName || owner + "/" + repo).slice(0, 200), branch: String(x.branch || "main").slice(0, 100), allowEdit: !!x.allowEdit };
+        }).filter(Boolean) : [];
+        if (pat && repos.length) ghOut = JSON.stringify({ pat, repos });
+      } catch (_) { ghOut = null; }
+      try { await runSQL(env, `UPDATE ws_meta SET gh = ? WHERE chat_key = ?`, [ghOut, chatKey]); } catch (_) {}
+    }
     let manifest = {};
     try { manifest = await wsManifest(env, chatKey); } catch (err) { return json({ error: "manifest failed on the database", retry: true }, 503); }
     return json({ ok: true, chatKey, rev: await wsRev(env, chatKey), adopted, conflicts, ws: { meta: manifest }, v: WORKER_VERSION });
