@@ -205,11 +205,15 @@
    worker degrades to a plain streaming passthrough relay.
 
    LIMITS (honest): unfinished jobs are worked for up to 30 min / 24
-   attempts; finished jobs replay for 2h; 8 MB buffer per job; free-plan
-   subrequest budgets degrade gracefully (fresh drivers resume the work).
+   attempts; finished jobs replay for 2h — and are then ARCHIVED (v18:
+   the response record lives on after the job rows are pruned, so a
+   phone that comes back hours or days later still syncs the whole
+   response, exactly like it syncs the files); 8 MB buffer per job;
+   free-plan subrequest budgets degrade gracefully (fresh drivers
+   resume the work).
    ===================================================================== */
 
-const WORKER_VERSION = 17;
+const WORKER_VERSION = 18;
 
 /* test tunables — production reads defaults; the local harness overrides
    via globalThis.__nexusTun to run E2E in seconds. */
@@ -233,6 +237,11 @@ const TAIL_POLL_FAST = TUN("tailPollFast", 400);
 const TAIL_POLL_SLOW = TUN("tailPollSlow", 2000);
 const MAX_ACTIVE_JOBS = 64;
 const MAX_TOTAL_JOBS = 256;
+/* v18: how many finished responses each chat keeps in the archive (the
+   newest N). The file mirror keeps files forever; the response archive
+   keeps the last N runs — anything older was superseded by later runs
+   on the same chat. */
+const RESP_ARCHIVE_KEEP = TUN("respArchiveKeep", 8);
 
 const FWD_HEADERS = ["authorization", "content-type", "http-referer", "x-title", "accept"];
 const NEXUS_HEADERS = ["x-nexus-submit", "x-nexus-chat", "x-nexus-key", "x-nexus-parent", "x-nexus-ws"];
@@ -424,10 +433,36 @@ const SCHEMA_TABLES = [
      rev INTEGER NOT NULL DEFAULT 0,
      synced_at INTEGER NOT NULL DEFAULT 0
      )`,
+  /* v18: the RESPONSE ARCHIVE — the durable twin of the file mirror.
+     The file mirror keeps the chat's FILES forever; the response archive
+     keeps the chat's last FINISHED RESPONSES (done + failed) after the
+     job rows themselves are TTL-pruned. A phone that comes back hours or
+     days later syncs EVERYTHING from the worker — not just the files.
+     Buffer bytes live in resp_chunks rows (same shape the live chunks
+     table uses, one flush per row) so total size is bounded only by
+     MAX_JOB_BYTES, never by a single statement limit. */
+  `CREATE TABLE IF NOT EXISTS resp_archive (
+     chat_key TEXT NOT NULL,
+     job_id TEXT NOT NULL,
+     kind TEXT NOT NULL DEFAULT 'chat',
+     status TEXT NOT NULL DEFAULT 'done',
+     bytes INTEGER NOT NULL DEFAULT 0,
+     meta TEXT,
+     finished_at INTEGER NOT NULL DEFAULT 0,
+     PRIMARY KEY (chat_key, job_id)
+     )`,
+  `CREATE TABLE IF NOT EXISTS resp_chunks (
+     chat_key TEXT NOT NULL,
+     job_id TEXT NOT NULL,
+     idx INTEGER NOT NULL,
+     data TEXT NOT NULL,
+     PRIMARY KEY (chat_key, job_id, idx)
+     )`,
 ];
 const SCHEMA_INDEXES = [
   `CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status, next_retry)`,
   `CREATE INDEX IF NOT EXISTS idx_jobs_chat ON jobs (chat_key, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_resp_chat ON resp_archive (chat_key, finished_at)`,
 ];
 
 /* EVERY column the engine writes, for EVERY table — so a database from
@@ -514,6 +549,8 @@ async function probeTables(env) {
     { ins: `INSERT INTO ws_files (chat_key, path, bytes, mtime, parts) VALUES (?, 'probe', 0, 0, 0)`, del: `DELETE FROM ws_files WHERE chat_key = ?`, params: [pid] },
     { ins: `INSERT INTO ws_chunks (chat_key, path, idx, data) VALUES (?, 'probe', 0, '')`, del: `DELETE FROM ws_chunks WHERE chat_key = ?`, params: [pid] },
     { ins: `INSERT INTO ws_meta (chat_key, rev, synced_at) VALUES (?, 0, 0)`, del: `DELETE FROM ws_meta WHERE chat_key = ?`, params: [pid] },
+  { ins: `INSERT INTO resp_archive (chat_key, job_id, kind, status, bytes, meta, finished_at) VALUES (?, ?, 'chat', 'done', 0, '{}', 0)`, del: `DELETE FROM resp_archive WHERE chat_key = ? AND job_id = ?`, params: [pid, pid] },
+  { ins: `INSERT INTO resp_chunks (chat_key, job_id, idx, data) VALUES (?, ?, 0, '')`, del: `DELETE FROM resp_chunks WHERE chat_key = ? AND job_id = ?`, params: [pid, pid] },
   ];
   let allOk = true;
   for (const t of tests) {
@@ -1629,6 +1666,89 @@ async function deleteJobRows(env, id) {
   await runSQL(env, `DELETE FROM chunks WHERE job = ?`, [id]);
   await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
   await runSQL(env, `DELETE FROM jobs WHERE id = ?`, [id]);
+}
+
+/* =====================================================================
+   v18: THE RESPONSE ARCHIVE — "make sure the sync from the worker is
+   EVERYTHING". Done jobs used to be deleted outright after 2h; the
+   phone then found a 404, marked the response "interrupted — cut off"
+   and tried to re-prompt the model, while the FILES (mirror, never
+   pruned) still synced fine — the exact split outcome the user reported.
+   Now the prune first ARCHIVES the job: the full byte buffer (copied
+   row-for-row from the live chunk log) + the row's meta move into
+   resp_archive/resp_chunks, which are NEVER pruned by TTL. /job/:id,
+   /job/:id/status and /job/by-key all serve the archived record after
+   the job rows are gone, so a phone returning hours or days later
+   replays the exact same stream a live done job would have sent —
+   snap-in sync, one pass, done. Only SYSTEM prunes archive: an explicit
+   user removal (panel "remove"/"clear finished") deletes for real, and
+   stopped/parked runs are never archived (the user cancelled; the
+   round belongs to the phone). */
+async function archiveJob(env, id) {
+  try {
+    const row = await getJobRow(env, id);
+    if (!row || !row.chatKey) return false;       // no chat to sync back to
+    const st = String(row.status);
+    if (st !== "done" && st !== "failed") return false; // stopped = user cancelled; parked = the phone's round
+    /* copy the buffer row-for-row (each live chunk row is already
+       statement-sized; total is bounded by MAX_JOB_BYTES) */
+    await runSQL(env,
+      `INSERT OR REPLACE INTO resp_chunks (chat_key, job_id, idx, data) SELECT ?, ?, seq, data FROM chunks WHERE job = ? ORDER BY seq ASC`,
+      [row.chatKey, id, id]);
+    const meta = { ...(row.meta || {}) };
+    meta.timing = { waitMs: row.waitMs, workMs: row.workMs, finishedAt: row.updatedAt };
+    await runSQL(env,
+      `INSERT OR REPLACE INTO resp_archive (chat_key, job_id, kind, status, bytes, meta, finished_at) VALUES (?,?,?,?,?,?,?)`,
+      [row.chatKey, id, row.kind || "chat", st, row.bytes, JSON.stringify(meta), row.updatedAt]);
+    /* retention: newest RESP_ARCHIVE_KEEP runs per chat; orphan chunks go too */
+    await runSQL(env,
+      `DELETE FROM resp_archive WHERE chat_key = ? AND job_id NOT IN (SELECT job_id FROM (SELECT job_id FROM resp_archive WHERE chat_key = ? ORDER BY finished_at DESC, job_id DESC LIMIT ?))`,
+      [row.chatKey, row.chatKey, RESP_ARCHIVE_KEEP]);
+    await runSQL(env,
+      `DELETE FROM resp_chunks WHERE chat_key = ? AND job_id NOT IN (SELECT job_id FROM resp_archive WHERE chat_key = ?)`,
+      [row.chatKey, row.chatKey]);
+    return true;
+  } catch (_) { return false; }
+}
+async function getArchiveRow(env, jobId) {
+  try {
+    const r = await getSQL(env, `SELECT * FROM resp_archive WHERE job_id = ? ORDER BY finished_at DESC LIMIT 1`, [jobId]);
+    if (!r) return null;
+    let meta = {};
+    try { meta = r.meta ? JSON.parse(r.meta) : {}; } catch (_) {}
+    return {
+      jobId: r.job_id, chatKey: r.chat_key, kind: r.kind || "chat", status: String(r.status),
+      bytes: Number(r.bytes) || 0, meta, finishedAt: Number(r.finished_at) || 0,
+      waitMs: Number(meta.timing && meta.timing.waitMs) || 0,
+      workMs: Number(meta.timing && meta.timing.workMs) || 0,
+    };
+  } catch (_) { return null; }
+}
+async function newestArchiveForChat(env, chatKey) {
+  try {
+    const r = await getSQL(env, `SELECT job_id FROM resp_archive WHERE chat_key = ? ORDER BY finished_at DESC, job_id DESC LIMIT 1`, [chatKey]);
+    return r ? getArchiveRow(env, r.job_id) : null;
+  } catch (_) { return null; }
+}
+/* the archived job's full buffer as a Response — byte-identical to what
+   the live tail delivered, ending on the same terminal event the job
+   finished with, so the app's parser closes it as a clean done stream */
+async function archiveReplayResponse(env, arc) {
+  let rows = [];
+  try {
+    rows = await allSQL(env, `SELECT data FROM resp_chunks WHERE chat_key = ? AND job_id = ? ORDER BY idx ASC`, [arc.chatKey, arc.jobId]);
+  } catch (_) {}
+  const enc = new TextEncoder();
+  const parts = (rows || []).map(r => enc.encode(String(r.data)));
+  const total = parts.reduce((n, p) => n + p.byteLength, 0);
+  let off = 0;
+  const body = new ReadableStream({
+    start(c) {
+      for (const p of parts) { try { c.enqueue(p); } catch (_) {} off += p.byteLength; }
+      try { c.close(); } catch (_) {}
+    },
+  });
+  return new Response(body, { status: 200, headers: relayHeaders(arc.meta && arc.meta.contentType, arc.jobId, { "X-Nexus-Offset": String(total), "X-Nexus-Archive": "1" }) });
 }
 
 /* v14: retire job rows OUTSIDE the pump (user stop / stop-all / parent
@@ -2887,7 +3007,15 @@ async function handleJobGet(url, ctx, env) {
     try { job = await getJobRow(env, id); } catch (err) { sqlErr = err; }
   }
   if (sqlErr) return json({ error: "job lookup failed on the database (the job keeps running — retry is safe)", retry: true }, 503);
-  if (!job) return json({ error: "job not found (expired or relay restarted)" }, 404);
+  if (!job) {
+    /* v18: the job rows were pruned (done past its replay window) — but a
+       FINISHED run is never really gone: the archive holds the full buffer.
+       Replay it exactly like a live done job so a returning phone snaps to
+       the final state instead of reading 404 as "interrupted — cut off". */
+    const arc = await getArchiveRow(env, id);
+    if (arc) return archiveReplayResponse(env, arc);
+    return json({ error: "job not found (expired or relay restarted)" }, 404);
+  }
   maybeWorkAny(env, ctx); // a live-cast reader just attached — drive due work now
   /* v13: the D1-polling tail is the ONLY delivery path. The old in-isolate
      live fast-path (liveSubscriber) was retired: it closed the client's
@@ -2910,7 +3038,26 @@ async function handleJobStatus(url, ctx, env) {
     try { job = await getJobRow(env, id); } catch (err) { sqlErr = err; }
   }
   if (sqlErr) return json({ error: "status lookup failed on the database", retry: true }, 503);
-  if (!job) return json({ error: "job not found (expired or relay restarted)", gone: true }, 404);
+  if (!job) {
+    /* v18: an archived finished job still answers status — the app's snap
+       decision ("is this job terminal?") and its wait/work timing chips
+       read this, so an away-and-back run keeps its honest numbers */
+    const arc = await getArchiveRow(env, id);
+    if (arc) {
+      const st = String(arc.status);
+      return json({
+        ok: true, id: arc.jobId, jobId: arc.jobId, kind: arc.kind, status: st,
+        attempts: Number(arc.meta && arc.meta.attempts) || 0,
+        waitedMs: arc.waitMs, workMs: arc.workMs, bytes: arc.bytes,
+        working: false, waiting: false, nextRetryAt: 0,
+        serverTools: !!(arc.meta && arc.meta.serverTools),
+        serverRounds: Number(arc.meta && arc.meta.serverRounds) || 0,
+        createdAt: Number(arc.meta && arc.meta.createdAt) || arc.finishedAt,
+        updatedAt: arc.finishedAt, finishedAt: arc.finishedAt, archived: true, v: WORKER_VERSION,
+      });
+    }
+    return json({ error: "job not found (expired or relay restarted)", gone: true }, 404);
+  }
   maybeWorkAny(env, ctx); // the app polls this while waiting — progress resumes NOW
   const now = Date.now();
   /* v14: the true wait/work split — WAIT is line time, WORK is the model
@@ -2963,6 +3110,16 @@ async function handleJobByKey(url, ctx, env) {
     if ((st === "failed" || st === "stopped") && age < 120000) {
       return json({ ok: true, jobId: r.id, id: r.id, kind: r.kind, status: st, bytes: Number(r.bytes) });
     }
+  }
+  /* v18: no LIVE row qualifies — but the chat's newest FINISHED response
+     may still live in the archive (the job rows were pruned hours or days
+     ago). Return it so a returning phone rebuilds the full response
+     instead of reading 404 as "nothing happened". */
+  const arc = await newestArchiveForChat(env, key);
+  if (arc) {
+    const out = { ok: true, jobId: arc.jobId, id: arc.jobId, kind: arc.kind, status: String(arc.status), bytes: arc.bytes, archived: true, finishedAt: arc.finishedAt };
+    if (arc.meta && arc.meta.error) out.error = String(arc.meta.error); // the honest failure reason (the phone syncs the error, not "interrupted")
+    return json(out);
   }
   return json({ error: "no job for this key" }, 404);
 }
@@ -3195,7 +3352,9 @@ async function prune(env) {
     const dead = await allSQL(env,
       `SELECT id FROM jobs WHERE (status IN ('done','failed','parked','stopped') AND updated_at < ?) OR (created_at < ?)`,
       [now - DONE_TTL_MS, now - JOB_TTL_MS - DONE_TTL_MS]);
-    for (const r of dead) await deleteJobRows(env, r.id);
+    /* v18: a pruned FINISHED run is archived FIRST — its response outlives
+       its job rows (the away-and-back sync reads the archive) */
+    for (const r of dead) { await archiveJob(env, r.id); await deleteJobRows(env, r.id); }
     await runSQL(env,
       `UPDATE jobs SET status = 'failed', heartbeat = 0, lock_token = NULL, updated_at = ? WHERE status IN ('queued','streaming') AND created_at < ?`,
       [now, now - JOB_TTL_MS]);
@@ -3203,12 +3362,12 @@ async function prune(env) {
     const total = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs`);
     if (total && Number(total.n) > MAX_TOTAL_JOBS) {
       const old = await allSQL(env, `SELECT id FROM jobs WHERE status IN ('done','stopped','failed','parked') ORDER BY updated_at ASC LIMIT ?`, [Number(total.n) - MAX_TOTAL_JOBS]);
-      for (const r of old) await deleteJobRows(env, r.id);
+      for (const r of old) { await archiveJob(env, r.id); await deleteJobRows(env, r.id); }
     }
     const n = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','streaming')`);
     if (n && Number(n.n) > MAX_ACTIVE_JOBS) {
       const old = await allSQL(env, `SELECT id FROM jobs WHERE status IN ('done','stopped') ORDER BY updated_at ASC LIMIT ?`, [Number(n.n) - MAX_ACTIVE_JOBS]);
-      for (const r of old) await deleteJobRows(env, r.id);
+      for (const r of old) { await archiveJob(env, r.id); await deleteJobRows(env, r.id); }
     }
   } catch (_) {}
 }
