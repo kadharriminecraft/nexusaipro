@@ -1,7 +1,46 @@
 /* =====================================================================
-   NEXUS BACKGROUND RELAY v12 — Cloudflare Worker
-   THE WORKER OWNS THE REQUEST.
+   NEXUS BACKGROUND RELAY v15 — Cloudflare Worker
+   THE WORKER OWNS THE REQUEST — AND NOW YOUR FILES.
    =====================================================================
+   v15 — "CLOUDFLARE IS THE BACKUP": the workspace file mirror + the
+   server-side agent loop.
+   The v14-and-earlier design executed EVERY agentic tool round on the
+   phone — by design, that is where the credentials and the files lived.
+   Two consequences the user hit in production: (1) a tool round could
+   only progress while the phone was attached, so an agent coding run
+   stalled the moment the phone left; (2) a tool-call argument cut
+   (free models mid-write_file) PARKED the job, and a parked job never
+   progresses on its own — the panel filled with "Parked (tools)" rows
+   while the chat showed a cut-off response error.
+   v15 mirrors the app's per-chat workspace into D1 (ws_files/ws_chunks)
+   and, when a submit declares a synced workspace ("X-Nexus-WS: 1"),
+   executes FILE-TOOL rounds ON THE WORKER against that mirror:
+     list_files / read_file / grep_files / write_file / edit_file /
+     rename_file / delete_file — the exact same implementations and result
+     strings the app uses, so the model cannot tell the difference.
+   The loop runs INSIDE the same job: each executed round appends
+     data: {"nexus_server_round":N,...}   (the app renders the tool cards,
+                                            splits the message timeline)
+     extends the job's request messages with the assistant tool_calls +
+     tool results (durable in D1 — any driver continues the run), and
+     re-requests the model. Rounds containing ANY tool the worker cannot
+     execute (gh_* writes, web_search, run_javascript…) still finish as
+     DONE and the app executes them locally — the phone is only needed
+     for what only the phone can do.
+   Tool-arg cuts in mirror mode no longer park: the worker appends
+     data: {"nexus_round_reset":1} (both parsers discard the fragment
+     accumulator; the text stays) and re-asks the model with the app's
+     exact CONTINUE protocol — same buffer, no duplication.
+   The SYNC (the user's words: "if I turn off the worker and use it
+   locally then turn it back on it should sync over properly"):
+     POST /ws/:chatKey  { files, mtime, deleted } → last-write-wins per
+     file by mtime; response = manifest. GET /ws/:chatKey?paths=… pulls
+     contents. The app pushes before every submit, pulls after runs,
+     pushes local edits when the relay is re-enabled. The mirror is
+   NEVER pruned by TTL — it is the backup.
+   Old apps never send X-Nexus-WS → 100% legacy behavior. Old workers
+   ignore the header → the app falls back to the per-round protocol.
+
    v12 — NO MORE INSTANT "Connection failed" (fixes the post-deploy
    regression where the app's live-cast attach died instantly with a
    status-0 "Connection failed" error card, no retries):
@@ -141,7 +180,7 @@
    subrequest budgets degrade gracefully (fresh drivers resume the work).
    ===================================================================== */
 
-const WORKER_VERSION = 14;
+const WORKER_VERSION = 15;
 
 /* test tunables — production reads defaults; the local harness overrides
    via globalThis.__nexusTun to run E2E in seconds. */
@@ -167,16 +206,29 @@ const MAX_ACTIVE_JOBS = 64;
 const MAX_TOTAL_JOBS = 256;
 
 const FWD_HEADERS = ["authorization", "content-type", "http-referer", "x-title", "accept"];
-const NEXUS_HEADERS = ["x-nexus-submit", "x-nexus-chat", "x-nexus-key", "x-nexus-parent"];
+const NEXUS_HEADERS = ["x-nexus-submit", "x-nexus-chat", "x-nexus-key", "x-nexus-parent", "x-nexus-ws"];
+
+/* v15: how many tool rounds the worker will execute server-side in one
+   job (the app's agent step ceiling is 25 by default — mirror that), and
+   the mirror's own caps (files per workspace mirrors the app's MAX_FILES). */
+const MAX_SERVER_ROUNDS = TUN("maxServerRounds", 25);
+const WS_CHUNK_BYTES = 48 * 1024; // per-row content piece (statement-safe for D1)
+const MAX_WS_FILES = TUN("maxWsFiles", 80);
+const MAX_WS_FILE_BYTES = TUN("maxWsFileBytes", 5 * 1024 * 1024);
+const MAX_WS_TOTAL_BYTES = TUN("maxWsTotalBytes", 20 * 1024 * 1024);
 
 /* server-side continue protocol — the EXACT instruction the app sends,
    so worker retries and app continues are interchangeable */
 const CONTINUE_INSTRUCTION = "Your previous answer was cut off by a connection drop. Continue exactly where you stopped. Do not repeat any text you already wrote, do not apologize, just continue the content seamlessly.";
 
+/* v15: the app's step-limit instruction, verbatim — the server-side loop
+   pushes it at the round cap exactly like the app's own agent loop does */
+const STEP_LIMIT_INSTRUCTION = "You have reached the tool-use step limit for this task. Stop calling tools now and write your final answer: summarize what you built, the current state of the files, and anything left to do.";
+
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title, X-Nexus-Submit, X-Nexus-Chat, X-Nexus-Key, X-Nexus-Parent, X-Nexus-Retry",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title, X-Nexus-Submit, X-Nexus-Chat, X-Nexus-Key, X-Nexus-Parent, X-Nexus-Retry, X-Nexus-WS",
   "Access-Control-Expose-Headers": "X-Nexus-Job, X-Nexus-Offset, X-Nexus-Status",
   "Access-Control-Max-Age": "86400",
 };
@@ -319,6 +371,30 @@ const SCHEMA_TABLES = [
      k TEXT PRIMARY KEY,
      v TEXT NOT NULL
      )`,
+  /* v15: the workspace file mirror — Cloudflare as the backup. Contents
+     live in ws_chunks pieces (48KB rows) so every INSERT stays far below
+     D1's statement limits no matter how big a file is; ws_files carries
+     the manifest. ws_meta holds the per-workspace revision counter. */
+  `CREATE TABLE IF NOT EXISTS ws_files (
+     chat_key TEXT NOT NULL,
+     path TEXT NOT NULL,
+     bytes INTEGER NOT NULL DEFAULT 0,
+     mtime INTEGER NOT NULL DEFAULT 0,
+     parts INTEGER NOT NULL DEFAULT 0,
+     PRIMARY KEY (chat_key, path)
+     )`,
+  `CREATE TABLE IF NOT EXISTS ws_chunks (
+     chat_key TEXT NOT NULL,
+     path TEXT NOT NULL,
+     idx INTEGER NOT NULL,
+     data TEXT NOT NULL,
+     PRIMARY KEY (chat_key, path, idx)
+     )`,
+  `CREATE TABLE IF NOT EXISTS ws_meta (
+     chat_key TEXT PRIMARY KEY,
+     rev INTEGER NOT NULL DEFAULT 0,
+     synced_at INTEGER NOT NULL DEFAULT 0
+     )`,
 ];
 const SCHEMA_INDEXES = [
   `CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status, next_retry)`,
@@ -360,6 +436,18 @@ const SCHEMA_ALTERS = [
   `ALTER TABLE secrets ADD COLUMN auth TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE wstate ADD COLUMN k TEXT`,
   `ALTER TABLE wstate ADD COLUMN v TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE ws_files ADD COLUMN chat_key TEXT`,
+  `ALTER TABLE ws_files ADD COLUMN path TEXT`,
+  `ALTER TABLE ws_files ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE ws_files ADD COLUMN mtime INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE ws_files ADD COLUMN parts INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE ws_chunks ADD COLUMN chat_key TEXT`,
+  `ALTER TABLE ws_chunks ADD COLUMN path TEXT`,
+  `ALTER TABLE ws_chunks ADD COLUMN idx INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE ws_chunks ADD COLUMN data TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE ws_meta ADD COLUMN chat_key TEXT`,
+  `ALTER TABLE ws_meta ADD COLUMN rev INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE ws_meta ADD COLUMN synced_at INTEGER NOT NULL DEFAULT 0`,
 ];
 
 function hasDB(env) { return !!(env && env.DB); }
@@ -393,6 +481,9 @@ async function probeTables(env) {
     { ins: `INSERT INTO chunks (job, seq, bytes, data) VALUES (?, 0, 0, '')`, del: `DELETE FROM chunks WHERE job = ?`, params: [pid] },
     { ins: `INSERT INTO secrets (job, auth) VALUES (?, 'probe')`, del: `DELETE FROM secrets WHERE job = ?`, params: [pid] },
     { ins: `INSERT INTO wstate (k, v) VALUES (?, '0')`, del: `DELETE FROM wstate WHERE k = ?`, params: [pid] },
+    { ins: `INSERT INTO ws_files (chat_key, path, bytes, mtime, parts) VALUES (?, 'probe', 0, 0, 0)`, del: `DELETE FROM ws_files WHERE chat_key = ?`, params: [pid] },
+    { ins: `INSERT INTO ws_chunks (chat_key, path, idx, data) VALUES (?, 'probe', 0, '')`, del: `DELETE FROM ws_chunks WHERE chat_key = ?`, params: [pid] },
+    { ins: `INSERT INTO ws_meta (chat_key, rev, synced_at) VALUES (?, 0, 0)`, del: `DELETE FROM ws_meta WHERE chat_key = ?`, params: [pid] },
   ];
   let allOk = true;
   for (const t of tests) {
@@ -485,6 +576,270 @@ async function wstateSet(env, k, v) {
 async function wstateGet(env, k) {
   const r = await getSQL(env, `SELECT v FROM wstate WHERE k = ?`, [k]);
   return r ? Number(r.v) || 0 : 0;
+}
+
+/* =====================================================================
+   v15: THE WORKSPACE FILE MIRROR (Cloudflare as the backup).
+   One workspace per chat (chat_key = the app's X-Nexus-Chat). Contents
+   are stored in 48KB ws_chunks pieces; ws_files is the manifest with a
+   wall-clock mtime per file (last-write-wins vs the app's local edits).
+   Never pruned by TTL — this is the user's backup, not job state.
+   ===================================================================== */
+async function wsBumpRev(env, chatKey) {
+  try {
+    await runSQL(env,
+      `INSERT INTO ws_meta (chat_key, rev, synced_at) VALUES (?, 1, ?)
+       ON CONFLICT(chat_key) DO UPDATE SET rev = rev + 1, synced_at = excluded.synced_at`,
+      [chatKey, Date.now()]);
+  } catch (_) {}
+}
+async function wsRev(env, chatKey) {
+  try {
+    const r = await getSQL(env, `SELECT rev FROM ws_meta WHERE chat_key = ?`, [chatKey]);
+    return r ? Number(r.rev) || 0 : 0;
+  } catch (_) { return 0; }
+}
+async function wsManifest(env, chatKey) {
+  const rows = await allSQL(env, `SELECT path, bytes, mtime FROM ws_files WHERE chat_key = ? ORDER BY path ASC`, [chatKey]);
+  const meta = {};
+  for (const r of rows) meta[r.path] = { bytes: Number(r.bytes) || 0, mtime: Number(r.mtime) || 0 };
+  return meta;
+}
+async function wsGetFile(env, chatKey, path) {
+  const row = await getSQL(env, `SELECT parts, mtime FROM ws_files WHERE chat_key = ? AND path = ?`, [chatKey, path]);
+  if (!row) return null;
+  const parts = await allSQL(env, `SELECT idx, data FROM ws_chunks WHERE chat_key = ? AND path = ? ORDER BY idx ASC`, [chatKey, path]);
+  const map = new Map();
+  for (const p of parts) map.set(Number(p.idx), p.data);
+  let content = "";
+  for (let i = 0; i < Number(row.parts); i++) content += map.has(i) ? map.get(i) : "";
+  return { content, mtime: Number(row.mtime) || 0, bytes: Number(row.bytes) || 0 };
+}
+/* chunked write — every INSERT stays statement-sized no matter the file */
+async function wsPutFile(env, chatKey, path, content, mtime) {
+  const pieces = [];
+  for (let i = 0; i < content.length; i += WS_CHUNK_BYTES) pieces.push(content.slice(i, i + WS_CHUNK_BYTES));
+  await runSQL(env, `DELETE FROM ws_chunks WHERE chat_key = ? AND path = ?`, [chatKey, path]);
+  for (let i = 0; i < pieces.length; i++) {
+    await runSQL(env, `INSERT INTO ws_chunks (chat_key, path, idx, data) VALUES (?, ?, ?, ?)`, [chatKey, path, i, pieces[i]]);
+  }
+  await runSQL(env,
+    `INSERT INTO ws_files (chat_key, path, bytes, mtime, parts) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(chat_key, path) DO UPDATE SET bytes = excluded.bytes, mtime = excluded.mtime, parts = excluded.parts`,
+    [chatKey, path, content.length, mtime, pieces.length]);
+}
+async function wsDeleteFile(env, chatKey, path) {
+  await runSQL(env, `DELETE FROM ws_chunks WHERE chat_key = ? AND path = ?`, [chatKey, path]);
+  await runSQL(env, `DELETE FROM ws_files WHERE chat_key = ? AND path = ?`, [chatKey, path]);
+}
+async function wsClear(env, chatKey) {
+  await runSQL(env, `DELETE FROM ws_chunks WHERE chat_key = ?`, [chatKey]);
+  await runSQL(env, `DELETE FROM ws_files WHERE chat_key = ?`, [chatKey]);
+  await runSQL(env, `DELETE FROM ws_meta WHERE chat_key = ?`, [chatKey]);
+}
+
+/* =====================================================================
+   v15: FILE TOOLS ON THE WORKER — the app's implementations, ported
+   line-for-line (same result strings, same paging, same error wording)
+   so the model behaves identically whether the round runs on the phone
+   or in the cloud. Only the file tools exist here; anything else in a
+   round hands the whole round back to the app.
+   ===================================================================== */
+const FS_TOOLS = ["list_files", "read_file", "grep_files", "write_file", "edit_file", "rename_file", "delete_file"];
+const FS_TOOL_ALIASES = {
+  apply_patch: "edit_file", str_replace: "edit_file", str_replace_editor: "edit_file", edit: "edit_file", modify_file: "edit_file", patch_file: "edit_file", replace: "edit_file",
+  create_file: "write_file", write_to_file: "write_file", write: "write_file", save_file: "write_file",
+  open_file: "read_file", cat: "read_file", read: "read_file", view_file: "read_file", open: "read_file",
+  search_files: "grep_files", search_code: "grep_files", find_in_files: "grep_files", grep: "grep_files", code_search: "grep_files", search: "grep_files",
+  ls: "list_files", list_directory: "list_files", list_dir: "list_files", dir: "list_files",
+  remove_file: "delete_file", rm: "delete_file", delete: "delete_file",
+  move_file: "rename_file", move: "rename_file", rename: "rename_file",
+};
+const FS_ARG_ALIASES = {
+  path: ["file", "filename", "file_path", "filePath", "filepath", "target"],
+  old_text: ["old_str", "old_string", "oldText", "find", "search", "match", "original", "source_text"],
+  new_text: ["new_str", "new_string", "newText", "replace_with", "replacement", "updated_text"],
+  new_path: ["to", "new_name", "name", "destination", "dest", "dest_path", "newpath", "new_file"],
+  content: ["text", "body", "contents", "file_content", "data"],
+  pattern: ["regex", "search_pattern", "needle"],
+};
+function fsNormalizeArgs(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return args;
+  const out = { ...args };
+  for (const [canonical, aliases] of Object.entries(FS_ARG_ALIASES)) {
+    for (const a of aliases) {
+      if (a in out && !(canonical in out)) { out[canonical] = out[a]; delete out[a]; }
+    }
+  }
+  return out;
+}
+function fsFormatBytes(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
+}
+function fsEscapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function fsValidPath(path) {
+  if (typeof path !== "string" || !path.trim()) throw new Error("A file path is required.");
+  const p = path.trim().replace(/^\/+/, "");
+  if (p.length > 140 || p.split("/").some(seg => seg === ".." || seg.length > 80)) throw new Error("Invalid path: " + path);
+  return p;
+}
+function fsBuildDiffLines(oldText, newText, max = 60) {
+  const lines = [];
+  oldText.split("\n").forEach(l => lines.push("- " + l));
+  newText.split("\n").forEach(l => lines.push("+ " + l));
+  if (lines.length > max) return lines.slice(0, max).concat(["… (" + (lines.length - max) + " more changed lines)"]);
+  return lines;
+}
+/* does a request's tools array declare any file tool? (submit-time check) */
+function requestHasFileTools(parsed) {
+  try {
+    const tools = parsed && parsed.tools;
+    if (!Array.isArray(tools)) return false;
+    for (const t of tools) {
+      const n = t && t.function && t.function.name;
+      if (FS_TOOLS.includes(n) || FS_TOOL_ALIASES[n]) return true;
+    }
+  } catch (_) {}
+  return false;
+}
+/* can EVERY call in this round run on the worker? (round-time check —
+   one gh_* call hands the whole round back to the phone) */
+function roundAllServerExecutable(calls) {
+  if (!calls.length) return false;
+  for (const c of calls) {
+    const resolved = FS_TOOL_ALIASES[c.name] || c.name;
+    if (!FS_TOOLS.includes(resolved)) return false;
+  }
+  return true;
+}
+/* execute one file tool against the mirror. Returns the app-shaped result
+   {text, label, sub, icon, file, failed}. Throws become failed results —
+   the model gets the same honest guidance the app gives it. */
+async function runServerTool(env, chatKey, rawName, args) {
+  const name = FS_TOOL_ALIASES[rawName] || rawName;
+  try {
+    switch (name) {
+      case "list_files": {
+        const rows = await allSQL(env, `SELECT path, bytes FROM ws_files WHERE chat_key = ? ORDER BY path ASC`, [chatKey]);
+        if (!rows.length) return { text: "The workspace is empty — no files yet.", label: "Checked files", sub: "0 files", icon: "folder" };
+        const lines = rows.map(r => r.path + "  (" + fsFormatBytes(Number(r.bytes) || 0) + ")");
+        return { text: lines.join("\n"), label: "Checked files", sub: rows.length + " files", icon: "folder" };
+      }
+      case "read_file": {
+        const p = fsValidPath(args.path);
+        const row = await wsGetFile(env, chatKey, p);
+        if (!row) throw new Error("File not found: " + p + " — use list_files to see what exists.");
+        const content = row.content;
+        const allLines = content.split("\n");
+        const total = allLines.length;
+        if (content.length <= 16000 && args.offset == null && args.limit == null) {
+          return { text: content, label: "Read " + p, sub: fsFormatBytes(content.length) + " · " + total + " lines", icon: "file", file: p };
+        }
+        const offset = Math.max(1, Math.floor(Number(args.offset) || 1));
+        const limit = Math.min(600, Math.max(1, Math.floor(Number(args.limit) || 400)));
+        if (offset > total) throw new Error("offset " + offset + " is past the end of the file (" + total + " lines).");
+        const end = Math.min(total, offset - 1 + limit);
+        const body = allLines.slice(offset - 1, end).map((l, i) => String(offset + i).padStart(5) + "| " + l).join("\n");
+        const footer = end < total
+          ? "\n…[lines " + offset + "–" + end + " of " + total + " — call read_file with offset " + (end + 1) + " for the next chunk]"
+          : "\n[End of file — " + total + " lines total]";
+        return { text: body + footer, label: "Read " + p, sub: "lines " + offset + "–" + end + " of " + total, icon: "file", file: p };
+      }
+      case "grep_files": {
+        const pat = String(args.pattern || "").trim();
+        if (!pat) throw new Error("A search pattern is required.");
+        let re;
+        const rx = pat.match(/^\/(.+)\/([a-z]*)$/);
+        try { re = rx ? new RegExp(rx[1], rx[2] || "i") : new RegExp(fsEscapeRegex(pat), "i"); }
+        catch (err) { throw new Error("Invalid pattern: " + err.message); }
+        const only = args.path ? [fsValidPath(args.path)] : (await allSQL(env, `SELECT path FROM ws_files WHERE chat_key = ? ORDER BY path ASC`, [chatKey])).map(r => r.path);
+        const max = Math.min(100, Math.max(1, Math.floor(Number(args.max_results) || 40)));
+        const hits = [];
+        let scanned = 0;
+        for (const p of only) {
+          const row = await wsGetFile(env, chatKey, p);
+          if (!row) throw new Error("File not found: " + p);
+          scanned++;
+          const lines = row.content.split("\n");
+          for (let i = 0; i < lines.length; i++) {
+            if (re.test(lines[i])) {
+              hits.push(p + ":" + (i + 1) + ": " + lines[i].trim().slice(0, 200));
+              if (hits.length >= max) break;
+            }
+          }
+          if (hits.length >= max) break;
+        }
+        const head = "Matches for \"" + pat + "\"" + (args.path ? " in " + args.path : " across " + scanned + " file" + (scanned === 1 ? "" : "s")) + ":\n";
+        const text = hits.length
+          ? head + hits.join("\n") + (hits.length >= max ? "\n…[first " + max + " matches — refine the pattern or raise max_results]" : "")
+          : "No matches for \"" + pat + "\"" + (args.path ? " in " + args.path : " across " + scanned + " file" + (scanned === 1 ? "" : "s")) + ".";
+        return { text, label: "Searched " + (args.path || "files"), sub: hits.length + " match" + (hits.length === 1 ? "" : "es"), icon: "search", file: args.path ? fsValidPath(args.path) : undefined };
+      }
+      case "write_file": {
+        const p = fsValidPath(args.path);
+        const content = String(args.content ?? "");
+        if (content.length > MAX_WS_FILE_BYTES) throw new Error("File too large (max " + fsFormatBytes(MAX_WS_FILE_BYTES) + ").");
+        const existing = await getSQL(env, `SELECT path FROM ws_files WHERE chat_key = ? AND path = ?`, [chatKey, p]);
+        if (!existing) {
+          const cnt = await getSQL(env, `SELECT COUNT(*) AS n FROM ws_files WHERE chat_key = ?`, [chatKey]);
+          if (cnt && Number(cnt.n) >= MAX_WS_FILES) throw new Error("Too many files (max " + MAX_WS_FILES + ").");
+          const tot = await getSQL(env, `SELECT COALESCE(SUM(bytes), 0) AS b FROM ws_files WHERE chat_key = ?`, [chatKey]);
+          if (tot && Number(tot.b) + content.length > MAX_WS_TOTAL_BYTES) throw new Error("The workspace mirror is full (max " + fsFormatBytes(MAX_WS_TOTAL_BYTES) + ").");
+        }
+        await wsPutFile(env, chatKey, p, content, Date.now());
+        await wsBumpRev(env, chatKey);
+        return { text: "Wrote " + p + " (" + fsFormatBytes(content.length) + ", " + content.split("\n").length + " lines).", label: "Wrote " + p, sub: fsFormatBytes(content.length) + " · " + content.split("\n").length + " lines", icon: "fileCode", file: p };
+      }
+      case "edit_file": {
+        const p = fsValidPath(args.path);
+        const row = await wsGetFile(env, chatKey, p);
+        if (!row) throw new Error("File not found: " + p + " — use list_files to see what exists, or write_file to create it fresh.");
+        const oldText = String(args.old_text ?? "");
+        const newText = String(args.new_text ?? "");
+        if (!oldText) throw new Error("old_text is required — copy the exact text (with its indentation) from read_file output.");
+        if (oldText === newText) throw new Error("old_text and new_text are identical — nothing to change.");
+        const content = row.content;
+        const count = content.split(oldText).length - 1;
+        if (count === 0) throw new Error("old_text was not found in " + p + " — it must match EXACTLY (whitespace, indentation, quotes). Read the file with read_file and copy the text precisely, or locate it with grep_files first.");
+        if (count > 1 && args.replace_all !== true) throw new Error("old_text appears " + count + " times in " + p + " — include more surrounding lines so it is unique, or pass replace_all: true to replace every occurrence.");
+        const updated = args.replace_all === true ? content.split(oldText).join(newText) : content.replace(oldText, newText);
+        if (updated.length > MAX_WS_FILE_BYTES) throw new Error("The edit would make the file too large (max " + fsFormatBytes(MAX_WS_FILE_BYTES) + ").");
+        await wsPutFile(env, chatKey, p, updated, Date.now());
+        await wsBumpRev(env, chatKey);
+        const changed = args.replace_all === true ? count : 1;
+        const diffLines = fsBuildDiffLines(oldText, newText);
+        return {
+          text: "Edited " + p + " — " + changed + " replacement" + (changed === 1 ? "" : "s") + " (" + oldText.split("\n").length + " line" + (oldText.split("\n").length === 1 ? "" : "s") + " out → " + newText.split("\n").length + " in, file now " + updated.split("\n").length + " lines).\n\n" + diffLines.join("\n"),
+          label: "Edited " + p, sub: changed + " change" + (changed === 1 ? "" : "s") + " · " + updated.split("\n").length + " lines", icon: "pencil", file: p, diffLines,
+        };
+      }
+      case "rename_file": {
+        const p = fsValidPath(args.path), np = fsValidPath(args.new_path);
+        const row = await wsGetFile(env, chatKey, p);
+        if (!row) throw new Error("File not found: " + p + " — use list_files to see what exists.");
+        if (np === p) throw new Error("The new path is the same as the old one.");
+        const exists = await getSQL(env, `SELECT path FROM ws_files WHERE chat_key = ? AND path = ?`, [chatKey, np]);
+        if (exists) throw new Error("A file called " + np + " already exists — pick a different name or delete it first.");
+        await wsPutFile(env, chatKey, np, row.content, Date.now());
+        await wsDeleteFile(env, chatKey, p);
+        await wsBumpRev(env, chatKey);
+        return { text: "Renamed " + p + " → " + np + " (" + fsFormatBytes(row.content.length) + " carried over).", label: "Renamed " + p + " → " + np, sub: fsFormatBytes(row.content.length), icon: "pen", file: np };
+      }
+      case "delete_file": {
+        const p = fsValidPath(args.path);
+        const row = await getSQL(env, `SELECT path FROM ws_files WHERE chat_key = ? AND path = ?`, [chatKey, p]);
+        if (!row) throw new Error("File not found: " + p);
+        await wsDeleteFile(env, chatKey, p);
+        await wsBumpRev(env, chatKey);
+        return { text: "Deleted " + p + ".", label: "Deleted " + p, sub: "", icon: "trash" };
+      }
+    }
+    throw new Error("Unknown tool: \"" + rawName + "\"");
+  } catch (err) {
+    return { text: "Tool error: " + (err && err.message || String(err)), label: (FS_TOOL_ALIASES[rawName] || rawName) + " (failed)", sub: String(err && err.message || "").slice(0, 80), icon: "alert", failed: true };
+  }
 }
 
 function rowToJob(row) {
@@ -613,6 +968,14 @@ function makeParser() {
     errorSeen: false,
     errorMessage: "",
     errorCode: 0,
+    /* v15 server-round state: tool-call fragments accumulate here exactly
+       like the app's readStream accumulator; the nexus_* marker events
+       delimit rounds (see line()). roundBase = contentText length at the
+       start of the CURRENT round; roundSawData = real events in it. */
+    toolAcc: {},
+    serverRounds: 0,
+    roundBase: 0,
+    roundSawData: false,
     feed(u8) {
       const text = this.dec.decode(u8, { stream: true });
       const nl = [];
@@ -637,6 +1000,28 @@ function makeParser() {
       if (raw === "[DONE]") { this.finishSeen = true; return; }
       let obj = null;
       try { obj = JSON.parse(raw); } catch (_) { return; }
+      /* ---- v15 round markers (only ever emitted by this worker) ----
+         nexus_server_round: the round completed and the WORKER executed
+           its tools. Everything round-scoped resets for the next round;
+           replaying the buffer rebuilds the same state on any driver.
+         nexus_round_reset: a tool-arg cut was discarded; the fragments
+           (and only the fragments) go away — text stays, the re-emission
+           re-accumulates. */
+      if (obj && (obj.nexus_server_round != null || obj.nexus_round_reset != null)) {
+        if (obj.nexus_server_round != null) {
+          this.serverRounds = Math.max(this.serverRounds, Number(obj.nexus_server_round) || 0);
+          this.roundBase = this.contentText.length;
+          this.finishSeen = false;
+          this.sawToolCalls = false;
+          this.toolAcc = {};
+          this.roundSawData = false;
+        } else {
+          this.toolAcc = {};
+          this.sawToolCalls = false;
+        }
+        this.eventIndex.push({ c: this.contentText.length, b: lineEndByte });
+        return;
+      }
       if (obj && obj.error) { this.errorSeen = true; this.errorMessage = String(obj.error.message || "upstream error"); this.errorCode = Number(obj.error.code) || 0; }
       const ch = obj && obj.choices && obj.choices[0];
       if (ch && ch.finish_reason) this.finishSeen = true;
@@ -645,9 +1030,31 @@ function makeParser() {
         if (typeof d.content === "string" && d.content.length) this.contentText += d.content;
         if (typeof d.reasoning === "string" && d.reasoning.length) this.sawReasoning = true;
         if (typeof d.reasoning_content === "string" && d.reasoning_content.length) this.sawReasoning = true;
-        if (Array.isArray(d.tool_calls) && d.tool_calls.length) this.sawToolCalls = true;
+        if (Array.isArray(d.tool_calls) && d.tool_calls.length) {
+          this.sawToolCalls = true;
+          this.roundSawData = true;
+          for (const tc of d.tool_calls) {
+            const idx = tc.index ?? 0;
+            if (!this.toolAcc[idx]) this.toolAcc[idx] = { id: "", name: "", args: "" };
+            if (tc.id) this.toolAcc[idx].id = tc.id;
+            if (tc.function && tc.function.name) this.toolAcc[idx].name = tc.function.name;
+            if (tc.function && tc.function.arguments) this.toolAcc[idx].args += tc.function.arguments;
+          }
+        }
+        if (typeof d.content === "string" && d.content.length) this.roundSawData = true;
+        if ((typeof d.reasoning === "string" && d.reasoning.length) || (typeof d.reasoning_content === "string" && d.reasoning_content.length)) this.roundSawData = true;
       }
+      if (obj && (obj.usage || (!ch && !obj.error && !obj.choices))) this.roundSawData = true;
       this.eventIndex.push({ c: this.contentText.length, b: lineEndByte });
+    },
+    /* accumulated calls, ordered by index, app-shaped */
+    toolCalls() {
+      return Object.keys(this.toolAcc).map(k => ({
+        index: Number(k),
+        id: this.toolAcc[k].id || "call_" + k,
+        name: this.toolAcc[k].name,
+        args: this.toolAcc[k].args || "",
+      })).filter(c => c.name).sort((a, b) => a.index - b.index);
     },
     /* claim-time: the buffer may end mid-line. If that trailing line is a
        COMPLETE JSON event (the pump died right before its newline),
@@ -824,16 +1231,16 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
     parser.flushPending();
   }
   if (parser.errorSeen && !job.finish) { await failJob(env, jobId, token, parser.errorMessage, { live, t: tsettle }); return; }
-  if (parser.finishSeen || job.finish) { await finalizeDone(env, jobId, token, live, tsettle); return; }
+
+  /* ---- v15: mirror-mode agent loop -------------------------------
+     serverTools jobs run the file-tool rounds HERE against the D1
+     workspace mirror. meta.serverTools is set at submit (X-Nexus-WS).
+     meta.noServerTools disables further rounds (step cap hit) while
+     keeping the round-continue body semantics. */
+  const serverToolsMode = !!(job.meta && job.meta.serverTools) && job.kind === "chat" && !!(job.chatKey);
+  const serverRoundsOn = () => serverToolsMode && !(job.meta && job.meta.noServerTools);
 
   let totalBytes = Math.max(parser.totalBytes(), 0);
-  let attempts = job.attempts;      // total across all drivers (persisted)
-  let inlineAttempts = 0;           // attempts driven by THIS event
-  const maxInline = opts.maxAttempts || 4;
-  const deadline = Date.now() + (opts.budgetMs || EVENT_BUDGET_MS);
-  let firstUpstream = opts.firstUpstream || null;
-  let firstByteAt = job.firstByte || 0;
-
   let seq = 0;
   {
     const r = await getSQL(env, `SELECT COALESCE(MAX(seq), -1) AS mx FROM chunks WHERE job = ?`, [jobId]);
@@ -842,6 +1249,116 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
 
   const flushDec = new TextDecoder();
   const flushEnc = new TextEncoder();
+
+  /* ---- v15: append a round marker event into the job buffer ----
+     Same accounting as flush(): chunk row + bytes + lock-guarded job
+     write + live fan-out. Markers are data: lines — byte-real, counted
+     by every offset, ignored by pre-v15 app parsers. */
+  const appendMarker = async payload => {
+    const text = "data: " + JSON.stringify(payload) + "\n\n";
+    const u8 = flushEnc.encode(text);
+    if (totalBytes + u8.length > MAX_JOB_BYTES) return false;
+    await runSQL(env, `INSERT INTO chunks (job, seq, bytes, data) VALUES (?, ?, ?, ?)`, [jobId, seq, u8.length, text]);
+    seq++;
+    totalBytes += u8.length;
+    parser.feed(u8);
+    const w = await lockWrite(env, jobId, token, {
+      bytes: totalBytes, content_text: parser.contentText, heartbeat: Date.now(), updated_at: Date.now(),
+      ...timingFields(),
+    });
+    if (w !== 1) return false; // lock lost — another driver took over
+    livePush(live, u8);
+    return true;
+  };
+
+  /* ---- v15: execute one complete server-tool round -----------------
+     1. run every call against the mirror (app-identical results)
+     2. append the nexus_server_round marker (the app builds its message
+        timeline from it; any driver replays it to rebuild state)
+     3. extend job.req with assistant(tool_calls) + tool(results) — the
+        DURABLE conversation, so any future driver continues correctly
+     4. reset round-scoped parser state; count the round; keep working.
+     Returns false when the lock was lost (caller must stop). */
+  async function execServerRound() {
+    const calls = parser.toolCalls();
+    if (!calls.length) return false;
+    const roundText = parser.contentText.slice(parser.roundBase);
+    const executed = [];
+    for (const c of calls) {
+      let args = {};
+      let parseOk = true;
+      try { args = JSON.parse(c.args || "{}"); } catch (_) { parseOk = false; }
+      if (parseOk && args && typeof args === "object" && !Array.isArray(args)) args = fsNormalizeArgs(args);
+      let res;
+      if (!parseOk) {
+        res = { text: "The arguments for " + c.name + " were not valid JSON (truncated or malformed) and the call was NOT executed. Retry with complete, valid JSON — if you keep hitting the length limit, work in smaller pieces (e.g. write_file with less content, or several edit_file calls).", label: "Malformed call · " + c.name, sub: "invalid arguments", icon: "alert", failed: true };
+      } else {
+        res = await runServerTool(env, job.chatKey, c.name, args || {});
+        const resolved = FS_TOOL_ALIASES[c.name] || c.name;
+        if (resolved !== c.name) {
+          res = { ...res, text: res.text + "\n\n(Note: \"" + c.name + "\" is not an available tool — this ran as " + resolved + ". Call " + resolved + " directly next time.)" };
+        }
+      }
+      executed.push({ i: c.index, id: c.id, name: c.name, ok: !res.failed, text: res.text, label: res.label, sub: res.sub, icon: res.icon, file: res.file });
+    }
+    const roundNo = parser.serverRounds + 1;
+    const markerOk = await appendMarker({
+      nexus_server_round: roundNo,
+      baseContent: parser.contentText.length,
+      calls: executed.map(e => ({ i: e.i, id: e.id, name: e.name, ok: e.ok, text: e.text, label: e.label, sub: e.sub, icon: e.icon, file: e.file })),
+    });
+    if (!markerOk) return false;
+    /* the marker's own parser.feed already reset round-scoped state
+       (finishSeen/sawToolCalls/toolAcc/roundBase/roundSawData) */
+    /* durable conversation extension: the exact apiMessagesFor shape the
+       app would have submitted for the next round */
+    let req = job.req;
+    if (req && Array.isArray(req.messages)) {
+      const asst = { role: "assistant", content: roundText };
+      if (calls.length) asst.tool_calls = calls.map(c => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.args || "{}" } }));
+      const msgs = [asst];
+      for (const e of executed) msgs.push({ role: "tool", tool_call_id: e.id, name: e.name, content: e.text });
+      /* step cap: mirror the app's agent step limit — push the wrap-up
+         instruction and hand any FURTHER tool rounds to the app */
+      if (roundNo + 1 > MAX_SERVER_ROUNDS) {
+        msgs.push({ role: "user", content: STEP_LIMIT_INSTRUCTION });
+        job.meta = { ...job.meta, noServerTools: true };
+      }
+      req = { ...req, messages: req.messages.concat(msgs), stream: true };
+      const metaOut = { ...job.meta, serverRounds: roundNo };
+      job.meta = metaOut;
+      const w = await lockWrite(env, jobId, token, { req: JSON.stringify(req), meta: JSON.stringify(metaOut), content_text: parser.contentText, updated_at: Date.now(), ...timingFields() });
+      if (w !== 1) return false;
+      job.req = req;
+    }
+    /* tool execution is WORK per the user's own definition ("the AI
+       creating files is working") — no wait gap before the next round */
+    settleWait();
+    workStart = Date.now();
+    try { await lockWrite(env, jobId, token, { ...timingFields(), heartbeat: Date.now(), updated_at: Date.now() }); } catch (_) {}
+    separatorNeeded = totalBytes > 0;
+    return true;
+  }
+
+  /* entry window: the previous pump died right after a tool round
+     completed but BEFORE it could execute it (finish marker seen, no
+     server_round marker for those calls). Execute it now, then run on. */
+  if (serverRoundsOn() && !job.finish && parser.finishSeen && parser.sawToolCalls) {
+    const calls = parser.toolCalls();
+    if (roundAllServerExecutable(calls)) {
+      const ok = await execServerRound();
+      if (!ok) { await finalizeDone(env, jobId, token, live, tsettle); return; }
+    }
+  }
+  if (parser.finishSeen || job.finish) { await finalizeDone(env, jobId, token, live, tsettle); return; }
+
+  let attempts = job.attempts;      // total across all drivers (persisted)
+  let inlineAttempts = 0;           // attempts driven by THIS event
+  const maxInline = opts.maxAttempts || 4;
+  const deadline = Date.now() + (opts.budgetMs || EVENT_BUDGET_MS);
+  let firstUpstream = opts.firstUpstream || null;
+  let firstByteAt = job.firstByte || 0;
+
   let pendingFlush = "";
   let pendingBytes = 0;
   let lastFlushAt = Date.now();
@@ -901,22 +1418,52 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
       if (signal.aborted) return; // killed like the runtime would — leave D1 stale on purpose
       if (Date.now() > deadline) { gaveUp = true; break; }
 
-      /* park: tool-call cuts are never continued server-side (app protocol).
-         images never continue either — they re-issue from zero or park. */
-      if (parser.sawToolCalls && !parser.finishSeen) { await parkJob(env, jobId, token, tsettle); liveClose(live); return; }
-      if (job.kind !== "chat" && totalBytes > 0 && !parser.finishSeen) { await parkJob(env, jobId, token, tsettle); liveClose(live); return; }
       /* v14: the attempt ceiling follows the job's pace profile (a
          Relentless pick earns its 100 attempts; the default stays put) */
       const pace = await jobRetryProfile(env, jobId);
+
+      /* park: tool-call cuts are never continued server-side (app protocol).
+         images never continue either — they re-issue from zero or park.
+         v15 EXCEPT in mirror mode: the cut fragments are discarded (both
+         parsers reset on the nexus_round_reset marker) and the model is
+         re-asked with the app's exact CONTINUE protocol — the run keeps
+         going with NOBODY attached, which is the entire point of the
+         worker holding the files. */
+      if (parser.sawToolCalls && !parser.finishSeen) {
+        if (serverRoundsOn()) {
+          const resetOk = await appendMarker({ nexus_round_reset: 1 });
+          if (!resetOk) { liveAbort(live); return; }
+          attempts++; inlineAttempts++;
+          if (!waitStart) waitStart = Date.now();
+          try { await lockWrite(env, jobId, token, { attempts, updated_at: Date.now(), ...timingFields() }); } catch (_) {}
+          if (inlineAttempts >= maxInline) { gaveUp = true; break; }
+          await pacedSleep(env, jobId, pace, attempts, signal);
+          separatorNeeded = true; // the re-ask must start line-aligned
+          continue;
+        }
+        await parkJob(env, jobId, token, tsettle); liveClose(live); return;
+      }
+      if (job.kind !== "chat" && totalBytes > 0 && !parser.finishSeen) { await parkJob(env, jobId, token, tsettle); liveClose(live); return; }
       if (attempts >= profMax(pace)) { await failJob(env, jobId, token, "retry budget used up", { live, t: tsettle }); return; }
 
       /* ---- build the upstream request ---- */
       let body;
-      /* v14: the buffer may carry the open-chunk comment (and provider
-         keepalives) with ZERO real events — a job the model never took yet
-         re-issues the ORIGINAL request; only a buffer that has actually
-         seen a data line continues from the partial content. */
-      if (job.kind !== "chat" || !parser.sawData) body = job.req; // plain re-issue
+      if (serverToolsMode) {
+        /* v15: the conversation lives in job.req — every completed server
+           round is already appended there. A round with no events yet
+           re-issues it; a partially-streamed round continues from ITS OWN
+           partial text (roundBase), never the whole buffer — earlier
+           rounds' text is already in the messages. */
+        if (!parser.roundSawData) body = job.req;
+        else body = {
+          ...job.req,
+          messages: (job.req.messages || []).concat([
+            { role: "assistant", content: parser.contentText.slice(parser.roundBase) },
+            { role: "user", content: CONTINUE_INSTRUCTION },
+          ]),
+          stream: true,
+        };
+      } else if (job.kind !== "chat" || !parser.sawData) body = job.req; // plain re-issue
       else body = {
         ...job.req,
         messages: (job.req.messages || []).concat([
@@ -1000,7 +1547,24 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
         if (!(await flush())) { liveAbort(live); return; }
         settleWork(); // the accepted attempt is over — work stops, line resumes below
         if (parser.errorSeen) { await failJob(env, jobId, token, parser.errorMessage, { live, t: tsettle }); return; }
-        if (parser.finishSeen) { await finalizeDone(env, jobId, token, live, tsettle); return; }
+        if (parser.finishSeen) {
+          /* v15: a COMPLETE round that asked for file tools and nothing
+             else — execute it here against the mirror and keep the loop
+             running (this is the server-side agent step). Any non-file
+             call hands the whole round to the app: finalizeDone, exactly
+             the pre-v15 protocol. */
+          if (serverRoundsOn() && parser.sawToolCalls) {
+            const calls = parser.toolCalls();
+            if (roundAllServerExecutable(calls)) {
+              const ok = await execServerRound();
+              if (!ok) { liveAbort(live); return; }
+              /* a server round is not a failed attempt — the retry budget
+                 is untouched; the loop continues immediately */
+              continue;
+            }
+          }
+          await finalizeDone(env, jobId, token, live, tsettle); return;
+        }
         if (naturalEnd && job.kind !== "chat") { await finalizeDone(env, jobId, token, live, tsettle); return; } // images: full body = done
         if (signal.aborted) return;
         /* truncated → persist the attempt count and try again inline
@@ -1137,6 +1701,12 @@ async function handleSubmit(request, pathname, ctx, env, parsed, fwd) {
   const parent = sanitizeKey(request.headers.get("X-Nexus-Parent"));
   /* v14: the starting retry pace rides the submit (the app's pace row) */
   const retryMode = sanitizeKey(request.headers.get("X-Nexus-Retry"));
+  /* v15: the submit declares a SYNCED workspace mirror — the worker may
+     execute this chat's file-tool rounds server-side (X-Nexus-WS: 1 after
+     a successful syncWorkspace). Only honored when the request actually
+     declares file tools; old apps never send the header. */
+  const wsSync = request.headers.get("X-Nexus-WS") === "1";
+  const serverTools = !!(wsSync && chatKey && pathname === "/chat" && requestHasFileTools(parsed));
 
   /* idempotency: a network retry of the same submission must not
      double-spend — hand back the job we already created */
@@ -1167,6 +1737,7 @@ async function handleSubmit(request, pathname, ctx, env, parsed, fwd) {
   const metaFwd = Object.assign({}, fwd);
   delete metaFwd.authorization;
   const meta = { fwd: metaFwd, contentType: kind === "images" ? "application/json" : "text/event-stream", submit: true };
+  if (serverTools) meta.serverTools = true; // v15: mirror-mode agent loop
   if (retryModes()[retryMode]) {
     const prof = retryModes()[retryMode];
     meta.retry = { mode: retryMode, label: prof.label, max: prof.max, delays: prof.delays, at: now };
@@ -1184,7 +1755,88 @@ async function handleSubmit(request, pathname, ctx, env, parsed, fwd) {
   }
   try { ctx && ctx.waitUntil && ctx.waitUntil(prune(env).catch(() => {})); } catch (_) {}
   try { ctx && ctx.waitUntil && ctx.waitUntil(driveJob(env, ctx, id).catch(() => {})); } catch (_) {}
-  return json({ ok: true, jobId: id, v: WORKER_VERSION }, 202, { "X-Nexus-Job": id });
+  return json({ ok: true, jobId: id, serverTools, v: WORKER_VERSION }, 202, { "X-Nexus-Job": id });
+}
+
+/* =====================================================================
+   v15: THE WORKSPACE SYNC ENDPOINTS — "cloudflare is a perfect backup".
+   POST /ws/:chatKey  — push local edits (last-write-wins per file by
+                        mtime) + tombstones for deletions; the response
+                        carries the full server manifest (path/bytes/mtime)
+                        so one round-trip is a complete pull decision.
+   GET  /ws/:chatKey?paths=a,b — pull file contents (all files when
+                        paths is omitted).
+   DELETE /ws/:chatKey — the chat was deleted locally; clear its mirror.
+   All auth-gated like /jobs (Authorization header). The mirror is never
+   TTL-pruned — it is the backup, not job state.
+   ===================================================================== */
+async function handleWsSync(request, env) {
+  if (!request.headers.get("authorization")) {
+    return json({ error: "send your API key as the Authorization header (same as /chat)" }, 401);
+  }
+  if (!hasDB(env)) return json({ error: "workspace sync needs the D1 engine (bind DB)" }, 404);
+  try { await ensureSchema(env); } catch (_) {}
+  const chatKey = sanitizeKey(new URL(request.url).pathname.split("/")[2]);
+  if (!chatKey) return json({ error: "chat key required" }, 400);
+
+  if (request.method === "DELETE") {
+    try { await wsClear(env, chatKey); } catch (_) { return json({ error: "clear failed on the database", retry: true }, 503); }
+    return json({ ok: true, cleared: chatKey, v: WORKER_VERSION });
+  }
+
+  if (request.method === "POST") {
+    let body = null;
+    try { body = await request.json(); } catch (_) {}
+    if (!body || typeof body !== "object") return json({ error: "body must be JSON { files, mtime, deleted }" }, 400);
+    const files = (body.files && typeof body.files === "object" && !Array.isArray(body.files)) ? body.files : {};
+    const mtimes = (body.mtime && typeof body.mtime === "object" && !Array.isArray(body.mtime)) ? body.mtime : {};
+    const deleted = Array.isArray(body.deleted) ? body.deleted.map(d => String(d).slice(0, 140)) : [];
+    let adopted = 0, conflicts = 0;
+    for (const path of Object.keys(files)) {
+      const p = String(path).slice(0, 140);
+      if (!p) continue;
+      const content = String(files[path] ?? "");
+      if (content.length > MAX_WS_FILE_BYTES) continue; // app caps match — belt and braces
+      const mtime = Math.floor(Number(mtimes[path]) || Date.now());
+      try {
+        const row = await getSQL(env, `SELECT mtime FROM ws_files WHERE chat_key = ? AND path = ?`, [chatKey, p]);
+        if (row && Number(row.mtime) > mtime) { conflicts++; continue; } // the worker wrote a newer version — it stays; the app pulls it
+        await wsPutFile(env, chatKey, p, content, mtime);
+        adopted++;
+      } catch (_) {}
+    }
+    for (const p of deleted) {
+      try { await wsDeleteFile(env, chatKey, p); } catch (_) {}
+    }
+    if (adopted || deleted.length) { try { await wsBumpRev(env, chatKey); } catch (_) {} }
+    try { await runSQL(env, `INSERT INTO ws_meta (chat_key, rev, synced_at) VALUES (?, 0, ?) ON CONFLICT(chat_key) DO UPDATE SET synced_at = excluded.synced_at`, [chatKey, Date.now()]); } catch (_) {}
+    let manifest = {};
+    try { manifest = await wsManifest(env, chatKey); } catch (err) { return json({ error: "manifest failed on the database", retry: true }, 503); }
+    return json({ ok: true, chatKey, rev: await wsRev(env, chatKey), adopted, conflicts, ws: { meta: manifest }, v: WORKER_VERSION });
+  }
+
+  if (request.method === "GET") {
+    const q = new URL(request.url).searchParams;
+    const wanted = q.get("paths");
+    const files = {};
+    const mtime = {};
+    try {
+      if (wanted) {
+        for (const p of wanted.split(",").map(s => s.trim()).filter(Boolean).slice(0, MAX_WS_FILES)) {
+          const row = await wsGetFile(env, chatKey, p);
+          if (row) { files[p] = row.content; mtime[p] = row.mtime; }
+        }
+      } else {
+        const manifest = await wsManifest(env, chatKey);
+        for (const p of Object.keys(manifest)) {
+          const row = await wsGetFile(env, chatKey, p);
+          if (row) { files[p] = row.content; mtime[p] = row.mtime; }
+        }
+      }
+    } catch (err) { return json({ error: "read failed on the database", retry: true }, 503); }
+    return json({ ok: true, chatKey, rev: await wsRev(env, chatKey), files, mtime, v: WORKER_VERSION });
+  }
+  return json({ error: "method not allowed" }, 405);
 }
 
 /* =====================================================================
@@ -1516,6 +2168,8 @@ async function handleJobStatus(url, ctx, env) {
     attempts: job.attempts, waitedMs: tw.waitedMs, workMs: tw.workMs, bytes: job.bytes,
     working: tw.working, waiting: running && !tw.working,
     nextRetryAt: running ? job.nextRetry : 0,
+    serverTools: !!(job.meta && job.meta.serverTools),
+    serverRounds: Number(job.meta && job.meta.serverRounds) || 0,
     createdAt: job.createdAt, updatedAt: job.updatedAt, v: WORKER_VERSION,
   };
   if (job.meta && job.meta.retry) {
@@ -1634,6 +2288,7 @@ async function handleJobsList(request, ctx, env) {
     const { model, preview } = previewFromReq(r.req);
     let error = "";
     let retryMode = "", retryLabel = "", retryMax = 0;
+    let serverRounds = 0, serverTools = false;
     try {
       const meta = r.meta ? JSON.parse(r.meta) : null;
       if (meta) {
@@ -1643,6 +2298,8 @@ async function handleJobsList(request, ctx, env) {
           retryLabel = String(meta.retry.label || "");
           retryMax = Number(meta.retry.max) || 0;
         }
+        serverRounds = Number(meta.serverRounds) || 0; // v15: rounds the WORKER executed
+        serverTools = !!meta.serverTools;
       }
     } catch (_) {}
     /* v14: the true wait/work split from the meters (line time vs the model
@@ -1661,6 +2318,7 @@ async function handleJobsList(request, ctx, env) {
       working: running && tw.working, waiting: running && !tw.working,
       nextRetryAt: running ? (Number(r.next_retry) || 0) : 0,
       retryMode, retryLabel, retryMax,
+      serverTools, serverRounds,
       createdAt: born, updatedAt: upd, chatKey: String(r.chat_key || ""),
       model, preview, error,
     };
@@ -1865,6 +2523,10 @@ export default {
     if (request.method === "POST" && /^\/job\/[A-Za-z0-9-]+\/retry-mode$/.test(url.pathname)) {
       return handleJobRetryMode(request, env);
     }
+    /* v15: the workspace mirror — push/pull/clear per chat */
+    if (/^\/ws\/[A-Za-z0-9._:-]+$/.test(url.pathname) && ["GET", "POST", "DELETE"].includes(request.method)) {
+      return handleWsSync(request, env);
+    }
     if (request.method === "GET" && /^\/job\/by-key\/[A-Za-z0-9._:%-]+$/.test(url.pathname)) {
       return handleJobByKey(url, ctx, env);
     }
@@ -1877,7 +2539,7 @@ export default {
     if (request.method === "DELETE" && /^\/job\/[A-Za-z0-9-]+$/.test(url.pathname)) {
       return handleDelete(url, env);
     }
-    return json({ error: "not found", hint: "use /chat (X-Nexus-Submit: 1), /job/:id?offset=N, /job/:id/status, /job/:id/retry-mode, /job/by-key/:key, /jobs, DELETE /jobs/:id, POST /jobs/clear, /health" }, 404);
+    return json({ error: "not found", hint: "use /chat (X-Nexus-Submit: 1), /job/:id?offset=N, /job/:id/status, /job/:id/retry-mode, /job/by-key/:key, /jobs, DELETE /jobs/:id, POST /jobs/clear, /ws/:chatKey (GET/POST/DELETE), /health" }, 404);
   },
 
   /* cron tick: heartbeat + prune + up to two jobs of real work */
