@@ -1,7 +1,39 @@
 /* =====================================================================
-   NEXUS BACKGROUND RELAY v19 — Cloudflare Worker
+   NEXUS BACKGROUND RELAY v20 — Cloudflare Worker
    THE WORKER OWNS THE REQUEST — AND YOUR FILES — AND YOUR TOOLS.
    =====================================================================
+
+   v20 — "A PARKED JOB IS A HANDOFF, NOT A DEAD END":
+   the user's report — "tried qwen and left it for a few hours; came back
+   to 'the response has been cut off' with no progress but the thinking
+   from when I left, and the request on the worker sits PARKED because of
+   tools". The parked round is the worker HOLDING THE RUN OPEN for the
+   phone to execute its tool calls — but everything around it treated a
+   park as a failure:
+     - The phone's recovery checked !rs.clean (no finish marker — parked
+       buffers never have one) BEFORE the tool-call branch, so it marked
+       the chat "Interrupted — response cut off" and never executed the
+       round. Fixed on the app side (v16): complete tool calls execute,
+       the run continues, the parked job is retired as the parent.
+     - by-key rediscovery only covered 30 minutes and the prune deleted
+       parked rows at 2h — "left for a few hours" fell outside BOTH.
+       v20: parked rows keep for PARKED_KEEP_MS (24h default) and by-key
+       rediscovers them for the same window, carrying the park reason.
+     - The park itself was SILENT. v20 writes meta.park {reason, detail}:
+       "tools" (the device's round — tool names listed), "upstream-fatal"
+       (the provider refused mid-run — 401/404/etc, WITH the honest error
+       event appended to the buffer so the replay shows WHY), or
+       "images-cut". /jobs, /job/:id/status and /job/by-key all expose it.
+     - The prune could FAIL A LIVE JOB BY AGE: queued/streaming rows older
+       than 30 minutes were failed even with a fresh heartbeat — the
+       second half of the slow-model "time out and cut off" (v19 fixed
+       the watchdog; this fixes the age ceiling). v20: only stale-
+       heartbeat rows past the TTL are failed; JOB_TTL default is 2h and
+       the drive budget is 20min per session (seamless release/re-drive).
+     - Parent retirement flipped terminal statuses: a DONE parent was
+       marked "stopped" by its follow-up submit. v20 stopJobRows only
+       retires queued/streaming/parked parents; done/failed keep their
+       honest status (the explicit user Stop still stops anything).
 
    v19 — "SLOW MODELS DON'T TIME OUT, AND THE CLOCK IS THE WORKER'S":
    the user's report — slower models (Qwen-class, minutes of queue or
@@ -243,7 +275,7 @@
    resume the work).
    ===================================================================== */
 
-const WORKER_VERSION = 19;
+const WORKER_VERSION = 20;
 
 /* test tunables — production reads defaults; the local harness overrides
    via globalThis.__nexusTun to run E2E in seconds. */
@@ -253,8 +285,22 @@ function TUN(key, def) {
 }
 
 const MAX_JOB_BYTES = TUN("maxJobBytes", 8 * 1024 * 1024);
-const JOB_TTL_MS = TUN("jobTtlMs", 30 * 60 * 1000);
+/* v20: JOB_TTL is now the ceiling for a job NOBODY is driving (dead queue
+   rows). A LIVE pump heartbeats every few seconds and is exempt from the
+   fail-sweep in prune() — a genuinely slow model (big Qwen thinking for
+   40+ minutes) streams to completion instead of being failed by age.
+   30 minutes was the second half of the slow-model "time out and cut
+   off": v19 fixed the watchdog, this fixes the age ceiling. */
+const JOB_TTL_MS = TUN("jobTtlMs", 2 * 60 * 60 * 1000);
 const DONE_TTL_MS = TUN("doneTtlMs", 2 * 60 * 60 * 1000);
+/* v20: a PARKED job is the phone's tool round — the worker is holding the
+   buffer open FOR the device to come back and execute it. 30 minutes of
+   rediscovery (the old by-key window) and 2 hours of row life (DONE_TTL)
+   were both shorter than the user's "left for a few hours" — the phone
+   came back to nothing. Parked rows now outlive everything else. */
+/* v20: read at CALL time — tests and harnesses retune the window at
+   runtime (parkedKeepMs), so it can't be a module-load constant */
+const parkedKeepMs = () => TUN("parkedKeepMs", 24 * 60 * 60 * 1000);
 const MAX_ATTEMPTS = TUN("maxAttempts", 24);
 const RETRY_DELAYS = TUN("retryDelays", [1500, 3000, 6000, 10000, 15000, 20000]);
 const UPSTREAM_STALL_MS = TUN("stallMs", 90 * 1000);
@@ -272,7 +318,10 @@ const STALE_LOCK_MS = TUN("staleLockMs", 26 * 1000);
 const FLUSH_MS = TUN("flushMs", 300);
 const FLUSH_BYTES = TUN("flushBytes", 64 * 1024);
 const TICK_BUDGET_MS = TUN("tickBudgetMs", 210 * 1000);
-const EVENT_BUDGET_MS = TUN("eventBudgetMs", 10 * 60 * 1000);
+/* v20: 20 minutes per drive session — a slow-model run crosses session
+   boundaries with a release + re-drive (the lock, buffer and meters all
+   survive), so fewer swaps = fewer D1 writes for the same progress. */
+const EVENT_BUDGET_MS = TUN("eventBudgetMs", 20 * 60 * 1000);
 const TAIL_POLL_FAST = TUN("tailPollFast", 400);
 const TAIL_POLL_SLOW = TUN("tailPollSlow", 2000);
 const MAX_ACTIVE_JOBS = 64;
@@ -1794,8 +1843,13 @@ async function archiveReplayResponse(env, arc) {
 /* v14: retire job rows OUTSIDE the pump (user stop / stop-all / parent
    retirement) — settles the wait/work meters in SQL so the row's final
    numbers stay honest, then marks it stopped and drops its secret. */
-async function stopJobRows(env, ids) {
+async function stopJobRows(env, ids, opts = {}) {
   const now = Date.now();
+  /* v20: parent retirement must not overwrite a terminal status — a DONE
+     parent stays done (the panel and by-key keep the honest state); only
+     queued/streaming/parked rows are stoppable. The explicit user Stop
+     (handleDelete) passes any: true — user intent overrides. */
+  const guard = opts.any ? "" : " AND status IN ('queued','streaming','parked')";
   for (const id of ids) {
     try {
       await runSQL(env,
@@ -1804,7 +1858,7 @@ async function stopJobRows(env, ids) {
            work_ms = work_ms + CASE WHEN work_start > 0 THEN ? - work_start ELSE 0 END,
            wait_start = 0, work_start = 0,
            status = 'stopped', heartbeat = 0, lock_token = NULL, updated_at = ?
-         WHERE id = ?`, [now, now, now, id]);
+         WHERE id = ?` + guard, [now, now, now, id]);
     } catch (_) {}
     try { await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]); } catch (_) {}
   }
@@ -2154,6 +2208,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
     parser.feed(all);
     parser.flushPending();
   }
+  if (TUN("debugPark", 0)) console.log("[rebuild] live.total=" + live.total + " job.bytes=" + job.bytes + " liveChunks=" + (live.chunks || []).length + " → sawToolCalls=" + parser.sawToolCalls + " toolAcc=" + Object.keys(parser.toolAcc).length + " contentLen=" + parser.contentText.length);
   if (parser.errorSeen && !job.finish) { await failJob(env, jobId, token, parser.errorMessage, { live, t: tsettle }); return; }
 
   /* ---- v15: mirror-mode agent loop -------------------------------
@@ -2345,6 +2400,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
     while (true) {
       if (signal.aborted) return; // killed like the runtime would — leave D1 stale on purpose
       if (Date.now() > deadline) { gaveUp = true; break; }
+      if (TUN("debugPark", 0)) console.log("[loop] top: sawToolCalls=" + parser.sawToolCalls + " finishSeen=" + parser.finishSeen + " sawData=" + parser.sawData + " bytes=" + totalBytes + " toolAcc=" + Object.keys(parser.toolAcc).length + " attempt=" + attempts);
 
       /* v14: the attempt ceiling follows the job's pace profile (a
          Relentless pick earns its 100 attempts; the default stays put) */
@@ -2358,6 +2414,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
          going with NOBODY attached, which is the entire point of the
          worker holding the files. */
       if (parser.sawToolCalls && !parser.finishSeen) {
+        if (TUN("debugPark", 0)) console.log("[park] tools cut: serverRoundsOn=" + serverRoundsOn() + " calls=" + Object.keys(parser.toolAcc).length + " attempt=" + attempts);
         if (serverRoundsOn()) {
           const resetOk = await appendMarker({ nexus_round_reset: 1 });
           if (!resetOk) { liveAbort(live); return; }
@@ -2369,9 +2426,12 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
           separatorNeeded = true; // the re-ask must start line-aligned
           continue;
         }
-        await parkJob(env, jobId, token, tsettle); liveClose(live); return;
+        await parkJob(env, jobId, token, tsettle, {
+          reason: "tools",
+          detail: "tool round for the device: " + (parser.toolCalls() || []).map(c => c.name).filter(Boolean).join(", ").slice(0, 240),
+        }); liveClose(live); return;
       }
-      if (job.kind !== "chat" && totalBytes > 0 && !parser.finishSeen) { await parkJob(env, jobId, token, tsettle); liveClose(live); return; }
+      if (job.kind !== "chat" && totalBytes > 0 && !parser.finishSeen) { await parkJob(env, jobId, token, tsettle, { reason: "images-cut", detail: "image body arrived incomplete" }); liveClose(live); return; }
       if (attempts >= profMax(pace)) { await failJob(env, jobId, token, "retry budget used up", { live, t: tsettle }); return; }
 
       /* ---- build the upstream request ---- */
@@ -2532,6 +2592,14 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
         status = upstream.status;
         try { const t = await upstream.text(); message = String(t).slice(0, 400); } catch (_) {}
       } else if (upstreamErr) message = String((upstreamErr && upstreamErr.message) || upstreamErr);
+      /* v20: providers wrap their reason as JSON — surface the actual
+         error.message, not the raw body (the park's detail + the replay's
+         error event both carry it; the phone shows WHY in one line) */
+      try {
+        const parsed = JSON.parse(message);
+        if (parsed && parsed.error && parsed.error.message) message = String(parsed.error.message).slice(0, 300);
+        else if (parsed && parsed.message) message = String(parsed.message).slice(0, 300);
+      } catch (_) {}
 
       const fatal = [400, 401, 403, 404, 422].includes(status);
       if (fatal && totalBytes === 0) {
@@ -2539,7 +2607,17 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
           { errorEvent: { message: message, code: status }, kind: job.kind, live, t: tsettle });
         return;
       }
-      if (fatal) { await parkJob(env, jobId, token, tsettle); liveClose(live); return; }
+      if (fatal) {
+        /* v20: an upstream refusal mid-run parks WITH the honest error
+           event in the buffer — the phone's replay shows WHY (bad key,
+           model route, context) instead of a mystery "cut off", and
+           meta.park carries it for the requests panel */
+        await parkJob(env, jobId, token, tsettle, {
+          reason: "upstream-fatal",
+          detail: "upstream " + status + ": " + message,
+          error: { message: message, code: status },
+        }); liveClose(live); return;
+      }
       /* retryable: 429 / 408 / 5xx / network — re-request until it gets in.
          A refused attempt is pure line time: wait_start stays running. */
       attempts++; inlineAttempts++;
@@ -2595,12 +2673,38 @@ async function finalizeDone(env, id, token, live, t) {
   } catch (_) {}
   liveClose(live);
 }
-async function parkJob(env, id, token, t) {
+/* v20: parkJob writes WHY the job parked into meta.park and — when the
+   reason is an upstream refusal — puts the honest error event into the
+   buffer BEFORE the status flip (same ordering rule as failJob: the
+   polling tail must see the event before it is allowed to close). A
+   tools-park appends NO error (it is a handoff, not a failure) but does
+   ride the v19 timing chunk so the phone sees the meters. The reasons:
+     tools        — the round's tool calls are the phone's to execute
+                    (no mirror, or the cut hit mid-round)
+     images-cut   — an image body that arrived incomplete
+     upstream-fatal — the provider refused mid-run (401/403/404/422...);
+                    the phone replays the partial, sees the error event,
+                    and can retry with fresh credentials/model */
+async function parkJob(env, id, token, t, park) {
   const now = Date.now();
   const tv = t ? t() : null;
+  /* bytes FIRST when there is an error event — parked buffer replays must
+     carry the honest reason the same way failed ones do */
+  if (park && park.error) {
+    try { await appendErrorChunk(env, id, "chat", park.error.message, park.error.code); } catch (_) {}
+  }
+  try { await appendTimingChunk(env, id, tv); } catch (_) {}
   try {
     const fields = { status: "parked", heartbeat: 0, updated_at: now, lock_token: null };
     if (tv) Object.assign(fields, { wait_ms: tv.waitMs, work_ms: tv.workMs, wait_start: 0, work_start: 0 });
+    if (park && park.reason) {
+      const row = await getJobRow(env, id);
+      if (row) {
+        const meta = row.meta || {};
+        meta.park = { reason: String(park.reason).slice(0, 40), detail: String(park.detail || "").slice(0, 300), at: now };
+        fields.meta = JSON.stringify(meta);
+      }
+    }
     await lockWrite(env, id, token, fields);
     await runSQL(env, `DELETE FROM secrets WHERE job = ?`, [id]);
   } catch (_) {}
@@ -3180,6 +3284,11 @@ async function handleJobStatus(url, ctx, env) {
     out.retryMax = Number(job.meta.retry.max) || 0;
   }
   if (job.meta && job.meta.error) out.error = job.meta.error;
+  if (job.meta && job.meta.park) { // v20: the park reason rides the status
+    out.parkReason = String(job.meta.park.reason || "");
+    out.parkDetail = String(job.meta.park.detail || "");
+    out.parkedAt = Number(job.meta.park.at) || 0;
+  }
   return json(out);
 }
 
@@ -3192,7 +3301,7 @@ async function handleJobByKey(url, ctx, env) {
   if (hasDB(env)) {
     try { await ensureSchema(env); } catch (_) {}
     try {
-      rows = await allSQL(env, `SELECT id, kind, status, bytes, created_at FROM jobs WHERE chat_key = ? ORDER BY created_at DESC LIMIT 8`, [key]);
+      rows = await allSQL(env, `SELECT id, kind, status, bytes, created_at, meta FROM jobs WHERE chat_key = ? ORDER BY created_at DESC LIMIT 8`, [key]);
     } catch (err) { return json({ error: "key lookup failed on the database", retry: true }, 503); }
   } else {
     return json({ error: "no job for this key (passthrough mode)" }, 404);
@@ -3202,8 +3311,18 @@ async function handleJobByKey(url, ctx, env) {
   for (const r of rows) {
     const age = now - Number(r.created_at);
     const st = String(r.status);
-    if (["queued", "streaming", "parked"].includes(st) && age < JOB_TTL_MS) {
+    if (["queued", "streaming"].includes(st) && age < JOB_TTL_MS) {
       return json({ ok: true, jobId: r.id, id: r.id, kind: r.kind, status: st, bytes: Number(r.bytes) });
+    }
+    /* v20: a parked job is HELD FOR THIS DEVICE — it stays discoverable
+    for PARKED_KEEP_MS (24h), not the 30-minute live window. "Left for a
+    few hours" used to fall outside the window: by-key skipped the parked
+    row, the app never re-attached, and the chat read "cut off" while the
+    round sat on the worker waiting for it. */
+    if (st === "parked" && age < parkedKeepMs()) {
+      let parkReason = "tools", parkDetail = "";
+      try { const meta = r.meta ? JSON.parse(r.meta) : null; if (meta && meta.park) { parkReason = String(meta.park.reason || "tools"); parkDetail = String(meta.park.detail || ""); } } catch (_) {}
+      return json({ ok: true, jobId: r.id, id: r.id, kind: r.kind, status: st, bytes: Number(r.bytes), parkReason, parkDetail: parkDetail.slice(0, 200) });
     }
     if (st === "done" && age < DONE_TTL_MS) {
       return json({ ok: true, jobId: r.id, id: r.id, kind: r.kind, status: st, bytes: Number(r.bytes) });
@@ -3232,8 +3351,10 @@ async function handleDelete(url, env) {
   if (jobEngineOk(env)) {
     /* stop the spend AND settle the meters (v14): mark cancelled (running
        pumps lose their lock on the next flush and self-terminate); rows are
-       pruned by TTL shortly after */
-    try { await stopJobRows(env, [id]); } catch (_) {}
+       pruned by TTL shortly after. v20 any:true — an explicit user Stop
+       also retires a PARKED round (its buffer goes with it; the chat's
+       local continue protocol takes over if the user resumes) */
+    try { await stopJobRows(env, [id], { any: true }); } catch (_) {}
   }
   return json({ ok: true });
 }
@@ -3301,6 +3422,7 @@ async function handleJobsList(request, ctx, env) {
     let error = "";
     let retryMode = "", retryLabel = "", retryMax = 0;
     let serverRounds = 0, serverTools = false;
+    let parkReason = "", parkDetail = "";
     try {
       const meta = r.meta ? JSON.parse(r.meta) : null;
       if (meta) {
@@ -3312,6 +3434,10 @@ async function handleJobsList(request, ctx, env) {
         }
         serverRounds = Number(meta.serverRounds) || 0; // v15: rounds the WORKER executed
         serverTools = !!meta.serverTools;
+        if (meta.park) { // v20: why this job is waiting for the device
+          parkReason = String(meta.park.reason || "");
+          parkDetail = String(meta.park.detail || "");
+        }
       }
     } catch (_) {}
     /* v14: the true wait/work split from the meters (line time vs the model
@@ -3331,6 +3457,7 @@ async function handleJobsList(request, ctx, env) {
       nextRetryAt: running ? (Number(r.next_retry) || 0) : 0,
       retryMode, retryLabel, retryMax,
       serverTools, serverRounds,
+      parkReason, parkDetail,
       createdAt: born, updatedAt: upd, chatKey: String(r.chat_key || ""),
       model, preview, error,
     };
@@ -3450,15 +3577,56 @@ async function prune(env) {
   if (!jobEngineOk(env)) return;
   const now = Date.now();
   try {
+    /* v20: two liveness rules changed here.
+       (1) A row with a FRESH heartbeat has a live pump driving it — it is
+           NEVER swept, no matter its age. A big slow model can stream for
+           40+ minutes; the old created_at-only sweep failed it mid-run
+           ("time out and cut off", the slow-model bug's second half).
+       (2) PARKED rows keep for PARKED_KEEP_MS (24h) — they are held FOR
+           the device's return, so they outlive done/failed/stopped rows. */
+    /* v20 fix: heartbeat 0 is the canonical "no live pump" marker (every
+       park/fail/done/release clears it) — `heartbeat < now-stale` alone can
+       NEVER match 0, so parked + released rows were unprunable. A row is
+       pumpless when heartbeat IS 0 OR has gone stale. The catch-all is
+       status-scoped too: queued/streaming rows belong to the fail-sweep
+       (which writes the honest error event BEFORE failing them), and
+       PARKED rows outlive everything for parkedKeepMs — a bare age clause
+       deleted them at JOB_TTL+DONE_TTL (4h in production), INSIDE the 24h
+       the park was promised. */
     const dead = await allSQL(env,
-      `SELECT id FROM jobs WHERE (status IN ('done','failed','parked','stopped') AND updated_at < ?) OR (created_at < ?)`,
-      [now - DONE_TTL_MS, now - JOB_TTL_MS - DONE_TTL_MS]);
+      `SELECT id FROM jobs WHERE (COALESCE(heartbeat, 0) = 0 OR COALESCE(heartbeat, 0) < ?) AND (
+         (status IN ('done','failed','stopped') AND updated_at < ?)
+         OR (status = 'parked' AND updated_at < ?)
+         OR (status NOT IN ('done','failed','stopped','parked','queued','streaming') AND created_at < ?))`,
+      [now - 4 * STALE_LOCK_MS, now - DONE_TTL_MS, now - parkedKeepMs(), now - JOB_TTL_MS - DONE_TTL_MS]);
     /* v18: a pruned FINISHED run is archived FIRST — its response outlives
        its job rows (the away-and-back sync reads the archive) */
     for (const r of dead) { await archiveJob(env, r.id); await deleteJobRows(env, r.id); }
-    await runSQL(env,
-      `UPDATE jobs SET status = 'failed', heartbeat = 0, lock_token = NULL, updated_at = ? WHERE status IN ('queued','streaming') AND created_at < ?`,
-      [now, now - JOB_TTL_MS]);
+    /* fail-sweep: only jobs with NO live pump (heartbeat 0 = released or
+       never driven; a stale heartbeat = a dead driver) AND past the TTL —
+       an actively-streaming slow model is exempt (rule 1). v20 fix: this
+       moved from a blind UPDATE to an honest failJob-shaped write — the
+       error event lands in the buffer BEFORE the status flip (the tail
+       replays WHY, not a mystery 404) and meta.error rides /status. */
+    try {
+      const sweep = await allSQL(env,
+        `SELECT id FROM jobs WHERE status IN ('queued','streaming') AND created_at < ? AND (COALESCE(heartbeat, 0) = 0 OR COALESCE(heartbeat, 0) < ?)`,
+        [now - JOB_TTL_MS, now - 4 * STALE_LOCK_MS]);
+      for (const r of sweep) {
+        try {
+          await appendErrorChunk(env, r.id, "chat",
+            "The worker gave up on this request — it sat with no driver for over " + Math.max(1, Math.round(JOB_TTL_MS / 60000)) + " minutes. Resume from the app to continue it.", 599);
+        } catch (_) {}
+        try {
+          const row = await getJobRow(env, r.id);
+          const meta = (row && row.meta) ? row.meta : {};
+          meta.error = "worker TTL exceeded — no driver progress";
+          await runSQL(env,
+            `UPDATE jobs SET status = 'failed', heartbeat = 0, lock_token = NULL, updated_at = ?, meta = ? WHERE id = ? AND status IN ('queued','streaming')`,
+            [now, JSON.stringify(meta), r.id]);
+        } catch (_) {}
+      }
+    } catch (_) {}
     await runSQL(env, `DELETE FROM secrets WHERE job NOT IN (SELECT id FROM jobs)`);
     const total = await getSQL(env, `SELECT COUNT(*) AS n FROM jobs`);
     if (total && Number(total.n) > MAX_TOTAL_JOBS) {
