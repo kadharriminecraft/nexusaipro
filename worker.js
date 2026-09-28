@@ -1,7 +1,37 @@
 /* =====================================================================
-   NEXUS BACKGROUND RELAY v17 — Cloudflare Worker
+   NEXUS BACKGROUND RELAY v19 — Cloudflare Worker
    THE WORKER OWNS THE REQUEST — AND YOUR FILES — AND YOUR TOOLS.
    =====================================================================
+
+   v19 — "SLOW MODELS DON'T TIME OUT, AND THE CLOCK IS THE WORKER'S":
+   the user's report — slower models (Qwen-class, minutes of queue or
+   silent thinking on free lines) "just seem to time out and cut off for
+   the worker"; the times indicators "don't seem to be correct".
+   Two root causes, both fixed at the source:
+     - THE STALL WATCHDOG WAS FLAT. A single 60s "no bytes" timer armed
+       BEFORE the fetch even left — so a provider holding the request in
+       its queue (headers not back yet), or a thinking model silent
+       before its first token, was killed at 60s, retried, killed again,
+       until the attempt budget drained and the job "cut off". v19 makes
+       the watchdog phase-aware:
+         connect    (headers not back yet — the provider LINE)  → 5 min
+         accepted   (headers ok, model thinking before byte 1)  → 3 min
+         streaming  (bytes were flowing, now silent = dead)      → 90s
+       Any byte — data or an SSE keep-alive comment — is a beat and
+       promotes the phase. A genuinely dead socket still dies in 90s and
+       takes the truncation-recovery path, exactly as before.
+     - THE TIMES WERE THE PHONE'S GUESS. The live path stamped the
+       message's wait/work chip from the phone's own t0/first-token —
+       meaningless when the phone attached late or left and came back.
+       The worker has kept honest meters since v14 (wait = line, work =
+       the model on an accepted attempt); v19 FORWARDS them inside the
+       stream itself: every terminal chat job appends one final event
+           data: {"nexus_timing":{"waitMs":…,"workMs":…,"attempts":…}}
+       BEFORE its status flips — so the live tail, every re-attach, the
+       D1 replay AND the v18 archive all carry the worker's clock. The
+       app prefers it (chip says "synced from worker"), falls back to
+       /job/:id/status, and only measures locally for direct runs. The
+       wait monitor also becomes a live WORK counter while streaming.
 
    v17 — "THE AI AND THE WORKER ARE INDEPENDENT": every tool the agent
    can call now runs ON THE WORKER too — the phone is a pure observer.
@@ -213,7 +243,7 @@
    resume the work).
    ===================================================================== */
 
-const WORKER_VERSION = 18;
+const WORKER_VERSION = 19;
 
 /* test tunables — production reads defaults; the local harness overrides
    via globalThis.__nexusTun to run E2E in seconds. */
@@ -227,7 +257,17 @@ const JOB_TTL_MS = TUN("jobTtlMs", 30 * 60 * 1000);
 const DONE_TTL_MS = TUN("doneTtlMs", 2 * 60 * 60 * 1000);
 const MAX_ATTEMPTS = TUN("maxAttempts", 24);
 const RETRY_DELAYS = TUN("retryDelays", [1500, 3000, 6000, 10000, 15000, 20000]);
-const UPSTREAM_STALL_MS = TUN("stallMs", 60 * 1000);
+const UPSTREAM_STALL_MS = TUN("stallMs", 90 * 1000);
+/* v19: the watchdog needs to know WHICH silence it is looking at — a
+   slow model in a provider line or thinking before its first token is
+   ALIVE, and the old flat 60s kill was the slow-model "time out and
+   cut off". Phase limits (beats: any body byte, keep-alive comments
+   included, promote to streaming):
+     connect    — fetch still out, headers not back yet (the line)
+     accepted   — headers ok, the model is silent before byte one
+     streaming  — bytes flowed, then stopped = a dead socket */
+const UPSTREAM_CONNECT_MS = TUN("connectMs", 5 * 60 * 1000);
+const UPSTREAM_FIRST_CHUNK_MS = TUN("firstChunkMs", 3 * 60 * 1000);
 const STALE_LOCK_MS = TUN("staleLockMs", 26 * 1000);
 const FLUSH_MS = TUN("flushMs", 300);
 const FLUSH_BYTES = TUN("flushBytes", 64 * 1024);
@@ -1954,6 +1994,41 @@ async function appendErrorChunk(env, id, kind, message, code) {
   await runSQL(env, `UPDATE jobs SET bytes = bytes + ?, updated_at = ? WHERE id = ?`, [byteLen, Date.now(), id]);
 }
 
+/* v19: the honest meters, forwarded IN the stream itself. Every terminal
+   chat job appends one final event before its status flips:
+     data: {"nexus_timing":{"waitMs":…,"workMs":…,"attempts":…,"finishedAt":…}}
+   Ordering rule (same as failJob's error chunk): the event must land in
+   the buffer BEFORE the status flips, so the D1-polling tail delivers it
+   before it is allowed to close. From there it rides EVERYTHING — the
+   live tail, any re-attach, the offset replay, and the v18 archive copy
+   (chunks are archived row-for-row) — so the phone's timing chip reads
+   the WORKER's clock (the only clock that saw the whole job) whether it
+   watched live, left and came back, or snapped in days later. Images
+   jobs never get one: their replay is a single JSON body, and a stray
+   line would corrupt the app's JSON.parse. Old apps ignore the event
+   (unknown nexus_* JSON is skipped by their line parsers). */
+async function appendTimingChunk(env, id, meters) {
+  try {
+    const row = await getSQL(env, `SELECT kind, attempts, status, created_at, updated_at, heartbeat, first_byte, wait_ms, work_ms, work_start, wait_start FROM jobs WHERE id = ?`, [id]);
+    if (!row || String(row.kind) !== "chat") return false;
+    let waitMs, workMs;
+    if (meters && (meters.waitMs != null || meters.workMs != null)) {
+      waitMs = Math.max(0, Number(meters.waitMs) || 0);
+      workMs = Math.max(0, Number(meters.workMs) || 0);
+    } else {
+      const tw = liveWaitWork(rowToJob(row), Date.now());
+      waitMs = tw.waitedMs; workMs = tw.workMs;
+    }
+    const payload = "data: " + JSON.stringify({ nexus_timing: { waitMs: Math.round(waitMs), workMs: Math.round(workMs), attempts: Number(row.attempts) || 0, finishedAt: Date.now() } }) + "\n\n";
+    const byteLen = new TextEncoder().encode(payload).length;
+    const r = await getSQL(env, `SELECT COALESCE(MAX(seq), -1) AS mx FROM chunks WHERE job = ?`, [id]);
+    const seq = (r ? Number(r.mx) : -1) + 1;
+    await runSQL(env, `INSERT INTO chunks (job, seq, bytes, data) VALUES (?, ?, ?, ?)`, [id, seq, byteLen, payload]);
+    await runSQL(env, `UPDATE jobs SET bytes = bytes + ?, updated_at = ? WHERE id = ?`, [byteLen, Date.now(), id]);
+    return true;
+  } catch (_) { return false; }
+}
+
 /* =====================================================================
    Live registry — in-isolate fan-out for the client that is watching
    right now (zero D1 latency), plus the abort handle used by DELETE,
@@ -2333,8 +2408,18 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
       const ac = new AbortController();
       const onOuterAbort = () => { try { ac.abort(); } catch (_) {} };
       signal.addEventListener("abort", onOuterAbort, { once: true });
+      /* v19: phase-aware watchdog — the limit follows the CURRENT silence
+         (connect / accepted / streaming, see the constants above), so a
+         slow model waiting out a provider line or thinking silently
+         before its first token is no longer killed by the old flat 60s
+         abort loop (the exact "slower models time out and cut off"
+         report). Any body byte is a beat and promotes the phase. */
       let lastBeat = Date.now();
-      const wd = setInterval(() => { if (Date.now() - lastBeat > UPSTREAM_STALL_MS) { try { ac.abort(); } catch (_) {} } }, 5000);
+      let wdPhase = "connect"; // connect → accepted → streaming
+      const wd = setInterval(() => {
+        const limit = wdPhase === "connect" ? UPSTREAM_CONNECT_MS : (wdPhase === "accepted" ? UPSTREAM_FIRST_CHUNK_MS : UPSTREAM_STALL_MS);
+        if (Date.now() - lastBeat > limit) { try { ac.abort(); } catch (_) {} }
+      }, TUN("wdTickMs", 5000));
 
       let upstream = null, upstreamErr = null;
       if (firstUpstream) { upstream = firstUpstream; firstUpstream = null; }
@@ -2353,9 +2438,15 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
 
       if (!upstreamErr && upstream && upstream.ok && upstream.body) {
         /* ---- ACCEPTED: the model took the request — the line wait ends,
-           the work meter starts (thinking, text, tool args all count) ---- */
+           the work meter starts (thinking, text, tool args all count).
+           v19: headers back = a watchdog beat + phase promotion — the
+           request is OUT of the provider line, but the model may still
+           sit silent before its first token (thinking), which is the
+           firstChunk window, not a stall. ---- */
         settleWait();
         workStart = Date.now();
+        lastBeat = Date.now();
+        wdPhase = "accepted";
         try { await lockWrite(env, jobId, token, { ...timingFields(), updated_at: Date.now() }); } catch (_) {}
         /* ---- stream it: fan out + parse + flush ---- */
         const reader = upstream.body.getReader();
@@ -2369,6 +2460,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
             const value = res.value;
             if (value && value.length) {
               lastBeat = Date.now();
+              wdPhase = "streaming"; // bytes flowing — silence from here is a dead socket, 90s
               if (firstChunk && separatorNeeded) {
                 if (lastByte !== 0x0A) {
                   const sep = new Uint8Array([0x0A, 0x0A]); // line-align before a continuation
@@ -2490,6 +2582,11 @@ async function releaseJob(env, id, token, attempts, timing) {
 async function finalizeDone(env, id, token, live, t) {
   const now = Date.now();
   const tv = t ? t() : null; // settle both meters at the true end
+  /* v19: the meters ride the stream itself — BEFORE the status flip (the
+     same ordering rule as failJob's error chunk: the polling tail must
+     see the event before it is allowed to close). Live tails, re-attaches
+     and the v18 archive replay all carry the worker's clock. */
+  try { await appendTimingChunk(env, id, tv); } catch (_) {}
   try {
     const fields = { status: "done", finish: 1, heartbeat: 0, updated_at: now, lock_token: null };
     if (tv) Object.assign(fields, { wait_ms: tv.waitMs, work_ms: tv.workMs, wait_start: 0, work_start: 0 });
@@ -2517,6 +2614,10 @@ async function failJob(env, id, token, reason, o = {}) {
   if (o.errorEvent) {
     try { await appendErrorChunk(env, id, o.kind || "chat", o.errorEvent.message, o.errorEvent.code); } catch (_) {}
   }
+  /* v19: a failed run's meters ride the stream too — the phone's chip
+     shows what the worker actually spent before giving up (chat jobs
+     only; appendTimingChunk guards images itself) */
+  try { await appendTimingChunk(env, id, tv); } catch (_) {}
   /* 2. status + honest reason in meta (so /job/:id/status can report it) */
   const timingFields = tv ? { wait_ms: tv.waitMs, work_ms: tv.workMs, wait_start: 0, work_start: 0 } : {};
   try {
