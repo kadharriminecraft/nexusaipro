@@ -1,7 +1,41 @@
 /* =====================================================================
-   NEXUS BACKGROUND RELAY v20 — Cloudflare Worker
+   NEXUS BACKGROUND RELAY v21 — Cloudflare Worker
    THE WORKER OWNS THE REQUEST — AND YOUR FILES — AND YOUR TOOLS.
    =====================================================================
+
+   v21 — "A PARK(error) IS A DIAGNOSIS, NOT A VERDICT — AND IT TAKES
+   MORE THAN ONE REFUSAL TO KILL A RUN":
+   the user's report — "when I start a qwen session it eventually when I
+   come back it just says request failed and in the settings sessions it
+   says parked(error)". parkReason "upstream-fatal" is the provider
+   returning a hard 4xx on a MID-RUN re-request — and v20 treated the
+   FIRST one as final. Three root causes, all fixed at the source:
+     - NO CONTEXT HYGIENE. The app trims every submit (contextTrim, the
+       model's real context_length); the worker never did — its agent
+       rounds append assistant text + tool results to job.req forever,
+       and continuations re-send the WHOLE accumulated answer as an
+       assistant message. An hour-long agent run on a big slow model
+       grows until the provider 400s "context length exceeded" →
+       Parked (error) with the whole run held hostage. v21: the app
+       forwards its context budget (X-Nexus-Context); the worker trims
+       the WIRE request to it (system messages + newest turns kept,
+       durable conversation untouched), caps continuation partials at
+       the tail, and on a length-flavored 400 HALVES the budget and
+       re-asks (twice max) before parking.
+     - ONE FATAL = DEAD. Free-tier routes flap — a request the provider
+       already accepted gets a 400/404 "provider unavailable" on the
+       retry after a cut. v21 retries fatal 400/404/422 twice with
+       backoff before the honest park (401/403 park immediately — a
+       revoked key does not heal in seconds).
+     - THINKING SILENCE WAS A "DEAD SOCKET". The v19 watchdog's 90s
+       streaming-stall applies once ANY byte flowed — including a
+       reasoning-only stream that goes quiet mid-think (qwen's norm on
+       slow lines). v21: silence before the attempt's first CONTENT or
+       tool byte gets the 3-minute firstChunk window, not the 90s kill.
+     - Visibility: an upstream-fatal park now also writes meta.error, so
+       /jobs renders the provider's actual message under the row and
+       the app panel shows the park detail — "Parked (error)" stops
+       being a mystery.
 
    v20 — "A PARKED JOB IS A HANDOFF, NOT A DEAD END":
    the user's report — "tried qwen and left it for a few hours; came back
@@ -275,7 +309,7 @@
    resume the work).
    ===================================================================== */
 
-const WORKER_VERSION = 20;
+const WORKER_VERSION = 21;
 
 /* test tunables — production reads defaults; the local harness overrides
    via globalThis.__nexusTun to run E2E in seconds. */
@@ -314,6 +348,23 @@ const UPSTREAM_STALL_MS = TUN("stallMs", 90 * 1000);
      streaming  — bytes flowed, then stopped = a dead socket */
 const UPSTREAM_CONNECT_MS = TUN("connectMs", 5 * 60 * 1000);
 const UPSTREAM_FIRST_CHUNK_MS = TUN("firstChunkMs", 3 * 60 * 1000);
+/* v21: fatal-flap resilience + context hygiene — see the pump's fatal
+   branch. A provider that already accepted a request once earns two
+   short re-tries when it flaps a 400/404/422 on the continuation;
+   401/403 still park immediately (revoked keys do not heal). */
+const FATAL_RETRY_MAX = TUN("fatalRetryMax", 2);
+const CTX_RESCUE_MAX = TUN("ctxRescueMax", 2);
+/* the continuation partial sent back to the model is capped at the TAIL
+   (a model continues seamlessly from its last words; the head adds
+   nothing but tokens). ~24k chars ≈ 6k tokens — generous for any qwen
+   window, and the buffer on OUR side keeps everything. */
+const CONT_PARTIAL_CAP = TUN("contPartialCap", 24000);
+/* v21: budget math for the WIRE request (never the durable job.req):
+   the app forwards the model's context_length × fill; a reactive rescue
+   halves it on a length-flavored 400. These bounds keep a rescue sane
+   even when no hint arrived (old apps). */
+const CTX_MIN_BUDGET = TUN("ctxMinBudget", 8000);
+const CTX_FIT_FILL = TUN("ctxFitFill", 0.92);
 const STALE_LOCK_MS = TUN("staleLockMs", 26 * 1000);
 const FLUSH_MS = TUN("flushMs", 300);
 const FLUSH_BYTES = TUN("flushBytes", 64 * 1024);
@@ -333,7 +384,7 @@ const MAX_TOTAL_JOBS = 256;
 const RESP_ARCHIVE_KEEP = TUN("respArchiveKeep", 8);
 
 const FWD_HEADERS = ["authorization", "content-type", "http-referer", "x-title", "accept"];
-const NEXUS_HEADERS = ["x-nexus-submit", "x-nexus-chat", "x-nexus-key", "x-nexus-parent", "x-nexus-ws"];
+const NEXUS_HEADERS = ["x-nexus-submit", "x-nexus-chat", "x-nexus-key", "x-nexus-parent", "x-nexus-ws", "x-nexus-context"];
 
 /* v15: how many tool rounds the worker will execute server-side in one
    job (the app's agent step ceiling is 25 by default — mirror that), and
@@ -355,7 +406,7 @@ const STEP_LIMIT_INSTRUCTION = "You have reached the tool-use step limit for thi
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title, X-Nexus-Submit, X-Nexus-Chat, X-Nexus-Key, X-Nexus-Parent, X-Nexus-Retry, X-Nexus-WS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title, X-Nexus-Submit, X-Nexus-Chat, X-Nexus-Key, X-Nexus-Parent, X-Nexus-Retry, X-Nexus-WS, X-Nexus-Context",
   "Access-Control-Expose-Headers": "X-Nexus-Job, X-Nexus-Offset, X-Nexus-Status",
   "Access-Control-Max-Age": "86400",
 };
@@ -447,6 +498,88 @@ async function pacedSleep(env, jobId, pace, attempts, signal) {
 function sanitizeKey(v) {
   return v ? String(v).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 128) : "";
 }
+
+/* =====================================================================
+   v21: CONTEXT HYGIENE — the WIRE request must respect the model's
+   window even when the durable conversation has grown for hours.
+   The app trims every submit (contextTrim × the model's real
+   context_length); the worker's half of the bargain:
+     - estimate tokens the same way the app does (chars/4 + per-message
+       overhead + tool_calls JSON)
+     - fitRequestToBudget: keep EVERY system message + the newest turns,
+       drop the OLDEST non-system groups (tool rounds travel with their
+       assistant message — never split), cap max_tokens to the room left.
+       Returns the wire body; job.req (the durable conversation) is
+       NEVER mutated by this.
+     - capPartial: a continuation re-sends only the TAIL of the partial
+       answer (the model continues from its last words; the head is just
+       tokens)
+     - isContextLengthError: recognize the provider's "context length
+       exceeded" class so the pump can halve its budget and re-ask
+       instead of parking the whole run dead.
+   ===================================================================== */
+const msgTokens = m => {
+  let n = 24;
+  if (typeof m?.content === "string") n += Math.ceil(m.content.length / 4);
+  else if (Array.isArray(m?.content)) { for (const p of m.content) n += p?.type === "text" ? Math.ceil((p.text || "").length / 4) : 900; }
+  if (m?.tool_calls) n += Math.ceil(JSON.stringify(m.tool_calls).length / 4);
+  return n;
+};
+const msgsTokens = ms => (Array.isArray(ms) ? ms : []).reduce((s, m) => s + msgTokens(m), 0);
+function fitRequestToBudget(body, budget) {
+  const msgs = Array.isArray(body?.messages) ? body.messages : [];
+  if (msgsTokens(msgs) <= budget) return { body, est: msgsTokens(msgs), trimmed: false };
+  let system = msgs.filter(m => m.role === "system");
+  const rest = msgs.filter(m => m.role !== "system");
+  /* a system prompt that alone busts a tiny window gets truncated to half
+     the budget (head kept — the persona lives there) instead of making the
+     fit mathematically impossible; real windows (32k+) never hit this */
+  const sysCost0 = system.reduce((s, m) => s + msgTokens(m), 0);
+  if (sysCost0 > budget * 0.5) {
+    const capChars = Math.max(256, Math.floor(budget * 0.5 * 4));
+    system = system.map(m => (typeof m.content === "string" && m.content.length > capChars)
+      ? { ...m, content: m.content.slice(0, capChars) + "\n…(system instructions trimmed to fit the context window)" }
+      : m);
+  }
+  /* atomic groups — the app's own contextTrim grouping: a user turn or a
+     plain assistant turn starts a group; tool results and assistant
+     tool_calls travel with what precedes them */
+  const groups = [];
+  for (const m of rest) {
+    if (m.role === "user" || (m.role === "assistant" && !m.tool_calls)) groups.push([m]);
+    else { if (!groups.length) groups.push([]); groups[groups.length - 1].push(m); }
+  }
+  const sysCost = system.reduce((s, m) => s + msgTokens(m), 0);
+  const usable = Math.max(400, budget - sysCost - 512); /* completion room */
+  const kept = [];
+  let used = 0;
+  for (let i = groups.length - 1; i >= 0; i--) {
+    const cost = groups[i].reduce((s, m) => s + msgTokens(m), 0);
+    if (used + cost > usable && kept.length) break;
+    kept.unshift(...groups[i]);
+    used += cost;
+  }
+  const out = { ...body, messages: system.concat(kept) };
+  if (Number(out.max_tokens) > 0) out.max_tokens = Math.max(512, Math.min(Number(out.max_tokens), Math.floor(Math.max(512, budget - sysCost - used))));
+  return { body: out, est: msgsTokens(out.messages), trimmed: true };
+}
+/* cap the continuation partial to its TAIL (a model continues from its
+   last words; the head is just tokens). Without a budget: the fixed
+   CONT_PARTIAL_CAP. With one: half the window in chars — the partial
+   must SURVIVE the trim as an atomic unit, so it is capped to what the
+   fitted request can actually carry. */
+const capPartial = (t, cap) => {
+  const s = typeof t === "string" ? t : "";
+  const c = Math.floor(Math.max(0, Number(cap) || 0)) || CONT_PARTIAL_CAP;
+  return s.length > c ? s.slice(-c) : s;
+};
+const partialCapFor = budget => (budget > 0 ? Math.max(1024, Math.floor(budget * 4 * 0.5)) : 0);
+/* the provider's "too big" complaints, in the wild: "context length
+   exceeded", "maximum context length is 4096 tokens", "input tokens
+   exceed limit", "request too large"... 401/404/429-class words never
+   match (auth/model/rate live in other branches) */
+const CONTEXT_ERR_RE = /context|too\s+(?:long|large)|exceed|max(?:imum)?[^\n]{0,30}(?:tokens?|length|prompt|input)|length\s*limit|input\s+(?:size|tokens)/i;
+function isContextLengthError(message) { return CONTEXT_ERR_RE.test(String(message || "")); }
 
 /* =====================================================================
    D1 layer — the durable half of the engine.
@@ -2396,11 +2529,20 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
   }, Math.min(10000, Math.max(400, Math.floor(STALE_LOCK_MS / 3))));
 
   let gaveUp = false;
+  /* v21: fatal-flap retries (a provider that already accepted this body
+     once earns two re-tries when it flaps a 400/404/422 on the re-request)
+     and context rescues (halve the wire budget on a length-flavored 400 —
+     CTX_RESCUE_MAX bounds it, then the honest park). ctxBudget comes from
+     the app's X-Nexus-Context hint (meta.contextTokens) or a previous
+     rescue (meta.ctxBudget, inherited across driver swaps). */
+  let fatalRetries = 0;
+  let contextRescues = 0;
+  let ctxBudget = Math.max(0, Math.floor(Number(job.meta && (job.meta.ctxBudget || job.meta.contextTokens)) || 0));
   try {
     while (true) {
       if (signal.aborted) return; // killed like the runtime would — leave D1 stale on purpose
       if (Date.now() > deadline) { gaveUp = true; break; }
-      if (TUN("debugPark", 0)) console.log("[loop] top: sawToolCalls=" + parser.sawToolCalls + " finishSeen=" + parser.finishSeen + " sawData=" + parser.sawData + " bytes=" + totalBytes + " toolAcc=" + Object.keys(parser.toolAcc).length + " attempt=" + attempts);
+      if (TUN("debugPark", 0)) console.log("[loop] top: sawToolCalls=" + parser.sawToolCalls + " finishSeen=" + parser.finishSeen + " sawData=" + parser.sawData + " bytes=" + totalBytes + " toolAcc=" + Object.keys(parser.toolAcc).length + " attempt=" + attempts + " ctxBudget=" + ctxBudget + " contentLen=" + parser.contentText.length);
 
       /* v14: the attempt ceiling follows the job's pace profile (a
          Relentless pick earns its 100 attempts; the default stays put) */
@@ -2446,7 +2588,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
         else body = {
           ...job.req,
           messages: (job.req.messages || []).concat([
-            { role: "assistant", content: parser.contentText.slice(parser.roundBase) },
+            { role: "assistant", content: capPartial(parser.contentText.slice(parser.roundBase), partialCapFor(ctxBudget)) },
             { role: "user", content: CONTINUE_INSTRUCTION },
           ]),
           stream: true,
@@ -2455,11 +2597,18 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
       else body = {
         ...job.req,
         messages: (job.req.messages || []).concat([
-          { role: "assistant", content: parser.contentText },
+          { role: "assistant", content: capPartial(parser.contentText, partialCapFor(ctxBudget)) },
           { role: "user", content: CONTINUE_INSTRUCTION },
         ]),
         stream: true,
       };
+      /* v21: proactive fit — the WIRE request respects the model's window
+         (the app's hint, or the halved budget a rescue settled on). The
+         durable job.req keeps every round; only what we SEND shrinks. */
+      if (job.kind === "chat" && ctxBudget > 0) {
+        const fit = fitRequestToBudget(body, Math.floor(ctxBudget * CTX_FIT_FILL));
+        if (fit.trimmed) body = fit.body;
+      }
 
       const authRow = await getSQL(env, `SELECT auth FROM secrets WHERE job = ?`, [jobId]);
       const fwd = Object.assign({}, job.meta.fwd || {});
@@ -2473,11 +2622,19 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
          slow model waiting out a provider line or thinking silently
          before its first token is no longer killed by the old flat 60s
          abort loop (the exact "slower models time out and cut off"
-         report). Any body byte is a beat and promotes the phase. */
+         report). Any body byte is a beat and promotes the phase.
+         v21: a REASONING-ONLY stream that goes quiet is a thinking model
+         mid-think (qwen's norm), not a dead socket — until the attempt's
+         first CONTENT or TOOL byte lands, silence gets the 3-minute
+         firstChunk window instead of the 90s kill. */
       let lastBeat = Date.now();
       let wdPhase = "connect"; // connect → accepted → streaming
+      const contentBefore = parser.contentText.length;
+      let attemptProducedBody = false;
       const wd = setInterval(() => {
-        const limit = wdPhase === "connect" ? UPSTREAM_CONNECT_MS : (wdPhase === "accepted" ? UPSTREAM_FIRST_CHUNK_MS : UPSTREAM_STALL_MS);
+        const limit = wdPhase === "connect" ? UPSTREAM_CONNECT_MS
+          : (wdPhase === "accepted" ? UPSTREAM_FIRST_CHUNK_MS
+          : (attemptProducedBody ? UPSTREAM_STALL_MS : UPSTREAM_FIRST_CHUNK_MS));
         if (Date.now() - lastBeat > limit) { try { ac.abort(); } catch (_) {} }
       }, TUN("wdTickMs", 5000));
 
@@ -2533,6 +2690,7 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
               }
               firstChunk = false;
               parser.feed(value);
+              if (!attemptProducedBody && (parser.contentText.length > contentBefore || parser.sawToolCalls)) attemptProducedBody = true;
               totalBytes += value.length;
               if (totalBytes <= MAX_JOB_BYTES) {
                 pendingFlush += flushDec.decode(value, { stream: true });
@@ -2608,13 +2766,70 @@ async function pumpLoop(env, jobId, token, live, signal, opts) {
         return;
       }
       if (fatal) {
+        /* v21 CONTEXT RESCUE: a 400 that smells like "context length
+           exceeded" means the WIRE request outgrew the model's window —
+           agent rounds + tool results + the continuation partial grow
+           for hours while the durable conversation never shrinks. Parse
+           the provider's OWN limit when it states one ("maximum context
+           length is 4096 tokens"), else halve what we actually sent —
+           the app's hint can simply be optimistic (outdated catalog,
+           wrong fill). Trim the wire body to it and re-ask IMMEDIATELY
+           (a refusal is instant; no line wait to sleep through). The
+           durable job.req is untouched — only what we SEND shrinks.
+           CTX_RESCUE_MAX bounds the attempts; then the honest park. */
+        if (isContextLengthError(message) && contextRescues < CTX_RESCUE_MAX) {
+          contextRescues++;
+          const estNow = (body && Array.isArray(body.messages)) ? msgsTokens(body.messages) : 0;
+          const stated = String(message).match(/max(?:imum)?[^0-9]{0,60}([0-9,]{3,})\s*tokens?/i);
+          const statedN = stated ? Number(stated[1].replace(/,/g, "")) : 0;
+          let next;
+          if (statedN >= 200) next = Math.floor(statedN * 0.9); /* trust the provider's own number (small windows are real) */
+          else {
+            /* no stated limit: halve the SMALLER of the hint and what we
+               actually sent (a hint above the est is not the constraint);
+               the floor never exceeds what we sent — a tiny est is the
+               provider's real window, not absurdity */
+            const cur = ctxBudget > 0 ? Math.min(ctxBudget, estNow || ctxBudget) : (estNow || 32000);
+            const floor = Math.min(CTX_MIN_BUDGET, estNow || CTX_MIN_BUDGET);
+            next = Math.max(Math.max(256, floor), Math.floor(cur / 2));
+          }
+          ctxBudget = Math.max(180, next);
+          attempts++;
+          try {
+            job.meta = { ...job.meta, ctxBudget };
+            await lockWrite(env, jobId, token, { meta: JSON.stringify(job.meta), attempts, updated_at: Date.now(), ...timingFields() });
+          } catch (_) {}
+          if (TUN("debugPark", 0)) console.log("[ctx-rescue] " + contextRescues + " → budget " + ctxBudget + " tokens (est was " + estNow + ", stated " + (statedN || "n/a") + ")");
+          separatorNeeded = totalBytes > 0; // the re-ask must start line-aligned
+          continue;
+        }
+        /* v21 PROVIDER FLAP: a fatal on a RETRY of a request this provider
+           already ACCEPTED (bytes streamed on an earlier attempt) is often
+           a route hiccup, not a verdict — free-tier qwen routes flap
+           400/404 "provider unavailable" all the time. Two short
+           backed-off re-tries before the park. 401/403 skip this: a
+           revoked key does not heal in seconds, so park fast + honest. */
+        if (status !== 401 && status !== 403 && fatalRetries < FATAL_RETRY_MAX) {
+          fatalRetries++;
+          attempts++; inlineAttempts++;
+          if (!waitStart) waitStart = Date.now();
+          try { await lockWrite(env, jobId, token, { attempts, updated_at: Date.now(), ...timingFields() }); } catch (_) {}
+          if (inlineAttempts >= maxInline) { gaveUp = true; break; }
+          await pacedSleep(env, jobId, pace, attempts, signal);
+          separatorNeeded = totalBytes > 0;
+          continue;
+        }
         /* v20: an upstream refusal mid-run parks WITH the honest error
            event in the buffer — the phone's replay shows WHY (bad key,
            model route, context) instead of a mystery "cut off", and
-           meta.park carries it for the requests panel */
+           meta.park carries it for the requests panel. v21: the detail
+           also says what the worker already tried, and meta.error rides
+           /jobs so the panel shows the provider's own words. */
+        const tried = (fatalRetries ? " (after " + fatalRetries + " fatal retr" + (fatalRetries === 1 ? "y" : "ies") + ")" : "")
+          + (contextRescues ? " — context trimmed " + contextRescues + "x, still refused" : "");
         await parkJob(env, jobId, token, tsettle, {
           reason: "upstream-fatal",
-          detail: "upstream " + status + ": " + message,
+          detail: ("upstream " + status + ": " + message + tried).slice(0, 300),
           error: { message: message, code: status },
         }); liveClose(live); return;
       }
@@ -2702,6 +2917,11 @@ async function parkJob(env, id, token, t, park) {
       if (row) {
         const meta = row.meta || {};
         meta.park = { reason: String(park.reason).slice(0, 40), detail: String(park.detail || "").slice(0, 300), at: now };
+        /* v21: an error park also rides meta.error — /jobs renders the
+           provider's actual message under the row and /status forwards
+           it, so "Parked (error)" carries its one-line diagnosis
+           everywhere the row is shown */
+        if (park.error) meta.error = String(park.detail || park.error.message || "").slice(0, 300);
         fields.meta = JSON.stringify(meta);
       }
     }
@@ -2764,6 +2984,12 @@ async function handleSubmit(request, pathname, ctx, env, parsed, fwd) {
      a successful syncWorkspace — v17: ANY worker-executable tool counts,
      not just file tools). Old apps never send the header. */
   const wsSync = request.headers.get("X-Nexus-WS") === "1";
+  /* v21: the app forwards the model's context budget (the same number its
+     own contextTrim uses — context_length × fill). The worker's server
+     rounds and continuations trim the WIRE request to it, so hour-long
+     agent runs stop outgrowing the window and 400ing into a park. Old
+     apps never send it; their jobs still get the reactive rescue. */
+  const ctxHint = Math.floor(Math.abs(Number(request.headers.get("X-Nexus-Context")) || 0));
   const serverTools = !!(wsSync && chatKey && pathname === "/chat" && requestHasServerTools(parsed));
 
   /* idempotency: a network retry of the same submission must not
@@ -2796,6 +3022,7 @@ async function handleSubmit(request, pathname, ctx, env, parsed, fwd) {
   delete metaFwd.authorization;
   const meta = { fwd: metaFwd, contentType: kind === "images" ? "application/json" : "text/event-stream", submit: true };
   if (serverTools) meta.serverTools = true; // v15: mirror-mode agent loop
+  if (ctxHint >= 2000) meta.contextTokens = ctxHint; // v21: the app's context budget (floor: a hint below 2k tokens is junk)
   if (retryModes()[retryMode]) {
     const prof = retryModes()[retryMode];
     meta.retry = { mode: retryMode, label: prof.label, max: prof.max, delays: prof.delays, at: now };
